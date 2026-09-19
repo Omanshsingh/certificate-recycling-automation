@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+Data/
+Input/
+Output/
+*.log
+*.sqlite*
+*.eml
+*.pdf
+credentials.json
+.env
