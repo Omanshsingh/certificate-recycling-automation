@@ -54,3 +54,5 @@ For a simple setup, run `Create Daily Draft Task.bat` after the first successful
 ## Recommended rollout
 
 Start with a two-case test that generates PDFs and Outlook drafts without sending. After the responsible person confirms the values and visual layout, test a full day of dummy batches. Only after that should automatic sending be considered, with an approval/status column and an audit log.
+
+For testing, use `Input/Dummy_Inward_10_Clients.xlsx`. It contains ten dummy clients and no real recipient addresses.
