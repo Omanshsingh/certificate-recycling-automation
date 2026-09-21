@@ -13,5 +13,15 @@ if not defined PYTHON_CMD (
   pause
   exit /b 1
 )
+%PYTHON_CMD% -c "import openpyxl, reportlab, win32com.client" >nul 2>nul
+if errorlevel 1 (
+  echo Installing missing certificate automation packages...
+  %PYTHON_CMD% -m pip install --user -r requirements.txt
+  if errorlevel 1 (
+    echo Package installation failed. Check internet access or ask IT for help.
+    pause
+    exit /b 1
+  )
+)
 %PYTHON_CMD% desktop_app.py
 if errorlevel 1 pause
