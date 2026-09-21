@@ -1,4 +1,4 @@
-# Certificate field mapping
+# Ecoreco certificate field mapping
 
 This mapping is based on the supplied `COD_0061.pdf` reference certificate and the dummy inward workbook.
 

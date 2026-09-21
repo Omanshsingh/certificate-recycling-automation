@@ -1,4 +1,4 @@
-# Certificate of Recycling Automation
+# Ecoreco Recycling and Data Destruction Certificate Automation
 
 Private project for preparing certificates of e-waste recycling from the facility inward workbook.
 

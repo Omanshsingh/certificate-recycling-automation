@@ -1,4 +1,4 @@
-# Project plan
+# Ecoreco recycling and data destruction certificate automation plan
 
 ## Phase 1: understand and validate the source
 
