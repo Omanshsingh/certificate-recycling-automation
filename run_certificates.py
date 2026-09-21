@@ -48,7 +48,13 @@ def run(workbook_path, mailbox, root, limit=None, create_drafts=True, as_of=None
             make_certificate(batch, cert_no, certificate_date, root / "templates" / "Certificate of Recycling.png", pdf_path)
             if writer:
                 subject = f"Certificate of E-Waste Recycling - {batch['supplier']} - {cert_no}"
-                entry = writer.save_draft(batch, subject, draft_html(batch), pdf_path)
+                entry = writer.save_draft(
+                    batch,
+                    subject,
+                    draft_html(batch),
+                    pdf_path,
+                    root / "templates" / "signature-banner.png",
+                )
             else:
                 entry = "PDF_ONLY"
             history.complete(batch, pdf_path, entry)

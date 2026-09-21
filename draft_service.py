@@ -77,7 +77,7 @@ class OutlookWriter:
         self.folder = self.account.DeliveryStore.GetDefaultFolder(16)
         self.mailbox = smtp.lower() + "|" + str(self.folder.StoreID)
 
-    def save_draft(self, batch, subject, html_body, pdf_path):
+    def save_draft(self, batch, subject, html_body, pdf_path, banner_path=None):
         message = self.folder.Items.Add(0)
         try:
             try:
@@ -89,6 +89,13 @@ class OutlookWriter:
             message.Subject = subject
             message.HTMLBody = html_body
             message.Attachments.Add(str(Path(pdf_path).resolve()), 1, 0)
+            if banner_path:
+                banner = message.Attachments.Add(str(Path(banner_path).resolve()), 1, 0)
+                # PR_ATTACH_CONTENT_ID makes the banner render inline in Outlook.
+                banner.PropertyAccessor.SetProperty(
+                    "http://schemas.microsoft.com/mapi/proptag/0x3712001F",
+                    "ecoreco-banner",
+                )
             message.Save()
             entry = str(message.EntryID)
             if not entry:
@@ -99,10 +106,30 @@ class OutlookWriter:
 
 
 def draft_html(batch):
-    return f"""<html><body style='font-family:Arial,sans-serif;font-size:11pt'>
-    <p>Hello,</p><p>Greetings from Ecoreco !!</p>
-    <p><b>Please find attached the Certificate of E-Waste Recycling for the material received from {batch['supplier'].upper()}, {batch['location'].upper()}.</b></p>
-    <p>Kindly review the attached certificate and let us know if any details need correction.</p>
-    <p>Thanks &amp; Regards,<br><b>CRM Executive</b><br>Eco Recycling Limited</p>
+    location = f", {batch['location']}" if batch.get("location") else ""
+    rows = "".join(
+        f"<tr><td style='border:1px solid #777;padding:8px'>{item['item']}</td>"
+        f"<td style='border:1px solid #777;padding:8px;text-align:center'>{item.get('quantity') or ''}</td>"
+        f"<td style='border:1px solid #777;padding:8px;text-align:right'>{item.get('weight') or 0:.1f} KG</td></tr>"
+        for item in batch["items"]
+    )
+    return f"""<html><body style='margin:0;background:#ffffff;color:#222;font-family:Arial,sans-serif;font-size:11pt'>
+    <div style='max-width:760px;margin:0 auto;padding:12px 18px'>
+      <p>Hello,</p>
+      <p>Greetings from Ecoreco !!</p>
+      <p><b>Eco Recycling Ltd is pleased to provide the attached Certificate of E-Waste Recycling for the material received from {batch['supplier'].upper()}{location.upper()}.</b></p>
+      <p>Please find the certificate details below. The official certificate is attached as a PDF for your records.</p>
+      <table cellpadding='0' cellspacing='0' style='border-collapse:collapse;width:100%;margin:18px 0'>
+        <tr style='background:#f2f2f2'><th style='border:1px solid #777;padding:8px;text-align:left'>Material / Item</th><th style='border:1px solid #777;padding:8px'>Quantity</th><th style='border:1px solid #777;padding:8px;text-align:right'>Weight</th></tr>
+        {rows}
+        <tr><td colspan='2' style='border:1px solid #777;padding:8px;text-align:right'><b>Total Weight</b></td><td style='border:1px solid #777;padding:8px;text-align:right'><b>{batch['total_weight']:.1f} KG</b></td></tr>
+      </table>
+      <p>Kindly review the attached certificate and let us know if any details need correction.</p>
+      <p>We look forward to your continued association.</p>
+      <p><b>Thanks &amp; Regards,</b><br><br>
+      <b>CRM Executive</b> | <a href='tel:+912240052951'>+91-22-4005 2951</a> / <a href='tel:+919004149714'>+91-9004149714</a> | <a href='https://www.ecoreco.com'>www.ecoreco.com</a><br>
+      <b>Eco Recycling Limited</b><br>
+      422, The Summit Business Park | Andheri Kurla Road | Andheri (East), Mumbai 400093</p>
+      <p style='margin-top:18px'><img src='cid:ecoreco-banner' alt='EcoReco' style='display:block;width:100%;max-width:760px;height:auto;border:0'></p>
+    </div>
     </body></html>"""
-
