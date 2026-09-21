@@ -1,0 +1,8 @@
+{
+  "eligibility_days": 30,
+  "certificate_number_prefix": "",
+  "certificate_number_start": 1,
+  "certificate_number_width": 4,
+  "outlook_mailbox": "",
+  "workbook_path": ""
+}

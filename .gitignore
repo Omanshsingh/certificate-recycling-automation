@@ -10,3 +10,4 @@ Output/
 *.pdf
 credentials.json
 .env
+settings.local.json
