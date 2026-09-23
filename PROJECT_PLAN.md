@@ -1,38 +1,16 @@
-# Ecoreco recycling and data destruction certificate automation plan
+# Current certificate automation
 
-## Phase 1: understand and validate the source
+Implemented locally:
 
-- Read the merged-cell workbook without changing the original.
-- Normalize each inward batch into one record with child item rows.
-- Calculate and validate total weight from the item rows.
-- Identify the official source for certificate number, reference number, manifest number, and recipient email.
+- Two plant workbook selections remembered between runs.
+- Ready / N/A / blank status handling and required-field checks.
+- Form 6 mapped to Manifest No.; missing Reference No. reported.
+- Centred vendor text, using Calibri Bold when available, with balanced wrapping for long names.
+- One sequence across both selected workbooks and a persistent local register.
+- COD No and COD Date writeback, workbook backups, and recovery of failed writebacks.
+- Duplicate prevention and a stop for uncertain Outlook saves.
+- Results shown in the app without completion popups.
+- Optional silent daily summaries with duplicate suppression.
+- Daily task installer with sign-in and missed-run handling.
 
-## Phase 2: generate the certificate
-
-- Reproduce the supplied certificate design as a controlled template.
-- Fill batch-level values in the certificate.
-- Export one PDF per eligible batch.
-- Keep the source workbook unchanged.
-
-## Phase 3: prepare communication
-
-- Create one Outlook draft per eligible batch.
-- Attach the matching PDF certificate.
-- Use a standard subject and body approved by the business.
-- Do not open many compose windows and do not send automatically.
-
-## Phase 4: scheduling and audit
-
-- Run daily or on demand from the responsible person’s desktop.
-- Select the latest copied workbook.
-- Process only batches at least 30 days old.
-- Record generated, drafted, sent, skipped, and review-required states.
-- Make reruns idempotent so a batch is not duplicated.
-
-## Decisions needed before implementation
-
-1. Is the delay exactly 30 calendar days from `Inward Date`, or one month by calendar date?
-2. Where does the client email address come from?
-3. How are certificate numbers assigned?
-4. Which source fields populate Reference No. and Manifest No.?
-5. Should the person approve every draft, or should approved rows be sent automatically later?
+Before using live data, select the two real files, provide the Reference No. and Certificate Issued columns, select the Classic Outlook mailbox, and check one real Outlook draft. Local automated tests use dummy files and a fake Outlook writer. This version prepares drafts; it does not send mail automatically.

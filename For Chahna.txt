@@ -1,0 +1,3 @@
+Chahna, please add a column named Reference No. to both plant inward Excel files and fill in the correct reference number for each batch. The automation will print this on the certificate and will flag batches where it is missing.
+
+Please also include Certificate Issued, COD No and COD Date columns. Use Ready when the batch can be certified, N/A when no certificate is required, and leave it blank while it needs attention. The automation will fill COD No and COD Date after preparing the certificate draft.

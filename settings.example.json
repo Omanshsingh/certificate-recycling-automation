@@ -1,8 +1,12 @@
 {
-  "eligibility_days": 30,
   "certificate_number_prefix": "",
   "certificate_number_start": 1,
+  "initial_cod_confirmed": false,
   "certificate_number_width": 4,
   "outlook_mailbox": "",
-  "workbook_path": ""
+  "quiet_notifications": true,
+  "workbook_paths": [
+    "",
+    ""
+  ]
 }

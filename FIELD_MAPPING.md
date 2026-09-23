@@ -1,17 +1,16 @@
 # Ecoreco certificate field mapping
 
-This mapping is based on the supplied `COD_0061.pdf` reference certificate and the dummy inward workbook.
+| Certificate / workflow field | Source or rule |
+|---|---|
+| Certificate No. | Next unique number after both plant workbooks and the shared local register; written back to COD No. |
+| Certificate Date | Date of the first official number reservation; written back to COD Date. Retained during recovery. |
+| Date of Material Receipt | Inward Date. |
+| Weight | Sum of the batch item weights, displayed to one decimal place in KG. |
+| Reference No. | Reference No. column. Missing values block generation. Chahna needs to add/populate this field in both plant workbooks. |
+| Manifest No. | Form 6 No. |
+| Supplier / vendor | Supplier Name plus Location, uppercase, centred in the template's vendor area. Calibri Bold is used when installed. Long names wrap into two balanced lines. |
+| Recipient | Client Email. |
+| Approval | Certificate Issued: Ready, N/A, or blank. |
+| Eligibility | Ready and complete required fields. No waiting period; future receipt dates require review. |
 
-| Certificate field | Observed source or rule | Status |
-|---|---|---|
-| Certificate No. | `0061` in the reference PDF | Source column not present in dummy workbook. Needs an approved numbering rule. |
-| Certificate Date | `01.06.2026` in the reference PDF | Needs an approved rule. It is not simply the same as the inward date. |
-| Date of Material Receipt | `Inward Date` | Confirmed. |
-| Weight | Sum of the batch item weights, rounded to one decimal place | Confirmed from `217.15` to displayed `217.2 KG`. |
-| Reference No. | `2026040047` in the reference PDF | Source column not identified in dummy workbook. Needs mapping. |
-| Manifest No. | `Form 6 No.`; reference shows `10164` | Confirmed for the sample. |
-| Supplier and city | `Supplier Name` plus `Location`; reference displays uppercase supplier and city | Confirmed formatting rule. |
-
-## Key consequence
-
-The automation must not generate a final certificate until the missing Reference No. source and the certificate numbering/date rule are confirmed. It can generate a clearly labelled test preview from the dummy workbook, but production output must stop and request review when those values are unavailable.
+Colour is presentation; the Ready / N/A text controls processing. Blank white status cells require attention. No number is consumed by a PDF preview.
