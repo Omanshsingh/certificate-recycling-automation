@@ -106,6 +106,36 @@ class DesktopEdges(TemporarySetup):
             confirm.assert_not_called()
         self.assertIn('Only a prepared', app.status.get())
 
+    def test_followup_history_read_failure_does_not_break_work_list(self):
+        save_json(self.base / 'Output' / 'Latest Results.json', {'rows': [
+            dict(plant='plant1', sn='1', outcome='already_prepared', detail='Prepared')
+        ]})
+        app = self.app()
+        with patch('draft_service.History.records', side_effect=OSError('disk unavailable')):
+            app.show_results()
+        self.assertIn('history unavailable', app.status.get())
+        self.assertEqual(len(app.table.get_children()), 1)
+
+    def test_mark_sent_cancel_confirm_and_undo_keep_excel_unchanged(self):
+        from draft_service import History
+        history = History(self.base / 'Data' / 'certificate-history.sqlite')
+        self.addCleanup(history.close)
+        history.db.execute("INSERT INTO batches(case_id,status,certificate_no,entry_id) VALUES('1','saved','0042','test-only')")
+        history.db.commit()
+        save_json(self.base / 'Output' / 'Latest Results.json', {'rows': [
+            dict(plant='plant1', sn='1', outcome='already_prepared', detail='COD 0042')
+        ]})
+        before = [p.read_bytes() for p in self.paths]
+        app = self.app()
+        for confirm, expected in ((False, False), (True, True), (True, False)):
+            app.table.selection_set(app.table.get_children()[0])
+            with patch('desktop_app.messagebox.askyesno', return_value=confirm):
+                app.mark_selected_sent()
+            self.assertEqual(bool(history.sent_acknowledgement('1')), expected)
+            label = app.table.item(app.table.get_children()[0], 'values')[2]
+            self.assertEqual(label, 'Marked sent' if expected else 'Drafts to review')
+        self.assertEqual(before, [p.read_bytes() for p in self.paths])
+
     def test_startup_marks_results_stale_after_a_workbook_changes(self):
         latest = self.base / "Output" / "Latest Results.json"
         save_json(latest, {"completed_at": "2000-01-01T00:00:00", "rows": [
@@ -370,7 +400,7 @@ class ScheduledEdges(TemporarySetup):
     def test_muted_run_calls_notify_to_acknowledge_results(self):
         with patch("workflow_support.notify_once") as notify:
             self.assertEqual(scheduled_run.main(self.base), 0)
-        notify.assert_called_once_with(self.base, self.result, self.notifier, enabled=False)
+        notify.assert_called_once_with(self.base, self.result, self.notifier, enabled=False, repeat_pending=True)
         self.assertTrue(self.run.call_args.kwargs["create_drafts"])
         self.com.CoInitialize.assert_called_once()
         self.com.CoUninitialize.assert_called_once()

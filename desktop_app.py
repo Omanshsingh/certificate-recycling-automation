@@ -366,7 +366,7 @@ class App:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             rows = data["rows"]
-            if not isinstance(rows, list) or any(not isinstance(row, dict) or any(key not in row for key in ("plant", "sn", "outcome", "detail")) or not isinstance(row["outcome"], str) for row in rows):
+            if not isinstance(rows, list) or any(not isinstance(row, dict) or any(key not in row for key in ("plant", "sn", "outcome", "detail")) or any(not isinstance(row[key], str) for key in ("plant", "outcome", "detail")) for row in rows):
                 raise ValueError("The saved results have an invalid format.")
         except FileNotFoundError:
             return
@@ -380,16 +380,22 @@ class App:
         self.visible_rows = {}
         counts = {}
         history = None
+        sent_cases = set()
         try:
             from draft_service import History
             history = History(self.base / "Data" / "certificate-history.sqlite")
+            sent_cases = {record['case_id'] for record in history.records()
+                          if record['status'] == 'saved' and history.sent_acknowledgement(record['case_id'])}
         except Exception as exc:
             self.status.set(f"Draft follow-up history unavailable: {exc}")
+        finally:
+            if history:
+                history.close()
         for row in sorted(rows, key=lambda r: r["outcome"] != "needs_review"):
             key = ("plant2|" if row["plant"] == "plant2" else "") + str(row["sn"])
             label = {"needs_review": "Needs attention", "ready": "Ready to draft", "not_applicable": "Skipped",
                      "draft_created": "Drafts to review", "updated": "Drafts to review", "already_prepared": "Drafts to review"}.get(row["outcome"], row["outcome"].replace("_", " ").title())
-            if history and label == "Drafts to review" and history.sent_acknowledgement(key):
+            if label == "Drafts to review" and key in sent_cases:
                 label = "Marked sent"
             counts[label] = counts.get(label, 0) + 1
             if self.queue_filter.get() not in ("All", label):
@@ -397,8 +403,6 @@ class App:
             detail = (str(row.get('supplier', '')).strip() + ' — ' if row.get('supplier') else '') + row['detail']
             item = self.table.insert("", "end", values=(row["plant"], row["sn"], label, detail), tags=(row["outcome"],))
             self.visible_rows[item] = row
-        if history:
-            history.close()
         self.queue_summary.set(" | ".join(f"{label}: {counts.get(label, 0)}" for label in ("Needs attention", "Ready to draft", "Drafts to review", "Marked sent")))
 
     def selected_row(self):
@@ -433,10 +437,10 @@ class App:
         if row['outcome'] not in {'draft_created', 'updated', 'already_prepared'}:
             self.status.set("Only a prepared certificate can be marked sent.")
             return
-        from draft_service import History
-        from workflow_support import run_lock
         history = None
         try:
+            from draft_service import History
+            from workflow_support import run_lock
             with run_lock(self.base):
                 history = History(self.base / 'Data' / 'certificate-history.sqlite')
                 key = ('plant2|' if row['plant'] == 'plant2' else '') + str(row['sn'])

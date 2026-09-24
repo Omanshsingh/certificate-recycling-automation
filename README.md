@@ -98,4 +98,4 @@ Input, output, history, backups and local settings are excluded from Git. Keep r
 
 Developer checks: install `requirements-dev.txt`, then run `python -m unittest discover -s tests -v`. The integration tests use temporary dummy workbooks and a fake Outlook writer; they never send mail.
 
-See `REVIEW_REPORT.md` for tested failures, remaining limitations and the live-desktop acceptance checklist. This project currently generates recycling certificates; there is no separate data-destruction certificate template or unattended email-sending workflow.
+See `VERIFICATION.md` for verified behavior, remaining limitations and deployment checks. This project currently generates recycling certificates; there is no separate data-destruction certificate template or unattended email-sending workflow.
