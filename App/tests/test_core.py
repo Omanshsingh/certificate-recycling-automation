@@ -3,7 +3,7 @@ import unittest
 from datetime import date
 from pathlib import Path
 
-from certificate_core import eligible, read_batches
+from certificate_core import certificate_reminder_due, eligible, read_batches
 from draft_service import draft_html
 from run_certificates import run
 
@@ -23,6 +23,23 @@ class CertificateTests(unittest.TestCase):
         batches = read_batches(SAMPLE)
         self.assertTrue(eligible(batches[0], date(2026, 6, 1), 30))
         self.assertFalse(eligible(batches[2], date(2026, 6, 1), 30))
+
+    def test_alert_cutoff_is_exactly_30_days_and_excludes_na_or_sent(self):
+        today = date(2026, 9, 23)
+        for status in (None, "", "Blank", "Ready", "Completed"):
+            with self.subTest(status=status):
+                batch = {"case_id": "100", "inward_date": date(2026, 8, 24), "issued": status}
+                self.assertTrue(certificate_reminder_due(batch, today))
+        for status in ("N/A", "Sent"):
+            with self.subTest(status=status):
+                batch = {"case_id": "100", "inward_date": date(2026, 8, 24), "issued": status}
+                self.assertFalse(certificate_reminder_due(batch, today))
+        self.assertFalse(certificate_reminder_due(
+            {"case_id": "100", "inward_date": date(2026, 8, 25), "issued": "Blank"}, today))
+        self.assertFalse(certificate_reminder_due(
+            {"case_id": "100", "inward_date": None, "issued": "Blank"}, today))
+        self.assertFalse(certificate_reminder_due(
+            {"case_id": "", "inward_date": date(2026, 8, 1), "issued": "Blank"}, today))
 
     def test_certificate_email_uses_salesforce_format_and_banner(self):
         html = draft_html({

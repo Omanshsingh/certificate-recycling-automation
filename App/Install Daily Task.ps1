@@ -1,15 +1,18 @@
 param(
-    [ValidateSet('Install', 'Setup', 'Desktop', 'Daily', 'Diagnose')]
-    [string]$Mode = 'Install'
+    [ValidateSet('Install', 'Setup', 'Desktop', 'Daily', 'Diagnose', 'Reschedule', 'Snooze', 'CancelSnooze')]
+    [string]$Mode = 'Install',
+    [string]$ReminderTime = '',
+    [string]$SnoozeAt = ''
 )
 
 $ErrorActionPreference = 'Stop'
+$certificateRoot = if ((Split-Path $PSScriptRoot -Leaf) -eq 'App') { Split-Path $PSScriptRoot -Parent } else { $PSScriptRoot }
 
 function Resolve-CertificatePython {
     param([bool]$RequirePackages = $true, [bool]$RequireOutlook = $true)
     $candidates = [System.Collections.Generic.List[object]]::new()
     $script:CertificatePythonProbeFailures = @()
-    $localPython = Join-Path $PSScriptRoot '.venv\Scripts\python.exe'
+    $localPython = Join-Path $certificateRoot '.venv\Scripts\python.exe'
     if (Test-Path -LiteralPath $localPython -PathType Leaf) {
         [void]$candidates.Add([pscustomobject]@{ Executable = $localPython; Prefix = @() })
     }
@@ -115,8 +118,72 @@ function Resolve-CertificatePython {
 }
 
 try {
-    Set-Location -LiteralPath $PSScriptRoot
-    $certificatePython = Resolve-CertificatePython -RequirePackages ($Mode -ne 'Setup') -RequireOutlook ($Mode -ne 'Desktop')
+    Set-Location -LiteralPath $certificateRoot
+    if ($Mode -eq 'CancelSnooze') {
+        $snoozeTaskName = 'Ecoreco Certificate Reminder Snooze'
+        $snoozeTask = Get-ScheduledTask -TaskName $snoozeTaskName -ErrorAction SilentlyContinue
+        if ($snoozeTask) {
+            Unregister-ScheduledTask -TaskName $snoozeTaskName -Confirm:$false
+        }
+        Write-Host 'Any pending one-hour reminder was cleared.'
+        exit 0
+    }
+    if ($Mode -eq 'Snooze') {
+        if ($SnoozeAt -notmatch '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$') {
+            throw 'The one-hour reminder time is invalid. Close the reminder and try again.'
+        }
+        $runAt = [DateTime]::ParseExact($SnoozeAt, 'yyyy-MM-ddTHH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
+        if ($runAt -le (Get-Date)) { throw 'The reminder time has already passed. Choose Remind me in 1 hour again.' }
+        $certificatePython = Resolve-CertificatePython -RequirePackages $false -RequireOutlook $false
+        if (-not $certificatePython) { throw 'Python could not be found, so Windows could not schedule the reminder. Keep the app open and ask IT to repair Python.' }
+        $certificatePythonw = Join-Path (Split-Path $certificatePython) 'pythonw.exe'
+        if (-not (Test-Path -LiteralPath $certificatePythonw -PathType Leaf)) {
+            throw 'pythonw.exe was not found beside Python. Windows could not schedule the reminder.'
+        }
+        $runner = Join-Path $PSScriptRoot 'scheduled_run.py'
+        $arguments = '"' + $runner + '" --snoozed-reminder'
+        $action = New-ScheduledTaskAction -Execute $certificatePythonw -Argument $arguments -WorkingDirectory $PSScriptRoot
+        $trigger = New-ScheduledTaskTrigger -Once -At $runAt
+        $taskSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+        $certificateUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+        $principal = New-ScheduledTaskPrincipal -UserId $certificateUser -LogonType Interactive -RunLevel Limited
+        Register-ScheduledTask -TaskName 'Ecoreco Certificate Reminder Snooze' -Action $action -Trigger $trigger -Settings $taskSettings -Principal $principal -Description 'Show a one-time Ecoreco certificate review reminder in the signed-in user session. Does not wake the computer, scan files, or send mail.' -Force | Out-Null
+        Write-Host "One-hour reminder scheduled for $($runAt.ToString('HH:mm')). It will wait until this user is signed in and the computer is awake; it will not wake the computer."
+        exit 0
+    }
+    if (-not $ReminderTime) {
+        $settingsPath = Join-Path $certificateRoot 'settings.local.json'
+        if (Test-Path -LiteralPath $settingsPath -PathType Leaf) {
+            try {
+                $savedSettings = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
+                if ($savedSettings.reminder_time) { $ReminderTime = [string]$savedSettings.reminder_time }
+            } catch {
+                throw 'Cannot read the saved reminder time. Open the app, correct Settings, and try again.'
+            }
+        }
+        if (-not $ReminderTime) { $ReminderTime = '09:00' }
+    }
+    if ($ReminderTime -notmatch '^(?:[01][0-9]|2[0-3]):[0-5][0-9]$') {
+        throw 'Reminder time must use 24-hour format, for example 09:00 or 17:30.'
+    }
+    if ($Mode -eq 'Reschedule') {
+        $taskName = 'Certificate Recycling Drafts'
+        $existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        if (-not $existingTask) {
+            throw 'The daily task is not installed yet. Run Setup/Create Daily Draft Task.bat once to turn it on.'
+        }
+        $certificateUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+        $triggers = @((New-ScheduledTaskTrigger -Daily -At $ReminderTime), (New-ScheduledTaskTrigger -AtLogOn -User $certificateUser))
+        # Sign-in remains a catch-up opportunity, but reminders themselves wait until the chosen time.
+        $triggers[1].Delay = 'PT2M'
+        $existingTask.Triggers = $triggers
+        $existingTask.Description = "Check both Ecoreco plant workbooks daily at $ReminderTime and shortly after sign-in; prepare Ready drafts, and remind for 30-day unsent inward records, un-ageable dates, or automation problems. Never send mail."
+        # Set-ScheduledTask has no -Description parameter on Windows PowerShell.
+        Set-ScheduledTask -InputObject $existingTask | Out-Null
+        Write-Host "Daily reminder time updated to $ReminderTime. The sign-in catch-up remains enabled."
+        exit 0
+    }
+    $certificatePython = Resolve-CertificatePython -RequirePackages ($Mode -ne 'Setup' -and $Mode -ne 'Snooze') -RequireOutlook ($Mode -ne 'Desktop' -and $Mode -ne 'Snooze')
     if (-not $certificatePython -and $Mode -eq 'Daily') {
         # Let the guarded runner record missing-package failures without a popup.
         $certificatePython = Resolve-CertificatePython -RequirePackages $false
@@ -165,14 +232,14 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'The daily task was not changed. Correct the setup shown above, then try again.' }
     $certificateUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
     $action = New-ScheduledTaskAction -Execute $certificatePythonw -Argument $scriptArgument -WorkingDirectory $PSScriptRoot
-    $triggers = @((New-ScheduledTaskTrigger -Daily -At '09:00'), (New-ScheduledTaskTrigger -AtLogOn -User $certificateUser))
+    $triggers = @((New-ScheduledTaskTrigger -Daily -At $ReminderTime), (New-ScheduledTaskTrigger -AtLogOn -User $certificateUser))
     # Give network drives and Classic Outlook time to become available at sign-in.
     $triggers[1].Delay = 'PT2M'
     # Do not forcibly terminate a batch halfway through saving Outlook/Excel.
     $taskSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
     $principal = New-ScheduledTaskPrincipal -UserId $certificateUser -LogonType Interactive -RunLevel Limited
-    Register-ScheduledTask -TaskName 'Certificate Recycling Drafts' -Action $action -Trigger $triggers -Settings $taskSettings -Principal $principal -Description 'Check both Ecoreco plant workbooks at 09:00 and shortly after sign-in; prepare Ready certificate drafts and show at most one quiet summary per day. Never send mail.' -Force | Out-Null
-    Write-Host 'Daily check installed for 09:00 and two minutes after Windows sign-in. Missed starts catch up when this user is signed in. Overlapping runs are skipped.'
+    Register-ScheduledTask -TaskName 'Certificate Recycling Drafts' -Action $action -Trigger $triggers -Settings $taskSettings -Principal $principal -Description "Check both Ecoreco plant workbooks at $ReminderTime and shortly after sign-in; prepare Ready drafts, and remind for 30-day unsent inward records, un-ageable dates, or automation problems. Never send mail." -Force | Out-Null
+    Write-Host "Daily check installed for $ReminderTime and two minutes after Windows sign-in. Missed starts catch up when this user is signed in. Overlapping runs are skipped."
     exit 0
 } catch {
     Write-Host ('Certificate Automation: ' + $_.Exception.Message)

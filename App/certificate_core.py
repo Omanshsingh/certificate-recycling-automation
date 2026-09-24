@@ -218,6 +218,12 @@ def status_value(value):
         return "ready"
     if cleaned in {"na", "notapplicable"}:
         return "na"
+    if cleaned == "blank":
+        return "blank"
+    if cleaned == "completed":
+        return "completed"
+    if cleaned == "sent":
+        return "sent"
     return "blank" if not cleaned else "unknown"
 
 
@@ -226,7 +232,17 @@ def batch_content(batch):
 
 
 def eligible(batch, as_of, days):
-    return bool(batch["inward_date"] and (as_of - batch["inward_date"]).days >= days)
+    inward_date = batch.get("inward_date")
+    return bool(inward_date and (as_of - inward_date).days >= days)
+
+
+def certificate_reminder_due(batch, as_of, days=30):
+    """A case is overdue only after its inward date ages and before N/A/Sent."""
+    return bool(
+        batch.get("case_id")
+        and eligible(batch, as_of, days)
+        and status_value(batch.get("issued")) not in {"na", "sent"}
+    )
 
 
 def certificate_number(sequence, settings):

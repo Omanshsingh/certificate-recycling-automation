@@ -5,6 +5,9 @@ Data/
 Input/
 Output/
 outputs/
+Plant Workbooks/
+App/sample/Old test inputs/
+.artifact_work/
 *.log
 *.sqlite*
 *.eml

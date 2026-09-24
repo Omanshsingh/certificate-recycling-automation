@@ -10,13 +10,14 @@ from unittest.mock import patch
 from zipfile import ZipFile
 
 from openpyxl import Workbook, load_workbook
+from openpyxl.formatting.rule import FormulaRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.worksheet.datavalidation import DataValidation
 from pypdf import PdfReader
 
 from certificate_core import read_batches, status_value, supplier_lines, vendor_font
 from run_certificates import run
-from workbook_store import WorkbookSession, exclusive_file
+from workbook_store import WorkbookSession, exclusive_file, update_issued_status
 from workflow_support import load_settings, notify_once, run_lock, save_json
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -36,13 +37,20 @@ def make_book(path, rows):
         for cell in sheet[index]:
             cell.border = Border(bottom=Side(style="thin", color="CCCCCC"))
             cell.alignment = Alignment(vertical="center")
-        sheet.cell(index, 14).fill = PatternFill("solid", fgColor="E2F0D9" if values["Certificate Issued"] == "Ready" else "FFC7CE") if values["Certificate Issued"] else PatternFill()
+        sheet.cell(index, 14).fill = PatternFill("solid", fgColor="FFFFFF")
     sheet.freeze_panes = "D2"
     sheet.column_dimensions["C"].width = 44
     sheet.auto_filter.ref = sheet.dimensions
-    validation = DataValidation(type="list", formula1='"Ready,N/A"', allow_blank=True)
+    validation = DataValidation(type="list", formula1='"Ready,N/A,Blank,Completed"', allow_blank=True)
     sheet.add_data_validation(validation)
     validation.add("N2:N1000")
+    for value, fill, color in (("READY", "C6EFCE", "006100"), ("N/A", "FFFFFF", "202020"),
+                               ("BLANK", "FFC7CE", "9C0006"), ("COMPLETED", "FFEB9C", "7F6000")):
+        sheet.conditional_formatting.add(
+            "N2:N1000",
+            FormulaRule(formula=[f'UPPER(TRIM($N2))="{value}"'],
+                        fill=PatternFill("solid", fgColor=fill), font=Font(color=color)),
+        )
     sheet["A1"].font = Font(bold=True)
     sheet.merge_cells("O2:P2")
     book.save(path)
@@ -91,12 +99,12 @@ class WorkflowTests(unittest.TestCase):
         make_book(self.paths[0], [{"COD No": "0061"}, {"SN": "2"}, {"SN": "3", "Certificate Issued": ""}, {"SN": "4", "Certificate Issued": "N/a", "Client Email": None}])
         make_book(self.paths[1], [{"COD No": "0064"}, {"SN": "2"}])
         created, review, _ = self.execute()
-        self.assertEqual((created, review), (2, 1), self.report)
+        self.assertEqual((created, review), (4, 1), self.report)
         self.assertEqual(read_batches(self.paths[0])[1]["cod_no"], "0065")
         self.assertEqual(read_batches(self.paths[1])[1]["cod_no"], "0066")
-        self.assertEqual(len(FakeOutlook.saved), 2)
+        self.assertEqual(len(FakeOutlook.saved), 4)
         self.execute()
-        self.assertEqual(len(FakeOutlook.saved), 2)
+        self.assertEqual(len(FakeOutlook.saved), 4)
         self.assertEqual(self.report["created"], 0)
 
     def test_preview_does_not_consume_number_or_change_workbooks(self):
@@ -113,7 +121,7 @@ class WorkflowTests(unittest.TestCase):
         self.execute()
         self.assertEqual(read_batches(self.paths[0])[0]["cod_no"], "0062")
 
-    def test_missing_fields_and_white_rows_alert_even_before_due(self):
+    def test_missing_fields_and_white_rows_stay_visible_before_the_reminder_age(self):
         make_book(self.paths[0], [{"Certificate Issued": "", "Inward Date": TODAY}, {"SN": "2", "Reference No.": None}, {"SN": "3", "Inward Date": None}])
         make_book(self.paths[1], [{"Certificate Issued": "Not applicable", "Reference No.": None}])
         self.assertEqual(self.execute()[:2], (0, 3), self.report)
@@ -125,9 +133,22 @@ class WorkflowTests(unittest.TestCase):
         make_book(self.paths[1], [{"Certificate Issued": "N/A"}])
         self.execute()
         detail = str(self.report)
-        self.assertIn("not Ready or N/A", detail)
+        self.assertIn("Completed is only valid after a confirmed Outlook draft", detail)
         self.assertIn("missing Form 6 number / manifest number", detail)
         self.assertFalse(FakeOutlook.saved)
+        db = sqlite3.connect(self.root / "Data" / "certificate-history.sqlite")
+        self.assertEqual(db.execute("SELECT count(*) FROM batches").fetchone()[0], 0)
+        db.close()
+
+    def test_explicit_blank_status_is_pending_and_never_allocates_or_drafts(self):
+        make_book(self.paths[0], [{"Certificate Issued": "Blank"}])
+        make_book(self.paths[1], [{"Certificate Issued": "N/A"}])
+        self.assertEqual(self.execute()[:2], (0, 1), self.report)
+        self.assertEqual(status_value("Blank"), "blank")
+        self.assertEqual(status_value(" blank "), "blank")
+        self.assertIn("marked Blank", self.report["rows"][0]["detail"])
+        self.assertFalse(FakeOutlook.saved)
+        self.assertEqual(read_batches(self.paths[0])[0]["cod_no"], "")
         db = sqlite3.connect(self.root / "Data" / "certificate-history.sqlite")
         self.assertEqual(db.execute("SELECT count(*) FROM batches").fetchone()[0], 0)
         db.close()
@@ -140,6 +161,67 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn(TODAY.strftime("%d.%m.%Y"), text)
         batch = read_batches(self.paths[0])[0]
         self.assertEqual(batch["cod_date"].date(), TODAY)
+
+    def test_completed_to_ready_redraft_reuses_same_cod_and_date(self):
+        self.one_ready()
+        self.execute()
+        first = read_batches(self.paths[0])[0]
+        self.assertEqual((first["cod_no"], first["issued"]), ("0062", "Completed"))
+        original_date = first["cod_date"].date()
+
+        from draft_service import History
+        history = History(self.root / "Data" / "certificate-history.sqlite")
+        try:
+            history.acknowledge_sent("1", "0062")
+        finally:
+            history.close()
+
+        book = load_workbook(self.paths[0])
+        book["Inward Register"]["N2"] = "Ready"
+        book.save(self.paths[0])
+        book.close()
+        self.execute()
+
+        redrafted = read_batches(self.paths[0])[0]
+        self.assertEqual((redrafted["cod_no"], redrafted["issued"]), ("0062", "Completed"))
+        self.assertEqual(redrafted["cod_date"].date(), original_date)
+        self.assertEqual(len(FakeOutlook.saved), 2)
+        self.assertIn("0062", FakeOutlook.saved[1][2])
+        reissue = next(row for row in self.report["rows"] if row["outcome"] == "draft_created")
+        self.assertIn("existing COD 0062 and its original date", reissue["detail"])
+        self.assertIn("earlier draft was left untouched", reissue["detail"])
+        db = sqlite3.connect(self.root / "Data" / "certificate-history.sqlite")
+        try:
+            self.assertEqual(db.execute("SELECT generation,certificate_no,status FROM batches WHERE case_id='1'").fetchone(), (2, "0062", "saved"))
+            archived = db.execute("SELECT generation,certificate_no,status,sent_at FROM archived_issuances WHERE case_id='1'").fetchone()
+            self.assertEqual(archived[:3], (1, "0062", "saved"))
+            self.assertTrue(archived[3])
+            self.assertIsNone(db.execute("SELECT 1 FROM sent_acknowledgements WHERE case_id='1'").fetchone())
+        finally:
+            db.close()
+
+        self.execute()
+        self.assertEqual(len(FakeOutlook.saved), 2)
+
+        book = load_workbook(self.paths[0])
+        sheet = book["Inward Register"]
+        next_row = sheet.max_row + 1
+        next_values = {
+            "SN": "NEXT-1", "Inward Date": TODAY - timedelta(days=31),
+            "Supplier Name": "Next Test Client", "Location": "Pune",
+            "Item": "Dummy laptops", "Quantity in Pcs": 1,
+            "Per Pcs Weight in (KG)": 2.5, "Weight (KG)": f"=F{next_row}*G{next_row}",
+            "Form 6 No": "FORM6-NEXT-1", "Client Email": "next@example.test",
+            "Reference No.": "REF-NEXT-1", "Certificate Issued": "Ready",
+        }
+        for col, header in enumerate(HEADERS, 1):
+            sheet.cell(next_row, col).value = next_values.get(header)
+        book.save(self.paths[0])
+        book.close()
+        self.execute()
+        next_batch = next(batch for batch in read_batches(self.paths[0]) if batch["case_id"] == "NEXT-1")
+        self.assertEqual(next_batch["cod_no"], "0063")
+        self.assertEqual(len(FakeOutlook.saved), 3)
 
     def test_original_parts_formulas_layout_validation_and_backup_preserved(self):
         self.one_ready()
@@ -191,6 +273,23 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(db.execute("SELECT count(*) FROM batches").fetchone()[0], 0)
         db.close()
 
+    def test_na_after_a_saved_certificate_is_reported_without_a_new_alert_or_draft(self):
+        self.one_ready()
+        self.execute()
+        self.assertEqual(len(FakeOutlook.saved), 1)
+
+        book = load_workbook(self.paths[0])
+        book["Inward Register"]["N2"] = "N/A"
+        book.save(self.paths[0])
+        book.close()
+
+        self.execute(check_only=True)
+        row = next(row for row in self.report["rows"] if row["sn"] == "1")
+        self.assertEqual(row["outcome"], "already_prepared")
+        self.assertFalse(row.get("system_alert", False))
+        self.assertIn("N/A skips new drafts but does not delete that draft", row["detail"])
+        self.assertEqual(len(FakeOutlook.saved), 1)
+
     def test_missing_plant_and_duplicate_cod_block_numbering(self):
         self.one_ready()
         missing = self.root / "missing.xlsx"
@@ -201,8 +300,9 @@ class WorkflowTests(unittest.TestCase):
         self.paths[1] = original
         make_book(self.paths[0], [{"COD No": "0061"}, {"SN": "2"}])
         self.execute()
-        self.assertFalse(FakeOutlook.saved)
-        self.assertIn("already repeated", str(self.report))
+        self.assertEqual(len(FakeOutlook.saved), 1)
+        self.assertIn("also entered", str(self.report))
+        self.assertIn("0062", FakeOutlook.saved[0][2])
 
     def test_unknown_number_format_is_not_guessed(self):
         self.one_ready()
@@ -235,12 +335,24 @@ class WorkflowTests(unittest.TestCase):
                 history.acknowledge_sent('plant2|1', '0061')
             history.acknowledge_sent('1', '0062')
             original = history.sent_acknowledgement('1')
+            created_row = next(row for row in self.report['rows'] if row['outcome'] == 'draft_created')
+            self.assertTrue(created_row['awaiting_send'])
             history.acknowledge_sent('1', '0062')
             self.assertEqual(original, history.sent_acknowledgement('1'))
+            update_issued_status(self.paths[0], self.root / 'Data' / 'Workbook Backups',
+                                 '1', 'Inward Register', 2, '0062', 'Completed', 'Sent')
             self.execute()
             self.assertEqual(len(FakeOutlook.saved), 1)
+            prepared_row = next(row for row in self.report['rows'] if row['outcome'] == 'sent')
+            self.assertFalse(prepared_row.get('awaiting_send', False))
             history.undo_sent_acknowledgement('1')
             self.assertIsNone(history.sent_acknowledgement('1'))
+            update_issued_status(self.paths[0], self.root / 'Data' / 'Workbook Backups',
+                                 '1', 'Inward Register', 2, '0062', 'Sent', 'Completed')
+            self.execute()
+            self.assertEqual(len(FakeOutlook.saved), 1)
+            prepared_row = next(row for row in self.report['rows'] if row['outcome'] == 'completed')
+            self.assertTrue(prepared_row['awaiting_send'])
         finally:
             history.close()
 
@@ -274,6 +386,23 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(latest_json.read_text(encoding="utf-8"), '{"marker":"plant report"}')
         self.assertEqual(latest_text.read_text(encoding="utf-8"), "plant report")
         self.assertFalse(FakeOutlook.saved)
+
+    def test_read_only_check_keeps_an_existing_unsent_draft_in_the_alert_queue(self):
+        from draft_service import History
+        self.one_ready()
+        self.execute()
+        history = History(self.root / "Data" / "certificate-history.sqlite")
+        try:
+            history.db.execute("UPDATE batches SET status='draft_saved' WHERE case_id='1'")
+            history.db.commit()
+        finally:
+            history.close()
+
+        self.execute(create_drafts=False, check_only=True)
+        rows = [row for row in self.report["rows"] if row["outcome"] == "ready"]
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0]["awaiting_send"])
+        self.assertEqual(len(FakeOutlook.saved), 1)
 
     def test_one_draft_action_uses_the_shared_workflow_and_updates_one_row(self):
         paths = [self.root / "Dummy_Inward_Plant_1.xlsx", self.root / "Dummy_Inward_Plant_2.xlsx"]
@@ -327,7 +456,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(FakeOutlook.saved), 1)
         self.assertEqual(read_batches(paths[0])[0]["cod_no"], "0001")
 
-    def test_existing_excel_cod_without_history_is_not_redrafted_and_advances_sequence(self):
+    def test_existing_excel_cod_without_history_is_used_as_custom_and_advances_sequence(self):
         paths = [self.root / "Dummy_Inward_Plant_1.xlsx", self.root / "Dummy_Inward_Plant_2.xlsx"]
         make_book(paths[0], [{"COD No": "0302", "COD Date": TODAY}, {"SN": "2"}])
         make_book(paths[1], [{"Certificate Issued": "N/A"}])
@@ -338,12 +467,100 @@ class WorkflowTests(unittest.TestCase):
         report = json.loads((output / "Results.json").read_text(encoding="utf-8"))
         plant1 = read_batches(paths[0])
 
-        self.assertEqual((created, review), (1, 0), report)
+        self.assertEqual((created, review), (2, 0), report)
         self.assertEqual(plant1[0]["cod_no"], "0302")
+        self.assertEqual(plant1[0]["issued"], "Completed")
         self.assertEqual(plant1[1]["cod_no"], "0303")
+        self.assertEqual(len(FakeOutlook.saved), 2)
+        self.assertIn("0302", FakeOutlook.saved[0][2])
+        self.assertIn("0303", FakeOutlook.saved[1][2])
+
+    def test_duplicate_custom_cod_only_blocks_the_rows_that_claim_it(self):
+        make_book(self.paths[0], [{"COD No": "0061"}, {"SN": "2", "COD No": "0061"}, {"SN": "3"}])
+        make_book(self.paths[1], [{"Certificate Issued": "N/A", "COD No": "0060"}])
+        created, review, _ = self.execute()
+        self.assertEqual((created, review), (1, 2), self.report)
         self.assertEqual(len(FakeOutlook.saved), 1)
-        self.assertIn("0303", FakeOutlook.saved[0][2])
-        self.assertEqual(sum(row["outcome"] == "already_prepared" for row in report["rows"]), 1)
+        self.assertEqual(FakeOutlook.saved[0][1], "3")
+        self.assertIn("0062", FakeOutlook.saved[0][2])
+        self.assertEqual(read_batches(self.paths[0])[2]["cod_no"], "0062")
+
+    def test_reissue_restores_removed_or_changed_cod_and_date_from_history(self):
+        self.one_ready()
+        self.execute()
+        original = read_batches(self.paths[0])[0]
+        original_date = original["cod_date"].date()
+
+        book = load_workbook(self.paths[0])
+        sheet = book["Inward Register"]
+        sheet["N2"] = "Ready"
+        sheet["L2"] = "0999"
+        sheet["M2"] = TODAY - timedelta(days=1)
+        book.save(self.paths[0])
+        book.close()
+
+        created, review, _ = self.execute()
+        redrafted = read_batches(self.paths[0])[0]
+        self.assertEqual((created, review), (1, 0), self.report)
+        self.assertEqual(len(FakeOutlook.saved), 2)
+        self.assertEqual((redrafted["cod_no"], redrafted["issued"]), (original["cod_no"], "Completed"))
+        self.assertEqual(redrafted["cod_date"].date(), original_date)
+        self.assertIn(original["cod_no"], FakeOutlook.saved[-1][2])
+        self.assertNotIn("0999", FakeOutlook.saved[-1][2])
+
+    def test_removed_cod_from_legacy_draft_is_restored_without_duplicate(self):
+        self.one_ready()
+        self.execute()
+        original = read_batches(self.paths[0])[0]
+        original_date = original["cod_date"].date()
+        db = sqlite3.connect(self.root / "Data" / "certificate-history.sqlite")
+        db.execute("UPDATE batches SET status_written=0 WHERE case_id='1'")
+        db.commit()
+        db.close()
+
+        book = load_workbook(self.paths[0])
+        sheet = book["Inward Register"]
+        sheet["N2"] = "Ready"
+        sheet["L2"] = None
+        sheet["M2"] = None
+        book.save(self.paths[0])
+        book.close()
+
+        created, review, _ = self.execute()
+        restored = read_batches(self.paths[0])[0]
+        self.assertEqual((created, review), (0, 0), self.report)
+        self.assertEqual(len(FakeOutlook.saved), 1)
+        self.assertEqual((restored["cod_no"], restored["issued"]), (original["cod_no"], "Completed"))
+        self.assertEqual(restored["cod_date"].date(), original_date)
+
+    def test_sent_row_restores_removed_cod_and_date_without_creating_a_message(self):
+        self.one_ready()
+        self.execute()
+        original = read_batches(self.paths[0])[0]
+        original_date = original["cod_date"].date()
+
+        from draft_service import History
+        history = History(self.root / "Data" / "certificate-history.sqlite")
+        try:
+            history.acknowledge_sent("1", original["cod_no"])
+        finally:
+            history.close()
+
+        book = load_workbook(self.paths[0])
+        sheet = book["Inward Register"]
+        sheet["N2"] = "Sent"
+        sheet["L2"] = None
+        sheet["M2"] = None
+        book.save(self.paths[0])
+        book.close()
+
+        created, review, _ = self.execute()
+        restored = read_batches(self.paths[0])[0]
+        self.assertEqual((created, review), (0, 0), self.report)
+        self.assertEqual(self.report["updated"], 1)
+        self.assertEqual(len(FakeOutlook.saved), 1)
+        self.assertEqual((restored["cod_no"], restored["issued"]), (original["cod_no"], "Sent"))
+        self.assertEqual(restored["cod_date"].date(), original_date)
 
     def test_first_cod_setting_is_used_as_the_sequence_floor(self):
         self.one_ready()
@@ -404,18 +621,20 @@ class WorkflowTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "already running"):
                 self.execute()
 
-    def test_notification_summary_suppresses_unchanged_and_limits_daily(self):
+    def test_notification_summary_repeats_on_new_runs_without_same_run_duplicates(self):
         notices = []
         notifier = lambda title, body: notices.append((title, body)) or True
-        first = {"created": 0, "rows": [{"outcome": "needs_review", "plant": "plant1", "sn": "1", "detail": "blank"}]}
-        notify_once(self.root, first, notifier, TODAY)
-        notify_once(self.root, first, notifier, TODAY + timedelta(days=1))
+        first = {"created": 0, "rows": [{"outcome": "needs_review", "plant": "plant1", "sn": "1", "detail": "blank", "reminder_due": True}]}
+        notify_once(self.root, first, notifier, TODAY, repeat_pending=True)
+        notify_once(self.root, first, notifier, TODAY, repeat_pending=True)
         self.assertEqual(len(notices), 1)
-        second = {"created": 0, "rows": first["rows"] + [{"outcome": "needs_review", "plant": "plant2", "sn": "2", "detail": "blank"}]}
-        notify_once(self.root, second, notifier, TODAY)
-        self.assertEqual(len(notices), 1)
-        notify_once(self.root, second, notifier, TODAY + timedelta(days=1))
+        notify_once(self.root, first, notifier, TODAY + timedelta(days=1), repeat_pending=True)
         self.assertEqual(len(notices), 2)
+        second = {"created": 0, "rows": first["rows"] + [{"outcome": "needs_review", "plant": "plant2", "sn": "2", "detail": "blank", "reminder_due": True}]}
+        notify_once(self.root, second, notifier, TODAY, repeat_pending=True)
+        self.assertEqual(len(notices), 3)
+        notify_once(self.root, second, notifier, TODAY + timedelta(days=1), repeat_pending=True)
+        self.assertEqual(len(notices), 4)
 
     def test_long_supplier_has_two_centred_lines_within_bounds(self):
         batch = {"supplier": "Dummy Advanced Electronics and Resource Recovery Solutions Private Limited", "location": "Mumbai"}

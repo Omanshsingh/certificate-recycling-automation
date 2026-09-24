@@ -8,7 +8,7 @@ import time
 from html import escape
 from pathlib import Path
 
-from certificate_core import certificate_number, certificate_sequence
+from certificate_core import certificate_number, certificate_sequence, parse_date
 
 
 class History:
@@ -20,8 +20,16 @@ class History:
         self.db.execute("CREATE TABLE IF NOT EXISTS batches (case_id TEXT PRIMARY KEY, fingerprint TEXT, status TEXT, certificate_no TEXT, pdf_path TEXT, entry_id TEXT, updated_at TEXT)")
         self.db.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
         self.db.execute("CREATE TABLE IF NOT EXISTS sent_acknowledgements (case_id TEXT PRIMARY KEY, certificate_no TEXT NOT NULL, sent_at TEXT NOT NULL)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS archived_issuances (case_id TEXT NOT NULL, generation INTEGER NOT NULL, fingerprint TEXT, status TEXT, certificate_no TEXT, pdf_path TEXT, entry_id TEXT, updated_at TEXT, certificate_date TEXT, sent_at TEXT, PRIMARY KEY(case_id,generation))")
         if "certificate_date" not in {row[1] for row in self.db.execute("PRAGMA table_info(batches)")}:
             self.db.execute("ALTER TABLE batches ADD COLUMN certificate_date TEXT")
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(batches)")}
+        for name, declaration in (("generation", "INTEGER NOT NULL DEFAULT 1"),
+                                  ("status_written", "INTEGER NOT NULL DEFAULT 0"),
+                                  ("prior_certificate_no", "TEXT"),
+                                  ("prior_certificate_date", "TEXT")):
+            if name not in columns:
+                self.db.execute(f"ALTER TABLE batches ADD COLUMN {name} {declaration}")
         self.db.commit()
 
     @staticmethod
@@ -59,7 +67,25 @@ class History:
         return None
 
     def complete(self, batch, pdf_path, entry_id):
-        self.db.execute("UPDATE batches SET status='saved',pdf_path=?,entry_id=?,updated_at=datetime('now') WHERE case_id=?", (str(pdf_path), entry_id, self.history_id(batch)))
+        changed = self.db.execute(
+            "UPDATE batches SET status='saved',status_written=1,prior_certificate_no=NULL,prior_certificate_date=NULL,"
+            "pdf_path=?,entry_id=?,updated_at=datetime('now') WHERE case_id=?",
+            (str(pdf_path), entry_id, self.history_id(batch)),
+        )
+        if changed.rowcount != 1:
+            self.db.rollback()
+            raise ValueError("The confirmed draft could not be matched to its active certificate history")
+        self.db.commit()
+
+    def mark_completed(self, batch, certificate_no):
+        changed = self.db.execute(
+            "UPDATE batches SET status_written=1,updated_at=datetime('now') "
+            "WHERE case_id=? AND status='saved' AND certificate_no=? AND fingerprint=?",
+            (self.history_id(batch), certificate_no, self.fingerprint(batch)),
+        )
+        if changed.rowcount != 1:
+            self.db.rollback()
+            raise ValueError("The saved certificate history changed before its Completed status could be recorded")
         self.db.commit()
 
     def record(self, batch):
@@ -67,10 +93,20 @@ class History:
         return dict(row) if row and row["entry_id"] != "PDF_ONLY" else None
 
     def has_numbers(self):
-        return bool(self.records())
+        return bool(self.all_records())
 
     def records(self):
         return [dict(row) for row in self.db.execute("SELECT * FROM batches WHERE COALESCE(entry_id, '') != 'PDF_ONLY'")]
+
+    def all_records(self):
+        """Return active and archived issues for number-history checks."""
+        active = self.records()
+        archived = [dict(row) for row in self.db.execute(
+            "SELECT case_id,generation,fingerprint,status,certificate_no,pdf_path,entry_id,updated_at,certificate_date,"
+            "0 AS status_written,NULL AS prior_certificate_no,NULL AS prior_certificate_date,sent_at "
+            "FROM archived_issuances WHERE COALESCE(entry_id, '') != 'PDF_ONLY'"
+        )]
+        return active + archived
 
     def validate_sources(self, paths, batches, bind=False):
         """Keep legacy plant-slot keys tied to the files that own them."""
@@ -88,28 +124,87 @@ class History:
             self.db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('source_paths',?)", (json.dumps(identities),))
             self.db.commit()
 
-    def allocate(self, batch, settings, minimum, issued_date):
-        """Reserve the next number and the batch together in one transaction."""
+    def allocate(self, batch, settings, minimum, issued_date, reissue=False,
+                 custom_certificate_no=None):
+        """Reserve a COD, reusing the batch's existing COD for an explicit re-draft."""
         self.db.execute("BEGIN IMMEDIATE")
         try:
             row = self.record(batch)
+            prior_number = prior_date = None
             if row:
-                if row["fingerprint"] != self.fingerprint(batch):
-                    raise ValueError("Source details changed after this certificate was reserved")
-                if row["status"] != "allocated":
-                    raise ValueError("An existing certificate cannot be allocated again; reconcile its saved history first")
-                self.db.commit()
-                return row
+                if reissue:
+                    if (row["status"] != "saved" or not row["status_written"]
+                            or row["fingerprint"] != self.fingerprint(batch)):
+                        raise ValueError("A new issue is allowed only after a confirmed Completed certificate is deliberately changed back to Ready and its source details are unchanged")
+                    prior_number = row["certificate_no"]
+                    prior_date = row["certificate_date"]
+                    sent = self.db.execute("SELECT certificate_no,sent_at FROM sent_acknowledgements WHERE case_id=?", (self.history_id(batch),)).fetchone()
+                    self.db.execute(
+                        "INSERT INTO archived_issuances(case_id,generation,fingerprint,status,certificate_no,pdf_path,entry_id,updated_at,certificate_date,sent_at) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                        (row["case_id"], row["generation"], row["fingerprint"], row["status"], row["certificate_no"],
+                         row["pdf_path"], row["entry_id"], row["updated_at"], row["certificate_date"],
+                         sent["sent_at"] if sent and sent["certificate_no"] == row["certificate_no"] else None),
+                    )
+                    self.db.execute("DELETE FROM sent_acknowledgements WHERE case_id=?", (self.history_id(batch),))
+                    self.db.execute("DELETE FROM batches WHERE case_id=?", (self.history_id(batch),))
+                    generation = int(self.db.execute(
+                        "SELECT COALESCE(MAX(generation),0)+1 FROM archived_issuances WHERE case_id=?",
+                        (self.history_id(batch),),
+                    ).fetchone()[0])
+                    self.db.execute(
+                        "INSERT INTO batches(case_id,fingerprint,status,certificate_no,pdf_path,entry_id,updated_at,certificate_date,generation,status_written,prior_certificate_no,prior_certificate_date) "
+                        "VALUES (?,?,?,?,?,?,datetime('now'),?,?,0,NULL,NULL)",
+                        (self.history_id(batch), self.fingerprint(batch), "allocated", prior_number, "", "", prior_date, generation),
+                    )
+                    self.db.commit()
+                    return self.record(batch)
+                else:
+                    if row["fingerprint"] != self.fingerprint(batch):
+                        raise ValueError("Source details changed after this certificate was reserved")
+                    if row["status"] != "allocated":
+                        raise ValueError("An existing certificate cannot be allocated again; reconcile its saved history first")
+                    self.db.commit()
+                    return row
+            elif reissue:
+                raise ValueError("The previous certificate history is missing; review it before requesting a new issue")
+
             saved = self.db.execute("SELECT value FROM meta WHERE key='next_sequence'").fetchone()
-            registered = list(self.db.execute("SELECT certificate_no FROM batches WHERE COALESCE(entry_id, '') != 'PDF_ONLY'"))
+            registered = list(self.db.execute(
+                "SELECT certificate_no FROM batches WHERE COALESCE(entry_id, '') != 'PDF_ONLY' "
+                "UNION ALL SELECT certificate_no FROM archived_issuances WHERE COALESCE(entry_id, '') != 'PDF_ONLY'"
+            ))
             if minimum <= 1 and not registered and not settings.get("initial_cod_confirmed", False):
                 raise ValueError("Neither plant file contains an earlier COD number. Enter the approved first COD number once in the app before issuing.")
             sequence = max(int(settings.get("certificate_number_start", 1)), int(minimum), int(saved[0]) if saved else 1)
             for existing in registered:
                 sequence = max(sequence, certificate_sequence(existing[0], settings) + 1)
-            cert_no = certificate_number(sequence, settings)
-            self.db.execute("INSERT OR REPLACE INTO batches(case_id,fingerprint,status,certificate_no,pdf_path,entry_id,updated_at,certificate_date) VALUES (?,?,?,?,?,?,datetime('now'),?)", (self.history_id(batch), self.fingerprint(batch), "allocated", cert_no, "", "", issued_date.isoformat()))
-            self.db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('next_sequence',?)", (str(sequence + 1),))
+            if custom_certificate_no:
+                custom_sequence = certificate_sequence(custom_certificate_no, settings)
+                owner = self.history_id(batch)
+                for existing in self.db.execute(
+                    "SELECT case_id,certificate_no FROM batches WHERE COALESCE(entry_id, '') != 'PDF_ONLY' "
+                    "UNION ALL SELECT case_id,certificate_no FROM archived_issuances WHERE COALESCE(entry_id, '') != 'PDF_ONLY'"
+                ):
+                    if (existing[0] != owner
+                            and certificate_sequence(existing[1], settings) == custom_sequence):
+                        raise ValueError(f"COD {custom_certificate_no} is already assigned to another inward. Leave COD No blank to use the next number, or enter a unique COD.")
+                cert_no = str(custom_certificate_no).strip()
+                sequence = max(sequence, custom_sequence + 1)
+                next_sequence = sequence
+            else:
+                cert_no = certificate_number(sequence, settings)
+                next_sequence = sequence + 1
+            generation = int(self.db.execute(
+                "SELECT COALESCE(MAX(generation),0)+1 FROM archived_issuances WHERE case_id=?",
+                (self.history_id(batch),),
+            ).fetchone()[0])
+            self.db.execute(
+                "INSERT INTO batches(case_id,fingerprint,status,certificate_no,pdf_path,entry_id,updated_at,certificate_date,generation,status_written,prior_certificate_no,prior_certificate_date) "
+                "VALUES (?,?,?,?,?,?,datetime('now'),?,?,0,?,?)",
+                (self.history_id(batch), self.fingerprint(batch), "allocated", cert_no, "", "", issued_date.isoformat(), generation, prior_number, prior_date),
+            )
+            self.db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('next_sequence',?)", (str(next_sequence),))
             self.db.commit()
             return self.record(batch)
         except Exception:

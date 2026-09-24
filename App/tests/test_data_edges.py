@@ -16,7 +16,7 @@ from openpyxl.utils.datetime import CALENDAR_MAC_1904
 from reportlab.pdfbase.pdfmetrics import stringWidth
 
 from certificate_core import certificate_layout, columns, eligible, fit, make_certificate, number, parse_date, read_batches, valid_email
-from workbook_store import WorkbookSession, _set_cell, exclusive_file, LockBusyError
+from workbook_store import WorkbookSession, _set_cell, exclusive_file, LockBusyError, update_issued_status
 
 
 TODAY = date(2026, 9, 23)
@@ -206,11 +206,37 @@ class DataEdges(unittest.TestCase):
                     self.assertEqual(before.read(name), after.read(name), name)
             old_xml = before.read("xl/worksheets/sheet1.xml").decode()
             new_xml = after.read("xl/worksheets/sheet1.xml").decode()
-            self.assertEqual(old_xml, re.sub(r'<c r="[LM]2".*?</c>', '', new_xml))
+            strip_outputs = lambda xml: re.sub(r'<c r="[LMN]2".*?</c>', '', xml)
+            self.assertEqual(strip_outputs(old_xml), strip_outputs(new_xml))
         book = load_workbook(self.path)
         self.addCleanup(book.close)
         self.assertEqual(book.active["L2"].value, "0001")
         self.assertEqual(book.active["M2"].value.date(), TODAY)
+        self.assertEqual(book.active["N2"].value, "Completed")
+
+    def test_mark_sent_changes_only_status_cell_and_keeps_recoverable_backup(self):
+        self.book(changes={"COD No": "0042", "COD Date": TODAY, "Certificate Issued": "Completed"})
+        original = self.path.read_bytes()
+        before = read_batches(self.path)[0]
+        backup = update_issued_status(self.path, self.backups, "1", "Register", 2,
+                                      "0042", "completed", "Sent")
+        self.assertEqual(backup.read_bytes(), original)
+        after = read_batches(self.path)[0]
+        self.assertEqual(after["issued"], "Sent")
+        self.assertEqual(after["cod_no"], before["cod_no"])
+        self.assertEqual(after["cod_date"], before["cod_date"])
+        book = load_workbook(self.path, data_only=False)
+        try:
+            sheet = book["Register"]
+            self.assertEqual(sheet["H2"].value, "=F2*G2")
+            self.assertEqual(sheet["N2"].value, "Sent")
+        finally:
+            book.close()
+        saved = self.path.read_bytes()
+        with self.assertRaisesRegex(ValueError, "status changed"):
+            update_issued_status(self.path, self.backups, "1", "Register", 2,
+                                 "0042", "completed", "Sent")
+        self.assertEqual(self.path.read_bytes(), saved)
 
     def test_date_epoch_and_existing_date_style_survive(self):
         def edit(book, sheet):
@@ -218,7 +244,7 @@ class DataEdges(unittest.TestCase):
             sheet["M2"].number_format = "dd.mm.yyyy"
             sheet["M2"].fill = PatternFill("solid", fgColor="AAFFAA")
             sheet.protection.sheet = True
-            for coord in ["L2", "M2"]:
+            for coord in ["L2", "M2", "N2"]:
                 sheet[coord].protection = Protection(locked=False)
         batch = self.batch(edit=edit)
         with ZipFile(self.path) as archive:
@@ -331,13 +357,14 @@ class DataEdges(unittest.TestCase):
                 with exclusive_file(self.path):
                     self.fail("Second exclusive lock must not succeed")
 
-    def test_zero_cod_date_is_not_an_empty_cell(self):
+    def test_invalid_orphan_cod_date_is_replaced_with_confirmed_issue_date(self):
         batch = self.batch(changes={"COD Date": 0})
-        original = self.path.read_bytes()
         with WorkbookSession(self.path, self.backups) as session:
-            with self.assertRaisesRegex(ValueError, "COD Date is already filled"):
-                session.commit(batch, "0001", TODAY)
-        self.assertEqual(self.path.read_bytes(), original)
+            session.commit(batch, "0001", TODAY)
+        updated = read_batches(self.path)[0]
+        self.assertEqual(updated["cod_no"], "0001")
+        self.assertEqual(parse_date(updated["cod_date"]), TODAY)
+        self.assertEqual(updated["issued"], "Completed")
 
     def test_xml_attribute_entities_are_not_double_escaped(self):
         xml = '<worksheet><sheetData><row r="2"><c r="L2" custom="a&amp;b"/></row></sheetData></worksheet>'

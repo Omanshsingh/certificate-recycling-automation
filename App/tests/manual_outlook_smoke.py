@@ -17,12 +17,13 @@ from certificate_core import read_batches
 from draft_service import OutlookWriter
 from run_certificates import run
 from workflow_support import load_settings, save_json
+from app_paths import DATA_ROOT
 from test_workflow import make_book
 
 
 def main():
     import pythoncom
-    mailbox = load_settings(ROOT)['outlook_mailbox']
+    mailbox = load_settings(DATA_ROOT)['outlook_mailbox']
     if not mailbox:
         raise RuntimeError('Select a Classic Outlook mailbox in the app first.')
     key = 'SMOKE-' + uuid.uuid4().hex

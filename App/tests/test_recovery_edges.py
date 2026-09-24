@@ -105,11 +105,12 @@ class RecoveryEdges(unittest.TestCase):
         self.assertEqual(self.report["observed_sources"], ["plant2"])
         self.assertIn("blank (white)", str(self.report))
 
-    def test_duplicate_global_number_lists_candidate_waiting_even_in_check(self):
+    def test_duplicate_custom_number_marks_its_owner_but_keeps_other_ready_row_eligible_in_check(self):
         make_book(self.paths[0], [{"COD No": "0061"}, {"SN": "2"}])
         self.execute(check_only=True)
         self.assertTrue(self.report["scan_complete"])
-        self.assertTrue(any(r["sn"] == "2" and r["outcome"] == "waiting" for r in self.report["rows"]))
+        self.assertTrue(any(r["sn"] == "1" and r["outcome"] == "needs_review" for r in self.report["rows"]))
+        self.assertTrue(any(r["sn"] == "2" and r["outcome"] == "ready" for r in self.report["rows"]))
         self.assertFalse(FakeOutlook.saved)
 
     def test_lock_failure_reports_all_unprocessed_candidates(self):
@@ -123,8 +124,9 @@ class RecoveryEdges(unittest.TestCase):
         self.edit(1, "L2", "0062")
         self.execute()
         self.assertEqual(len(FakeOutlook.saved), 1)
-        self.assertIn("belongs to another batch", str(self.report))
-        self.assertEqual(_read_sources(self.paths)[0]["cod_no"], "")
+        self.assertEqual(self.report["updated"], 1)
+        self.assertEqual(_read_sources(self.paths)[0]["cod_no"], "0062")
+        self.assertEqual(_read_sources(self.paths)[0]["issued"], "Completed")
 
     def test_slot_swap_blocks_even_if_case_details_are_identical(self):
         make_book(self.paths[1], [{}])
@@ -182,19 +184,22 @@ class RecoveryEdges(unittest.TestCase):
         self.assertEqual(self.report["updated"], 1)
         self.assertEqual(len(FakeOutlook.saved), 1)
 
-    def test_saved_excel_date_drift_is_not_silently_accepted(self):
+    def test_saved_excel_date_drift_is_restored_from_confirmed_history(self):
         self.execute()
         self.edit(0, "M2", TODAY - timedelta(days=1))
         self.execute()
-        self.assertIn("COD Date differs", str(self.report))
+        self.assertEqual(self.report["updated"], 1)
+        self.assertEqual(_read_sources(self.paths)[0]["cod_date"].date(), TODAY)
         self.assertEqual(len(FakeOutlook.saved), 1)
 
-    def test_blank_saved_cod_is_not_issued_again(self):
+    def test_blank_saved_cod_is_restored_without_issuing_again(self):
         self.execute()
         self.edit(0, "L2", None)
         self.edit(0, "M2", None)
         self.execute()
-        self.assertIn("already prepared but its Excel COD No is blank", str(self.report))
+        self.assertEqual(self.report["updated"], 1)
+        self.assertEqual(_read_sources(self.paths)[0]["cod_no"], "0062")
+        self.assertEqual(_read_sources(self.paths)[0]["issued"], "Completed")
         self.assertEqual(len(FakeOutlook.saved), 1)
 
     def test_rekeyed_saved_batch_without_its_cod_blocks_new_draft(self):
@@ -231,13 +236,17 @@ class RecoveryEdges(unittest.TestCase):
         self.assertEqual(self.report["updated"], 0)
         self.assertEqual(len(FakeOutlook.saved), 1)
 
-    def test_registry_duplicate_owners_block_all_new_numbers(self):
+    def test_orphaned_history_still_blocks_new_numbers(self):
         self.workbook_failure()
         with self.history() as history:
-            history.db.execute("INSERT INTO batches SELECT 'other',fingerprint,status,certificate_no,pdf_path,entry_id,updated_at,certificate_date FROM batches LIMIT 1")
+            history.db.execute(
+                "INSERT INTO batches(case_id,fingerprint,status,certificate_no,pdf_path,entry_id,updated_at,certificate_date,generation,status_written,prior_certificate_no,prior_certificate_date) "
+                "SELECT 'other',fingerprint,status,certificate_no,pdf_path,entry_id,updated_at,certificate_date,generation,status_written,prior_certificate_no,prior_certificate_date FROM batches LIMIT 1"
+            )
             history.db.commit()
         self.execute()
-        self.assertIn("multiple registry owners", str(self.report))
+        self.assertIn("no matching source row", str(self.report))
+        self.assertTrue(any(row["outcome"] == "waiting" for row in self.report["rows"]))
         self.assertEqual(len(FakeOutlook.saved), 1)
 
     def test_history_namespace_collision_blocks_before_allocation(self):

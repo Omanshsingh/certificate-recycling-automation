@@ -64,7 +64,7 @@ class VolumeTests(unittest.TestCase):
         repeat = self.execute()
         self.assertEqual((repeat["created"], repeat["review"]), (0, 0), repeat)
         self.assertEqual(len(FakeOutlook.saved), 100)
-        self.assertEqual(Counter(r["outcome"] for r in repeat["rows"]), {"already_prepared": 100})
+        self.assertEqual(Counter(r["outcome"] for r in repeat["rows"]), {"completed": 100})
         print(f"\n100-dummy-certificate run: {elapsed:.2f}s; real PDF generation and Excel writes; Outlook simulated.", flush=True)
 
     def test_100_mixed_batches_have_complete_results_and_one_quiet_alert(self):
@@ -77,14 +77,15 @@ class VolumeTests(unittest.TestCase):
         self.assertEqual(Counter(r["outcome"] for r in result["rows"]), {"draft_created": 40, "needs_review": 40, "not_applicable": 20})
         messages = []
         notifier = lambda title, body: messages.append(body) or True
-        notify_once(self.root, result, notifier, TODAY)
+        notify_once(self.root, result, notifier, TODAY, repeat_pending=True)
         self.assertEqual(len(messages), 1)
-        self.assertIn("40 new draft(s)", messages[0])
-        self.assertIn("40 issue(s)", messages[0])
+        self.assertIn("60 inward records are 30+ days old", messages[0])
+        self.assertNotIn("draft", messages[0].casefold())
         repeat = self.execute()
-        notify_once(self.root, repeat, notifier, TODAY + timedelta(days=1))
+        notify_once(self.root, repeat, notifier, TODAY + timedelta(days=1), repeat_pending=True)
         self.assertEqual(len(FakeOutlook.saved), 40)
-        self.assertEqual(len(messages), 1)
+        self.assertEqual(len(messages), 2)
+        self.assertIn("60 inward records are 30+ days old", messages[1])
 
 
 if __name__ == "__main__":

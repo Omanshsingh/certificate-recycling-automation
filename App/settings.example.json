@@ -5,6 +5,7 @@
   "certificate_number_width": 4,
   "outlook_mailbox": "",
   "quiet_notifications": true,
+  "reminder_time": "09:00",
   "workbook_paths": [
     "",
     ""

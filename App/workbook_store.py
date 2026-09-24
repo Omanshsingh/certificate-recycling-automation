@@ -1,4 +1,4 @@
-"""Lock source files and update only the two COD cells in their XLSX package."""
+"""Lock source files and atomically update certificate fields in their XLSX package."""
 from __future__ import annotations
 
 from contextlib import contextmanager
@@ -153,39 +153,69 @@ class WorkbookSession:
             finally:
                 self.context = None
 
-    def prepare(self, batch, certificate_no=None):
+    def prepare(self, batch, certificate_no=None, allow_completed=False,
+                expected_previous_no=None, expected_previous_date=None,
+                allow_history_restore=False, allow_sent=False):
         if self.context is None:
             raise PermissionError("The workbook became unavailable during its update. Close it in Excel and run again.")
         matches = [b for b in read_batches(BytesIO(self.data)) if b["case_id"] == batch["case_id"] and b["source_sheet"] == batch["source_sheet"]]
         if len(matches) != 1 or batch_content(matches[0]) != batch_content(batch):
             raise ValueError("The source batch changed; check the worksheet before continuing.")
         current = matches[0]
-        if status_value(current["issued"]) != "ready":
-            raise ValueError("Certificate Issued must contain Ready before generating a certificate.")
-        if current["cod_no"] and current["cod_no"] != certificate_no:
+        valid_statuses = {"ready"}
+        if allow_completed:
+            valid_statuses.add("completed")
+        if allow_sent:
+            valid_statuses.add("sent")
+        if status_value(current["issued"]) not in valid_statuses:
+            raise ValueError("Choose Ready before creating a new draft. A completed row must be changed back to Ready to request another issue.")
+        if (expected_previous_no and current["cod_no"] not in {certificate_no, expected_previous_no}
+                and not allow_history_restore):
+            raise ValueError("The previous COD is no longer in this row; review it before requesting another certificate.")
+        if (current["cod_no"] and current["cod_no"] not in {certificate_no, expected_previous_no}
+                and not allow_history_restore):
             raise ValueError("This batch already has a different COD number; it was not overwritten.")
+        if expected_previous_no and current["cod_no"] == expected_previous_no and not allow_history_restore:
+            if (status_value(current["issued"]) != "ready"
+                    and not (allow_completed and status_value(current["issued"]) == "completed")):
+                raise ValueError("A previous COD can be replaced only after the row is deliberately changed back to Ready.")
+            if parse_date(current["cod_date"]) != parse_date(expected_previous_date):
+                raise ValueError("The previous COD Date changed; review it before requesting another certificate.")
         book = load_workbook(BytesIO(self.data), data_only=False)
         try:
             sheet = book[current["source_sheet"]]
             cols = columns([c.value for c in sheet[1]])
             if not {"cod_no", "cod_date"}.issubset(cols):
                 raise ValueError("Add COD No and COD Date columns before preparing drafts.")
-            cells = [sheet.cell(current["source_row"], cols[key] + 1) for key in ("cod_no", "cod_date")]
+            if "issued" not in cols:
+                raise ValueError("Add a Certificate Issued column so the app can record Completed after saving the draft.")
+            cells = [sheet.cell(current["source_row"], cols[key] + 1) for key in ("cod_no", "cod_date", "issued")]
             for cell in cells:
                 if any(cell.coordinate in merged for merged in sheet.merged_cells.ranges):
                     raise ValueError(f"{cell.coordinate} belongs to merged cells; unmerge the COD output cells before issuing.")
                 if cell.data_type == "f" or (sheet.protection.sheet and cell.protection.locked):
                     raise ValueError(f"{cell.coordinate} is a formula or protected cell; it was not overwritten.")
-            if text(current["cod_date"]) and not current["cod_no"]:
-                raise ValueError("COD Date is already filled but COD No is blank; check this batch first.")
-            return current, cells[0].coordinate, cells[1].coordinate, cells[1].style_id, is_date_format(cells[1].number_format), book.epoch
+            return (current, cells[0].coordinate, cells[1].coordinate, cells[2].coordinate,
+                    cells[1].style_id, is_date_format(cells[1].number_format), book.epoch)
         finally:
             book.close()
 
-    def commit(self, batch, certificate_no, certificate_date):
-        current, cod_cell, date_cell, style_id, has_date_style, epoch = self.prepare(batch, certificate_no)
-        if text(current["cod_date"]) and parse_date(current["cod_date"]) != certificate_date:
-            raise ValueError("COD Date differs from the saved certificate date; it was not overwritten.")
+    def commit(self, batch, certificate_no, certificate_date,
+               expected_previous_no=None, expected_previous_date=None,
+               allow_history_restore=False, target_status="Completed"):
+        if status_value(target_status) not in {"completed", "sent"}:
+            raise ValueError("The workbook can only be updated to Completed or Sent after certificate history is confirmed.")
+        current, cod_cell, date_cell, status_cell, style_id, has_date_style, epoch = self.prepare(
+            batch, certificate_no, allow_completed=True,
+            expected_previous_no=expected_previous_no,
+            expected_previous_date=expected_previous_date,
+            allow_history_restore=allow_history_restore,
+            allow_sent=status_value(target_status) == "sent",
+        )
+        replacing_previous = bool(expected_previous_no and current["cod_no"] == expected_previous_no)
+        if replacing_previous and not allow_history_restore:
+            if parse_date(current["cod_date"]) != parse_date(expected_previous_date):
+                raise ValueError("The previous COD Date changed; it was not overwritten.")
         with ZipFile(BytesIO(self.data)) as source:
             member = _sheet_member(source, current["source_sheet"])
             xml = source.read(member).decode("utf-8")
@@ -195,6 +225,7 @@ class WorkbookSession:
                 changed["xl/styles.xml"] = styles.encode("utf-8")
             xml = _set_cell(xml, cod_cell, certificate_no, "inlineStr")
             xml = _set_cell(xml, date_cell, to_excel(certificate_date, epoch), "n", style_id)
+            xml = _set_cell(xml, status_cell, target_status, "inlineStr")
             ET.fromstring(xml)
             changed[member] = xml.encode("utf-8")
             buffer = BytesIO()
@@ -204,8 +235,71 @@ class WorkbookSession:
                     target.writestr(info, changed.get(info.filename, source.read(info.filename)))
         updated = buffer.getvalue()
         verified = next(b for b in read_batches(BytesIO(updated)) if b["case_id"] == current["case_id"])
-        if verified["cod_no"] != certificate_no or parse_date(verified["cod_date"]) != certificate_date:
-            raise ValueError("Excel update could not be verified; the original workbook was kept.")
+        if (verified["cod_no"] != certificate_no
+                or parse_date(verified["cod_date"]) != certificate_date
+                or status_value(verified["issued"]) != status_value(target_status)):
+            raise ValueError(f"Excel COD, date, or {target_status} status could not be verified; the original workbook was kept.")
+        return self._persist(updated)
+
+    def set_issued_status(self, case_id, source_sheet, source_row, expected_certificate_no,
+                          expected_status, new_status):
+        """Change only Certificate Issued after a deliberate operator action."""
+        if self.context is None:
+            raise PermissionError("The workbook became unavailable during its update. Close it in Excel and try again.")
+        if isinstance(expected_status, str):
+            expected_status = (expected_status,)
+        expected = {status_value(value) for value in expected_status}
+        target = status_value(new_status)
+        if target not in {"completed", "sent"}:
+            raise ValueError("Only Completed or Sent can be recorded by this action.")
+        matches = [batch for batch in read_batches(BytesIO(self.data))
+                   if batch["case_id"] == str(case_id)
+                   and batch["source_sheet"] == source_sheet
+                   and batch["source_row"] == int(source_row)]
+        if len(matches) != 1:
+            raise ValueError("The selected inward row changed or could not be found. Check both files again before updating its status.")
+        current = matches[0]
+        if current["cod_no"] != str(expected_certificate_no):
+            raise ValueError("The selected row's COD No changed. Check both files again before updating its status.")
+        if status_value(current["issued"]) not in expected:
+            raise ValueError("The selected row's Certificate Issued status changed. Check both files again before updating it.")
+        book = load_workbook(BytesIO(self.data), data_only=False)
+        try:
+            sheet = book[current["source_sheet"]]
+            cols = columns([cell.value for cell in sheet[1]])
+            if "issued" not in cols:
+                raise ValueError("Add a Certificate Issued column before updating the sent status.")
+            cell = sheet.cell(current["source_row"], cols["issued"] + 1)
+            if any(cell.coordinate in merged for merged in sheet.merged_cells.ranges):
+                raise ValueError(f"{cell.coordinate} belongs to merged cells; unmerge it before changing the status.")
+            if cell.data_type == "f" or (sheet.protection.sheet and cell.protection.locked):
+                raise ValueError(f"{cell.coordinate} is a formula or protected cell; its status was not changed.")
+            coordinate = cell.coordinate
+        finally:
+            book.close()
+        with ZipFile(BytesIO(self.data)) as source:
+            member = _sheet_member(source, current["source_sheet"])
+            xml = source.read(member).decode("utf-8")
+            xml = _set_cell(xml, coordinate, new_status, "inlineStr")
+            ET.fromstring(xml)
+            buffer = BytesIO()
+            with ZipFile(buffer, "w") as target_archive:
+                target_archive.comment = source.comment
+                for info in source.infolist():
+                    target_archive.writestr(info, xml.encode("utf-8") if info.filename == member
+                                             else source.read(info.filename))
+        updated = buffer.getvalue()
+        verified = next(batch for batch in read_batches(BytesIO(updated))
+                        if batch["case_id"] == str(case_id)
+                        and batch["source_sheet"] == source_sheet
+                        and batch["source_row"] == int(source_row))
+        if (status_value(verified["issued"]) != target
+                or verified["cod_no"] != current["cod_no"]
+                or parse_date(verified["cod_date"]) != parse_date(current["cod_date"])):
+            raise ValueError("The workbook status update could not be verified; the original file was kept.")
+        return self._persist(updated)
+
+    def _persist(self, updated):
         if not self.backup_path:
             self.backup_dir.mkdir(parents=True, exist_ok=True)
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -253,3 +347,13 @@ class WorkbookSession:
             if temporary.exists():
                 temporary.unlink()
         return self.backup_path
+
+
+def update_issued_status(path, backup_dir, case_id, source_sheet, source_row,
+                         expected_certificate_no, expected_status, new_status):
+    """Safely update only the issued-status cell after checking its current values."""
+    with WorkbookSession(path, backup_dir) as session:
+        return session.set_issued_status(
+            case_id, source_sheet, source_row, expected_certificate_no,
+            expected_status, new_status,
+        )

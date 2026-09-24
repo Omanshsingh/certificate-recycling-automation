@@ -10,7 +10,9 @@ import subprocess
 import sys
 import tempfile
 import tkinter as tk
+import tkinter.ttk as ttk
 import unittest
+from datetime import date
 from unittest.mock import Mock, patch
 
 from openpyxl import Workbook
@@ -18,9 +20,103 @@ from openpyxl import Workbook
 import desktop_app
 import scheduled_run
 import validate_daily_setup
+import workflow_support
 from workflow_support import load_settings, save_json
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+class CenteredReminderLifecycle(unittest.TestCase):
+    def _run_standalone(self, trigger):
+        host, window = Mock(), Mock()
+        window.winfo_width.return_value = 420
+        window.winfo_height.return_value = 240
+        window.winfo_screenwidth.return_value = 1600
+        window.winfo_screenheight.return_value = 900
+        protocols, bindings, buttons = {}, {}, []
+        window.protocol.side_effect = lambda key, callback: protocols.__setitem__(key, callback)
+        window.bind.side_effect = lambda key, callback: bindings.__setitem__(key, callback)
+
+        def button_factory(*_args, **kwargs):
+            button = Mock()
+            button.command = kwargs["command"]
+            buttons.append(button)
+            return button
+
+        host.mainloop.side_effect = lambda: trigger(host, window, buttons, protocols, bindings)
+        on_snooze, on_dismiss, on_review = Mock(), Mock(), Mock()
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(workflow_support.tk, "Tk", return_value=host))
+            stack.enter_context(patch.object(workflow_support.tk, "Toplevel", return_value=window))
+            stack.enter_context(patch.object(workflow_support.tk, "StringVar", return_value=Mock()))
+            stack.enter_context(patch.object(ttk, "Label", side_effect=lambda *_a, **_k: Mock()))
+            stack.enter_context(patch.object(ttk, "Frame", side_effect=lambda *_a, **_k: Mock()))
+            stack.enter_context(patch.object(ttk, "Button", side_effect=button_factory))
+            action = workflow_support.show_centered_reminder(
+                "Reminder", "Private-free test summary", on_snooze=on_snooze,
+                on_dismiss=on_dismiss, on_review=on_review)
+        return action, host, window, on_snooze, on_dismiss, on_review
+
+    def test_each_standalone_button_quits_the_hidden_host_loop(self):
+        for index, expected in enumerate(("review", "dismiss", "snooze")):
+            with self.subTest(button=expected):
+                action, host, window, snooze, dismiss, review = self._run_standalone(
+                    lambda _host, _window, buttons, _protocols, _bindings:
+                    buttons[index].command())
+                self.assertEqual(action, expected)
+                host.quit.assert_called_once_with()
+                host.destroy.assert_called_once_with()
+                window.destroy.assert_called_once_with()
+                self.assertEqual(dismiss.call_count, 0 if expected == "snooze" else 1)
+                self.assertEqual(review.call_count, 1 if expected == "review" else 0)
+                self.assertEqual(snooze.call_count, 1 if expected == "snooze" else 0)
+
+    def test_standalone_window_close_and_escape_quit_the_host_loop(self):
+        for event in ("WM_DELETE_WINDOW", "<Escape>"):
+            with self.subTest(event=event):
+                def trigger(_host, _window, _buttons, protocols, bindings):
+                    if event == "WM_DELETE_WINDOW":
+                        protocols[event]()
+                    else:
+                        bindings[event](None)
+
+                action, host, window, _snooze, dismiss, _review = self._run_standalone(trigger)
+                self.assertEqual(action, "dismiss")
+                host.quit.assert_called_once_with()
+                host.destroy.assert_called_once_with()
+                window.destroy.assert_called_once_with()
+                dismiss.assert_called_once_with()
+
+    def test_embedded_parent_path_does_not_quit_or_destroy_the_app_root(self):
+        parent, window = Mock(), Mock()
+        window.winfo_width.return_value = 420
+        window.winfo_height.return_value = 240
+        window.winfo_screenwidth.return_value = 1600
+        window.winfo_screenheight.return_value = 900
+        buttons, bindings = [], {}
+        window.bind.side_effect = lambda key, callback: bindings.__setitem__(key, callback)
+
+        def button_factory(*_args, **kwargs):
+            button = Mock()
+            button.command = kwargs["command"]
+            buttons.append(button)
+            return button
+
+        parent.wait_window.side_effect = lambda _window: buttons[1].command()
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(workflow_support.tk, "Tk",
+                                             side_effect=AssertionError("embedded path made a new root")))
+            stack.enter_context(patch.object(workflow_support.tk, "Toplevel", return_value=window))
+            stack.enter_context(patch.object(workflow_support.tk, "StringVar", return_value=Mock()))
+            stack.enter_context(patch.object(ttk, "Label", side_effect=lambda *_a, **_k: Mock()))
+            stack.enter_context(patch.object(ttk, "Frame", side_effect=lambda *_a, **_k: Mock()))
+            stack.enter_context(patch.object(ttk, "Button", side_effect=button_factory))
+            action = workflow_support.show_centered_reminder("Reminder", "Test", parent=parent)
+        self.assertEqual(action, "dismiss")
+        parent.quit.assert_not_called()
+        parent.destroy.assert_not_called()
+        parent.wait_window.assert_called_once_with(window)
+        window.destroy.assert_called_once_with()
 
 
 class TemporarySetup(unittest.TestCase):
@@ -42,7 +138,8 @@ class TemporarySetup(unittest.TestCase):
         self.addCleanup(self.stack.close)
         self.stack.enter_context(patch("draft_service.OutlookWriter", side_effect=AssertionError("Real Outlook is forbidden in these tests")))
         self.stack.enter_context(patch("run_certificates.OutlookWriter", side_effect=AssertionError("Real Outlook is forbidden in these tests")))
-        self.notifier = self.stack.enter_context(patch("workflow_support.windows_notification", return_value=True))
+        # Daily tests must never open a real reminder window.
+        self.notifier = self.stack.enter_context(patch("workflow_support.show_centered_reminder", return_value="dismiss"))
 
 
 class DesktopEdges(TemporarySetup):
@@ -75,6 +172,14 @@ class DesktopEdges(TemporarySetup):
     def app(self):
         return desktop_app.App(self.window(), self.base)
 
+    def test_saved_setup_is_collapsed_and_new_setup_opens_automatically(self):
+        app = self.app()
+        self.assertFalse(app.settings_visible)
+        self.assertEqual(app.plants_frame.master, app.settings_frame)
+        save_json(self.base / 'settings.local.json', {'workbook_paths': ['', '']})
+        fresh = self.app()
+        self.assertTrue(fresh.settings_visible)
+
     def test_work_queue_filters_and_opens_selected_source_without_changing_it(self):
         latest = self.base / 'Output' / 'Latest Results.json'
         save_json(latest, {'rows': [
@@ -95,6 +200,18 @@ class DesktopEdges(TemporarySetup):
         self.assertIn('row 2', app.status.get())
         self.assertEqual(app.displayed_results_path, latest.with_suffix('.txt'))
 
+    def test_overdue_filter_shows_only_30_day_items(self):
+        save_json(self.base / 'Output' / 'Latest Results.json', {'rows': [
+            dict(plant='plant1', sn='1', outcome='needs_review', detail='Old blank', reminder_due=True),
+            dict(plant='plant2', sn='2', outcome='needs_review', detail='Recent blank', reminder_due=False),
+        ]})
+        app = self.app()
+        app.queue_filter.set('Overdue 30+ days')
+        app.show_results()
+        self.assertEqual(len(app.table.get_children()), 1)
+        self.assertEqual(app.table.item(app.table.get_children()[0], 'values')[1], '1')
+        self.assertIn('Overdue 30+ days: 1', app.queue_summary.get())
+
     def test_unsaved_case_cannot_be_marked_sent(self):
         save_json(self.base / 'Output' / 'Latest Results.json', {'rows': [
             dict(plant='plant1', sn='1', outcome='ready', detail='Ready')
@@ -113,19 +230,31 @@ class DesktopEdges(TemporarySetup):
         app = self.app()
         with patch('draft_service.History.records', side_effect=OSError('disk unavailable')):
             app.show_results()
-        self.assertIn('history unavailable', app.status.get())
+        self.assertNotIn('history unavailable', app.status.get())
         self.assertEqual(len(app.table.get_children()), 1)
 
-    def test_mark_sent_cancel_confirm_and_undo_keep_excel_unchanged(self):
+    def test_mark_sent_updates_excel_status_and_undo_restores_completed(self):
         from draft_service import History
+        book = Workbook()
+        sheet = book.active
+        sheet.title = 'Register'
+        headers = ["SN", "Inward Date", "Supplier Name", "Location", "Item", "Quantity",
+                   "Per Piece Weight", "Weight", "Form 6 No", "Client Email", "Reference No",
+                   "COD No", "COD Date", "Certificate Issued"]
+        sheet.append(headers)
+        sheet.append(["1", date(2026, 8, 1), "Dummy Client", "Mumbai", "Laptop", 2, 3.5,
+                      7, "FORM-1", "dummy@example.test", "REF-1", "0042", date(2026, 9, 1), "Completed"])
+        book.save(self.paths[0])
+        book.close()
         history = History(self.base / 'Data' / 'certificate-history.sqlite')
         self.addCleanup(history.close)
         history.db.execute("INSERT INTO batches(case_id,status,certificate_no,entry_id) VALUES('1','saved','0042','test-only')")
         history.db.commit()
         save_json(self.base / 'Output' / 'Latest Results.json', {'rows': [
-            dict(plant='plant1', sn='1', outcome='already_prepared', detail='COD 0042')
+            dict(plant='plant1', sn='1', outcome='already_prepared', detail='COD 0042',
+                 certificate_no='0042', certificate_status='completed', file=str(self.paths[0]),
+                 sheet='Register', row=2, reminder_due=True, age_days=54)
         ]})
-        before = [p.read_bytes() for p in self.paths]
         app = self.app()
         for confirm, expected in ((False, False), (True, True), (True, False)):
             app.table.selection_set(app.table.get_children()[0])
@@ -133,8 +262,18 @@ class DesktopEdges(TemporarySetup):
                 app.mark_selected_sent()
             self.assertEqual(bool(history.sent_acknowledgement('1')), expected)
             label = app.table.item(app.table.get_children()[0], 'values')[2]
-            self.assertEqual(label, 'Marked sent' if expected else 'Drafts to review')
-        self.assertEqual(before, [p.read_bytes() for p in self.paths])
+            self.assertEqual(label, 'Sent' if expected else 'Drafts to review')
+            if expected:
+                latest = json.loads((self.base / 'Output' / 'Latest Results.json').read_text())
+                self.assertEqual(latest['rows'][0]['certificate_status'], 'sent')
+                self.assertIn('marked Sent', (self.base / 'Output' / 'Latest Results.txt').read_text())
+        final = __import__('openpyxl').load_workbook(self.paths[0], data_only=False)
+        try:
+            self.assertEqual(final['Register']['N2'].value, 'Completed')
+            self.assertEqual(final['Register']['L2'].value, '0042')
+        finally:
+            final.close()
+        self.assertGreaterEqual(len(list((self.base / 'Data' / 'Workbook Backups').glob('*.xlsx'))), 2)
 
     def test_startup_marks_results_stale_after_a_workbook_changes(self):
         latest = self.base / "Output" / "Latest Results.json"
@@ -165,12 +304,37 @@ class DesktopEdges(TemporarySetup):
         self.assertIn("1 row need attention", app.status.get())
         self.assertIn("Review Outlook Drafts", app.status.get())
 
-    def test_ui_has_one_draft_and_batch_actions_without_test_only_buttons(self):
+    def test_ui_has_draft_batch_and_alert_test_actions(self):
         app = self.app()
         labels = [str(control.cget("text")) for control in app.controls if control.winfo_class() == "TButton"]
         self.assertIn("Create one draft", labels)
         self.assertIn("Create all Ready drafts", labels)
+        self.assertIn("Test alert", labels)
         self.assertFalse(any("test draft" in label.casefold() or "sample" in label.casefold() for label in labels))
+
+    def test_test_alert_shows_notification_without_scanning_or_using_daily_state(self):
+        app = self.app()
+        settings_before = (self.base / "settings.local.json").read_bytes()
+        with patch("desktop_app.run") as run, patch("workflow_support.show_centered_reminder", return_value="dismiss") as prompt:
+            app.test_alert()
+        prompt.assert_called_once_with(
+            "Ecoreco certificate reminder — test",
+            "This is what the scheduled reminder will look like. It summarizes the items that need review.",
+            parent=app.root,
+            test_mode=True,
+        )
+        run.assert_not_called()
+        self.assertFalse((self.base / "Data" / "alert-state.json").exists())
+        self.assertEqual((self.base / "settings.local.json").read_bytes(), settings_before)
+        self.notifier.assert_not_called()
+        self.assertIn("No workbook, schedule, or alert history was changed", app.status.get())
+
+    def test_test_alert_reports_when_centered_prompt_cannot_open(self):
+        app = self.app()
+        with patch("workflow_support.show_centered_reminder", side_effect=RuntimeError("display unavailable")):
+            app.test_alert()
+        self.assertIn("Could not show the test reminder", app.status.get())
+        self.assertIn("display unavailable", app.status.get())
 
     def test_one_draft_action_is_confirmed_without_test_only_copy(self):
         app = self.app()
@@ -289,6 +453,90 @@ class DesktopEdges(TemporarySetup):
         self.assertTrue(app.save_settings())
         self.assertEqual(load_settings(self.base)["certificate_number_prefix"], "APPROVED-")
 
+    def test_reminder_picker_saves_afternoon_as_24_hour_and_updates_current_users_task(self):
+        app = self.app()
+        save_json(self.base / "Data" / "alert-state.json", {
+            "schema_version": 3,
+            "dismissed_until": "2026-09-24",
+            "last_attempt_day": "2026-09-24",
+            "last_attempt_pending": True,
+            "active": {"pending-case": "plant1"},
+            "system_active": {},
+            "date_quality_active": {},
+            "seen": [],
+            "system_seen": [],
+            "date_quality_seen": [],
+            "processed_runs": [],
+            "snooze_pending": False,
+        })
+        app.reminder_hour.set("5")
+        app.reminder_minute.set("45")
+        app.reminder_period.set("PM")
+        with patch.object(app, "launch_worker") as launch:
+            app.apply_reminder_time()
+        self.assertEqual(load_settings(self.base)["reminder_time"], "17:45")
+        self.assertIn("5:45 PM", app.status.get())
+        launch.assert_called_once_with(app.reminder_schedule_worker, ("17:45",))
+        worker, args = launch.call_args.args
+        with patch("desktop_app.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "updated", "")) as run:
+            worker(*args)
+        command = run.call_args.args[0]
+        self.assertIn("-Mode", command)
+        self.assertIn("Reschedule", command)
+        self.assertIn("17:45", command)
+        saved_alert_state = json.loads((self.base / "Data" / "alert-state.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved_alert_state["dismissed_until"], "")
+        self.assertFalse(saved_alert_state["last_attempt_pending"])
+        self.assertEqual(saved_alert_state["active"], {"pending-case": "plant1"})
+        self.assertEqual(app.events.get_nowait(), ("done", "Daily check and reminder set for 5:45 PM."))
+
+    def test_failed_schedule_update_does_not_clear_existing_dismissal(self):
+        app = self.app()
+        save_json(self.base / "Data" / "alert-state.json", {
+            "schema_version": 3,
+            "dismissed_until": "2026-09-24",
+            "active": {},
+            "system_active": {},
+            "date_quality_active": {},
+            "seen": [],
+            "system_seen": [],
+            "date_quality_seen": [],
+            "processed_runs": [],
+            "snooze_pending": False,
+        })
+        failure = subprocess.CompletedProcess([], 1, "", "task scheduler denied")
+        with patch("desktop_app.subprocess.run", return_value=failure):
+            app.reminder_schedule_worker("17:45")
+        saved = json.loads((self.base / "Data" / "alert-state.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["dismissed_until"], "2026-09-24")
+        self.assertEqual(app.events.get_nowait()[0], "error")
+
+    def test_invalid_reminder_time_is_not_saved_or_scheduled(self):
+        app = self.app()
+        before = (self.base / "settings.local.json").read_bytes()
+        app.reminder_hour.set("13")
+        app.reminder_minute.set("10")
+        app.reminder_period.set("PM")
+        with patch.object(app, "launch_worker") as launch:
+            app.apply_reminder_time()
+        self.assertEqual((self.base / "settings.local.json").read_bytes(), before)
+        launch.assert_not_called()
+
+    def test_reminder_picker_handles_midnight_noon_and_the_user_selected_time(self):
+        self.assertEqual(desktop_app.reminder_picker_parts("00:00"), ("12", "00", "AM"))
+        self.assertEqual(desktop_app.reminder_picker_parts("12:00"), ("12", "00", "PM"))
+        self.assertEqual(desktop_app.reminder_picker_parts("15:10"), ("3", "10", "PM"))
+        self.assertEqual(desktop_app.reminder_time_from_picker("3", "10", "PM"), "15:10")
+        self.assertEqual(desktop_app.reminder_time_from_picker("12", "10", "AM"), "00:10")
+        app = self.app()
+        self.assertEqual(str(app.reminder_hour_picker.cget("state")), "readonly")
+        self.assertEqual(str(app.reminder_minute_picker.cget("state")), "readonly")
+        self.assertEqual(str(app.reminder_period_picker.cget("state")), "readonly")
+        app.set_busy(True)
+        self.assertEqual(str(app.reminder_period_picker.cget("state")), "disabled")
+        app.set_busy(False)
+        self.assertEqual(str(app.reminder_period_picker.cget("state")), "readonly")
+
     def test_duplicate_missing_and_samefile_alias_paths_stop_before_worker(self):
         app = self.app()
         alias = self.base / "Alias.xlsx"
@@ -376,6 +624,18 @@ class DesktopEdges(TemporarySetup):
                 self.assertEqual(app.events.get_nowait()[0], "done")
         self.notifier.assert_not_called()
 
+    def test_manual_check_refreshes_alert_records_without_acknowledging_the_daily_popup(self):
+        app = self.app()
+        result = {"run_id": "manual-check", "mode": "Check sheets", "created": 0,
+                  "updated": 0, "rows": [], "scan_complete": True}
+        save_json(self.base / "Results.json", result)
+        with patch("desktop_app.run", return_value=(0, 0, self.base)), \
+             patch("workflow_support.notify_once") as notify:
+            app.worker(self.paths, "", False, None, True)
+        notify.assert_called_once()
+        self.assertTrue(notify.call_args.kwargs["record_only"])
+        self.assertEqual(notify.call_args.kwargs["reminder_time"], "09:00")
+
     def test_draft_worker_missing_com_reports_setup_without_running(self):
         app = self.app()
         with patch.dict(sys.modules, {"pythoncom": None}), patch("desktop_app.run") as run:
@@ -400,10 +660,32 @@ class ScheduledEdges(TemporarySetup):
     def test_muted_run_calls_notify_to_acknowledge_results(self):
         with patch("workflow_support.notify_once") as notify:
             self.assertEqual(scheduled_run.main(self.base), 0)
-        notify.assert_called_once_with(self.base, self.result, self.notifier, enabled=False, repeat_pending=True)
+        notify.assert_called_once()
+        self.assertEqual(notify.call_args.args[:2], (self.base, self.result))
+        self.assertTrue(callable(notify.call_args.args[2]))
+        self.assertEqual(notify.call_args.kwargs, {"enabled": False, "repeat_pending": True, "reminder_time": "09:00"})
         self.assertTrue(self.run.call_args.kwargs["create_drafts"])
         self.com.CoInitialize.assert_called_once()
         self.com.CoUninitialize.assert_called_once()
+
+    def test_snoozed_run_refreshes_read_only_without_outlook_or_draft_creation(self):
+        save_json(self.base / "settings.local.json", dict(self.settings, quiet_notifications=True))
+        with patch("workflow_support.notify_once") as notify, patch("workflow_support.cancel_snoozed_reminder") as cancel:
+            self.assertEqual(scheduled_run.main(self.base, reminder_only=True), 0)
+        self.assertEqual(notify.call_count, 2)
+        self.assertEqual(notify.call_args_list[0].args[:2], (self.base, self.result))
+        self.assertTrue(notify.call_args_list[0].kwargs["record_only"])
+        self.assertIs(notify.call_args_list[0].kwargs["enabled"], True)
+        self.assertEqual(notify.call_args_list[1].args[:2], (self.base, None))
+        self.assertTrue(callable(notify.call_args_list[1].args[2]))
+        self.assertEqual(notify.call_args_list[1].kwargs, {"enabled": True, "repeat_pending": True, "reminder_only": True})
+        cancel.assert_called_once_with(self.base, force=True)
+        self.run.assert_called_once_with(self.settings["workbook_paths"], "", self.base,
+                                         create_drafts=False, check_only=True, progress=unittest.mock.ANY)
+        self.assertFalse(self.run.call_args.kwargs["create_drafts"])
+        self.assertTrue(self.run.call_args.kwargs["check_only"])
+        self.com.CoInitialize.assert_not_called()
+        self.com.CoUninitialize.assert_not_called()
 
     def test_actual_muted_state_has_no_backlog_on_unmute(self):
         self.assertEqual(scheduled_run.main(self.base), 0)
@@ -540,6 +822,7 @@ function Test-Register-ScheduledTask { param($TaskName,$Action,$Trigger,$Setting
 $PSScriptRoot='C:\Dummy installation with spaces'
 $certificatePythonw='C:\Dummy Python\pythonw.exe'
 $scriptArgument='"C:\Dummy installation with spaces\scheduled_run.py"'
+$ReminderTime='09:00'
 & ([scriptblock]::Create($code))
 $global:captured | ConvertTo-Json -Depth 8 -Compress
 ''')
@@ -552,6 +835,30 @@ $global:captured | ConvertTo-Json -Depth 8 -Compress
         self.assertEqual(task["Settings"], {"Catchup": True, "MultipleInstances": "IgnoreNew", "Limit": 0, "Battery": True, "KeepBattery": True})
         self.assertEqual(task["Principal"]["LogonType"], "Interactive")
         self.assertEqual(task["Principal"]["RunLevel"], "Limited")
+
+    def test_script_has_safe_reschedule_mode_and_uses_saved_time_when_installing(self):
+        script = (ROOT / "Install Daily Task.ps1").read_text()
+        self.assertIn("'Reschedule'", script)
+        self.assertIn("Get-ScheduledTask -TaskName $taskName", script)
+        self.assertIn("$existingTask.Triggers = $triggers", script)
+        self.assertIn("$existingTask.Description =", script)
+        self.assertIn("Set-ScheduledTask -InputObject $existingTask", script)
+        self.assertNotIn("Set-ScheduledTask -TaskName $taskName -Trigger $triggers -Description", script)
+        parameters = self.powershell("(Get-Command Set-ScheduledTask).Parameters.Keys -join ','")
+        self.assertIn("InputObject", parameters)
+        self.assertNotIn("Description", parameters)
+        self.assertIn("ConvertFrom-Json", script)
+        self.assertIn("New-ScheduledTaskTrigger -Daily -At $ReminderTime", script)
+
+    def test_one_hour_task_is_interactive_one_shot_and_does_not_wake_pc(self):
+        source = (ROOT / "Install Daily Task.ps1").read_text(encoding="utf-8")
+        self.assertIn("'Snooze'", source)
+        self.assertIn("New-ScheduledTaskTrigger -Once -At $runAt", source)
+        self.assertIn("-StartWhenAvailable", source)
+        self.assertIn("-LogonType Interactive", source)
+        self.assertIn("--snoozed-reminder", source)
+        snooze_section = source.split("if ($Mode -eq 'Snooze')", 1)[1].split("if (-not $ReminderTime)", 1)[0]
+        self.assertNotIn("-WakeToRun", snooze_section)
 
     def test_runtime_probe_falls_back_from_unusable_python_and_checks_version(self):
         output = self.powershell(self.parsed() + r'''
@@ -643,7 +950,11 @@ $resolved = Resolve-CertificatePython
         script = (ROOT / "Install Daily Task.ps1").read_text()
         self.assertEqual(script.count("'pip', 'install'"), 1)
         for name, mode in (("Setup Once.bat", "Setup"), ("Prepare Certificates.bat", "Desktop"), ("Run Daily Drafts.bat", "Daily"), ("Create Daily Draft Task.bat", "Install"), ("Check Python Setup.bat", "Diagnose")):
-            content = (ROOT / name).read_text()
+            parent = ROOT.parent if ROOT.name == 'App' else ROOT
+            launcher_path = parent / name
+            if not launcher_path.exists():
+                launcher_path = parent / 'Setup' / name
+            content = launcher_path.read_text()
             self.assertIn(f"-Mode {mode}", content)
             self.assertNotIn("pip install", content)
             self.assertNotIn("ExecutionPolicy Bypass", content)
