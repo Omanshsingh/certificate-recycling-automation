@@ -127,13 +127,19 @@ class Report:
         else:
             inward_date_quality = "valid"
         age_days = (self.as_of - inward_date).days if inward_date else None
+        effective_status = batch.get("_effective_certificate_status")
         reminder_batch = dict(batch, inward_date=inward_date)
+        if effective_status is not None:
+            reminder_batch["_effective_certificate_status"] = effective_status
         row = {"plant": batch.get("source_id", "Setup"), "file": batch.get("source_path", ""),
                "sheet": batch.get("source_sheet", ""), "row": batch.get("source_row", ""),
                "sn": batch.get("case_id", ""), "supplier": batch.get("supplier", ""),
                "outcome": outcome, "detail": detail,
                "certificate_no": str(batch.get("cod_no", "") or ""),
-               "certificate_status": status_value(batch.get("issued")),
+               "certificate_date": (parse_date(batch.get("cod_date")).isoformat()
+                                    if parse_date(batch.get("cod_date")) else ""),
+               "certificate_status": (status_value(effective_status) if effective_status is not None
+                                      else status_value(batch.get("issued"))),
                "inward_date": inward_date.isoformat() if inward_date else "",
                "inward_date_quality": inward_date_quality,
                "age_days": age_days,
@@ -173,7 +179,7 @@ def _digest(value):
 
 def _reported_date_issue(row, result):
     """Return a safe date-quality category for legacy and current report rows."""
-    if status_value(row.get("certificate_status")) in {"na", "sent"}:
+    if status_value(row.get("certificate_status")) in {"na", "completed", "sent"}:
         return None
     category = row.get("inward_date_quality")
     if category in {"missing", "invalid", "future"}:
@@ -476,7 +482,7 @@ def notify_once(root, result, notifier, today=None, enabled=True, repeat_pending
             count = len(actionable)
             noun = "inward record" if count == 1 else "inward records"
             verb = "is" if count == 1 else "are"
-            parts.append(f"{count} {noun} {verb} 30+ days old and not marked Sent or N/A")
+            parts.append(f"{count} {noun} {verb} 30+ days old and not marked Completed or N/A")
         if actionable_date_quality:
             count = len(actionable_date_quality)
             noun = "inward record" if count == 1 else "inward records"

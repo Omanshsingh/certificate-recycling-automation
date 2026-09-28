@@ -220,11 +220,35 @@ def status_value(value):
         return "na"
     if cleaned == "blank":
         return "blank"
+    if cleaned == "drafted":
+        return "drafted"
     if cleaned == "completed":
         return "completed"
     if cleaned == "sent":
         return "sent"
     return "blank" if not cleaned else "unknown"
+
+
+def effective_certificate_status(batch, record=None, completion_ack=None):
+    """Interpret current statuses and safely recognize pre-Drafted workbooks.
+
+    Older app versions wrote ``Completed`` immediately after saving an
+    unsent Outlook draft. In the new workflow, Completed means the operator
+    confirmed the message was sent. Until history contains that confirmation,
+    a legacy Completed cell remains Drafted and overdue.
+    """
+    raw = status_value(batch.get("issued"))
+    if raw == "sent":  # Legacy workbook spelling for operator-confirmed send.
+        return "completed"
+    if raw == "completed":
+        acknowledged = bool(
+            record
+            and completion_ack
+            and record.get("status") == "saved"
+            and completion_ack.get("certificate_no") == record.get("certificate_no")
+        )
+        return "completed" if acknowledged else "drafted"
+    return raw
 
 
 def batch_content(batch):
@@ -237,11 +261,12 @@ def eligible(batch, as_of, days):
 
 
 def certificate_reminder_due(batch, as_of, days=30):
-    """A case is overdue only after its inward date ages and before N/A/Sent."""
+    """A case stays overdue until Completed or N/A, including unsent Drafted."""
+    issued = batch.get("_effective_certificate_status", batch.get("issued"))
     return bool(
         batch.get("case_id")
         and eligible(batch, as_of, days)
-        and status_value(batch.get("issued")) not in {"na", "sent"}
+        and status_value(issued) not in {"na", "completed", "sent"}
     )
 
 

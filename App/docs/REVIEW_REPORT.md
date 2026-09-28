@@ -45,17 +45,19 @@ The read-back implementation follows Microsoft's documented [GetItemFromID inter
 
 ## Alert rules
 
-- Current policy: each eligible reminder run may show one centered summary for inward batches at least 30 days old whose Certificate Issued status is not Sent or N/A. Blank, Ready, and Completed all qualify once aged; a saved draft is not proof of sending. Distinct later runs may alert again the same day; duplicate popups for the same run are blocked.
+- Current policy: each eligible reminder run may show one centered summary for inward batches at least 30 days old whose Certificate Issued status is not Completed or N/A. Blank, Ready, and Drafted all qualify once aged; a saved draft is not proof of sending. Distinct later runs may alert again the same day; duplicate popups for the same run are blocked.
 - Blank decisions and missing required details appear in the app results immediately but do not cause a popup before the inward date reaches 30 days. A missing inward date remains visible but cannot be aged.
 - Automation failures that reach the notification stage (for example, a source workbook unavailable or an uncertain Outlook save) are included in the next scheduled summary; a partial scan is not treated as a clean full scan. Failures before the runner or its dependencies load go to a diagnostic file instead of a popup.
-- The reminder is aggregated, not one popup per case, and unresolved overdue cases repeat on later eligible runs. “No, remind tomorrow” pauses for the rest of today; saving a reminder time clears that same-day pause. “Remind me later” snoozes for one hour and runs a read-only refresh. Marking a row Sent or N/A removes it from the overdue reminder set.
-- The app does not send mail. Mark Sent records an operator confirmation and updates the status cell in Excel; it does not verify delivery. Undo restores Completed, not an unsent message.
+- The reminder is aggregated, not one popup per case, and unresolved overdue cases repeat on later eligible runs. “No, remind tomorrow” pauses for the rest of today; saving a reminder time clears that same-day pause. “Remind me later” snoozes for one hour and runs a read-only refresh. Marking a row Completed or N/A removes it from the overdue reminder set.
+- The app does not send mail. After sending manually, Mark completed records the operator's confirmation and updates the status cell in Excel; it does not verify delivery. Undo restores Drafted, not an unsent message.
 - The daily task does one pass at its configured time; it is not an all-day watcher. A shut-down or signed-out desktop cannot display a reminder until a later eligible run.
 - The OS accepting a notification does not prove the user saw it. Focus Assist, Windows settings and company policy can suppress it.
 
 ## Tests performed
 
 The follow-up regression run on 24 September passed **207 tests in 99.463 seconds**. Tests include the exact day-29/day-30 boundary, Blank/Ready/Completed versus N/A/Sent statuses, Excel Sent update/undo, alert aggregation and simulated Outlook. No emails were sent by this suite.
+
+The latest local regression run on 26 September passed **248 tests in 128.353 seconds** after the Drafted/Completed lifecycle and audited COD/date correction changes. It includes simulated Outlook only; no emails were sent.
 
 The automated suite uses temporary Excel workbooks/PDF rendering, simulated Outlook objects and simulated Windows notifications. Separately, one normal workflow draft was verified in the selected Classic Outlook profile with a non-deliverable recipient, then removed from Drafts. No tests sent email or registered a Windows task.
 
@@ -85,7 +87,7 @@ The 100-certificate local run took approximately 118 seconds in the final measur
 
 The final local suite passed **224 tests**. Added checks cover the grouped data-quality reminder for missing/invalid/future inward dates, all three centered-reminder buttons and hidden-window cleanup, stale review-list refresh, failed snooze cleanup, and a case changed to N/A after a saved certificate. Automated Outlook tests are mocked; no live Outlook draft or email was created during this final pass.
 
-The daily reminder includes: (1) inward records at least 30 days old whose status is not Sent or N/A—including Blank, Ready, and Completed, because Completed means a draft exists but was not confirmed sent; (2) one aggregate count for inward dates that cannot be age-classified; and (3) automation failures that need action. Ordinary blank fields and recent blank statuses remain in the review list without a popup per row. The user marks Sent only after sending manually; the app never sends or verifies delivery.
+The daily reminder includes: (1) inward records at least 30 days old whose status is not Completed or N/A—including Blank, Ready, and Drafted, because Drafted means an unsent draft exists; (2) one aggregate count for inward dates that cannot be age-classified; and (3) automation failures that need action. Ordinary blank fields and recent blank statuses remain in the review list without a popup per row. The user marks Completed only after sending manually; the app never sends or verifies delivery.
 
 The installed `Certificate Recycling Drafts` task was found at 09:00 while saved Settings specified 11:54. The first reschedule attempt exposed an unsupported `Set-ScheduledTask -Description` parameter. The installer now updates the retrieved task definition instead, and the actual Windows PowerShell reschedule succeeded. The task remains interactive under the existing user, retains its Python action and sign-in trigger, and is now scheduled for 11:54. Next daily trigger: 25 September 2026 at 11:54. The previous result remains `0x800710E0`; Task Scheduler Operational history is disabled, so its cause was not inferred and the task was not manually run. Plant 1 was locked in Excel; both plant workbooks were left untouched.
 
@@ -95,7 +97,7 @@ Design references: [Task Scheduler StartWhenAvailable](https://learn.microsoft.c
 
 ## Remaining product limitations / highest-value follow-ups
 
-- **Drafts are not sent automatically.** The 30+ day reminder includes a Completed (draft-created) batch until the operator confirms Sent in Excel through the app. This is not mailbox-wide monitoring: if the operator sends outside the app and does not mark the row Sent, reminders continue.
+- **Drafts are not sent automatically.** The 30+ day reminder includes a Drafted batch until the operator sends it manually and marks it Completed in the app. This is not mailbox-wide monitoring: if the operator sends outside the app and does not mark the row Completed, reminders continue.
 - **One installation owns the numbering register.** Two independent desktops do not safely coordinate through separate Data folders. If both plants must issue independently, a shared transactional service/database and deployment plan are needed; do not copy the SQLite file between live machines.
 - **Ambiguous Outlook saves require reconciliation.** The app deliberately stops rather than guessing. There is not yet an operator-friendly recovery screen for linking an existing draft or approving a reviewed void. Do not delete history to clear this condition.
 - **Recycling only.** This build has a recycling certificate template. A distinct data-destruction certificate, its fields and approval rules are not implemented.

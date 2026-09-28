@@ -70,6 +70,24 @@ def reminder_time_label(value):
     return f"{hour}:{minute} {period}"
 
 
+def is_actionable_alert_row(row):
+    """Match the case-level items represented by the scheduled reminder."""
+    system_alert_codes = {
+        "source_unavailable", "run_failure", "setup_issue", "draft_recovery",
+        "history_reconcile", "history_source_changed", "sent_without_certificate",
+        "sent_history_mismatch", "outlook_save_uncertain",
+    }
+    outcome = str(row.get("outcome", "")).strip().casefold()
+    if (row.get("system_alert") is True or row.get("issue_code") in system_alert_codes
+            or (outcome == "needs_review" and not row.get("sn"))
+            or row.get("reminder_due") is True):
+        return True
+    status = str(row.get("certificate_status", "")).strip().casefold().replace(" ", "")
+    if status in {"na", "notapplicable", "completed", "sent"} or outcome in {"completed", "sent"}:
+        return False
+    return str(row.get("inward_date_quality", "")).strip().casefold() in {"missing", "invalid", "future"}
+
+
 class App:
     def __init__(self, root, base=BASE):
         self.root, self.base = root, Path(base)
@@ -204,14 +222,14 @@ class App:
         self.actions_frame.pack(fill="x", pady=(0, 8))
         ttk.Label(
             self.actions_frame,
-            text="Save and close Excel before running. Ready (green) = approved; N/A (white) = skip; Blank (red) or empty = needs a decision. A saved draft becomes Completed (yellow). After you send it in Outlook, mark it Sent (blue) here; that updates Excel and stops reminders. Ready again can create another draft with the same COD and date.",
+            text="Save and close Excel before running. Choose Ready (green), N/A (white), or Blank (red) in Excel. After creating a draft, the app marks it Drafted (yellow). Review and send it in Outlook, then click Mark completed here. Drafted stays in the 30+ day reminder list until you confirm it is completed. The app never sends email. Click Review alerts to refresh the real items that need attention; it does not create drafts.",
             wraplength=900,
         ).pack(anchor="w", pady=(0, 6))
         plant_actions = ttk.Frame(self.actions_frame)
         plant_actions.pack(fill="x")
         self.button(plant_actions, "Create all Ready drafts", self.start)
         self.button(plant_actions, "Check both files", lambda: self.start(check_only=True))
-        self.button(plant_actions, "Test alert", self.test_alert)
+        self.button(plant_actions, "Review alerts", self.review_alerts)
         extras = ttk.Frame(frame)
         extras.pack(fill="x", pady=(0, 4))
         ttk.Label(extras, text="Review saved drafts in Classic Outlook > Drafts.").pack(side="left", padx=(0, 12))
@@ -219,12 +237,18 @@ class App:
         queue_bar = ttk.Frame(frame)
         queue_bar.pack(fill="x", pady=4)
         queue_choices = ttk.Combobox(queue_bar, textvariable=self.queue_filter, state="readonly", width=23,
-                                    values=("All", "Overdue 30+ days", "Needs attention", "Ready to draft", "Drafts to review", "Sent", "Skipped"))
+                                    values=("All", "Alerts to review", "Overdue 30+ days", "Needs attention", "Ready to draft", "Drafted", "Completed", "Skipped"))
         queue_choices.pack(side="left", padx=(0, 8))
         queue_choices.bind("<<ComboboxSelected>>", lambda _: self.show_results())
         self.button(queue_bar, "Open selected plant", self.open_selected_plant)
-        self.button(queue_bar, "Mark sent / Undo", self.mark_selected_sent)
+        self.button(queue_bar, "Mark completed / Undo", self.mark_selected_completed)
+        self.button(queue_bar, "Correct certificate", self.correct_selected_certificate)
         ttk.Label(frame, textvariable=self.queue_summary, wraplength=900).pack(anchor="w", pady=(0, 4))
+        ttk.Label(
+            frame,
+            text="To fix a COD number or date on an unsent certificate, select its Drafted row and click Correct certificate. Completed certificates are kept unchanged.",
+            wraplength=900,
+        ).pack(anchor="w", pady=(0, 4))
         table_frame = ttk.Frame(frame)
         table_frame.pack(fill="both", expand=True)
         self.table = ttk.Treeview(table_frame, columns=("plant", "sn", "status", "detail"), show="headings")
@@ -391,20 +415,11 @@ class App:
         else:
             self.events.put(("error", f"The time is saved as {reminder_time_label(reminder_time)}, but Windows could not update the daily schedule. Try again or ask IT to allow this user's scheduled task. {output}"))
 
-    def test_alert(self):
+    def review_alerts(self):
         if self.busy:
             return
-        try:
-            from workflow_support import show_centered_reminder
-            show_centered_reminder(
-                "Ecoreco certificate reminder — test",
-                "This is what the scheduled reminder will look like. It summarizes the items that need review.",
-                parent=self.root,
-                test_mode=True,
-            )
-            self.status.set("Alert test finished. No workbook, schedule, or alert history was changed; no email was created or sent.")
-        except Exception as exc:
-            self.status.set(f"Could not show the test reminder: {error_message(exc)}")
+        self.queue_filter.set("Alerts to review")
+        self.start(drafts=False, check_only=True)
 
     def set_busy(self, busy):
         self.busy = busy
@@ -497,6 +512,7 @@ class App:
                 paths, mailbox, self.base, limit=limit, create_drafts=drafts, check_only=check_only,
                 progress=lambda msg: self.events.put(("status", msg)),
             )
+            latest = {"rows": [], "scan_complete": False}
             try:
                 from workflow_support import load_settings, notify_once
                 latest = json.loads((output / "Results.json").read_text(encoding="utf-8"))
@@ -510,7 +526,17 @@ class App:
             except Exception:
                 # Results remain available in the app even if Windows declines a toast.
                 pass
-            self.events.put(("done", f"Finished: {created} draft(s) created; {review} need attention. Open results for details."))
+            if check_only:
+                alert_count = sum(is_actionable_alert_row(row) for row in latest.get("rows", []))
+                if latest.get("scan_complete"):
+                    message = (f"Both plant files checked. {alert_count} current alert item(s) are in the work list; "
+                               "choose Alerts to review to show only those. No drafts were created.")
+                else:
+                    message = (f"The alert check is partial: {alert_count} item(s) need review, and at least one "
+                               "plant file could not be checked. No drafts were created.")
+                self.events.put(("done", message))
+            else:
+                self.events.put(("done", f"Finished: {created} draft(s) created; {review} need attention. Open results for details."))
         except Exception as exc:
             self.events.put(("error", error_message(exc)))
         finally:
@@ -543,25 +569,87 @@ class App:
         self.visible_rows = {}
         counts = {}
         history = None
-        for row in sorted(rows, key=lambda r: r["outcome"] != "needs_review"):
+        history_path = self.base / "Data" / "certificate-history.sqlite"
+        if history_path.is_file() and any(
+                row.get("certificate_status") in {"completed", "sent"} for row in rows):
+            try:
+                from certificate_core import effective_certificate_status
+                from draft_service import History
+                history = History(history_path)
+                for row in rows:
+                    current = row.get("certificate_status")
+                    if current == "sent":
+                        row["certificate_status"] = "completed"
+                    elif current == "completed":
+                        case_id = ("plant2|" if row.get("plant") == "plant2" else "") + str(row.get("sn", ""))
+                        record = history.record({"case_id": case_id})
+                        acknowledgement = history.completed_acknowledgement(case_id)
+                        effective = effective_certificate_status(
+                            {"issued": "Completed"}, record, acknowledgement,
+                        )
+                        row["certificate_status"] = effective
+                        if effective == "drafted" and type(row.get("age_days")) is int:
+                            row["reminder_due"] = row["age_days"] >= 30
+                            row["awaiting_send"] = bool(record and record.get("status") == "saved")
+            except Exception:
+                # A stale results file remains viewable; Check both files will
+                # rebuild it from the workbooks and history.
+                pass
+            finally:
+                if history:
+                    history.close()
+        for row in sorted(rows, key=lambda r: (not bool(r.get("reminder_due")), r["outcome"] != "needs_review")):
             label = {"needs_review": "Needs attention", "ready": "Ready to draft", "not_applicable": "Skipped",
-                     "draft_created": "Drafts to review", "updated": "Drafts to review", "already_prepared": "Drafts to review",
-                     "completed": "Drafts to review", "sent": "Sent"}.get(row["outcome"], row["outcome"].replace("_", " ").title())
-            if row.get("outcome") != "needs_review" and row.get("certificate_status") == "sent":
-                label = "Sent"
-            counts[label] = counts.get(label, 0) + 1
+                     "draft_created": "Drafted", "updated": "Drafted", "already_prepared": "Drafted",
+                     "completed": "Completed", "sent": "Completed"}.get(row["outcome"], row["outcome"].replace("_", " ").title())
+            certificate_status = row.get("certificate_status")
+            normalized_certificate_status = (str(certificate_status or "").strip().casefold()
+                                             .replace(" ", "").replace("/", "")
+                                             .replace("_", "").replace("-", ""))
+            is_skipped = (normalized_certificate_status in {"na", "notapplicable"}
+                          or row["outcome"] == "not_applicable")
+            if row.get("outcome") != "needs_review" and certificate_status == "drafted":
+                label = "Drafted"
+            elif row.get("outcome") != "needs_review" and certificate_status in {"completed", "sent"}:
+                label = "Completed"
+            has_saved_draft = (row.get("awaiting_send") is True
+                               and row.get("outcome") in {"draft_created", "updated", "already_prepared"})
+            if is_skipped and has_saved_draft and row.get("outcome") != "needs_review":
+                # N/A prevents another draft, but it does not remove a draft
+                # already saved in Outlook. Keep that distinction visible.
+                label = "Skipped (draft exists)"
+            if label not in {"Skipped", "Skipped (draft exists)"}:
+                counts[label] = counts.get(label, 0) + 1
+            if is_skipped:
+                counts["Skipped"] = counts.get("Skipped", 0) + 1
+            if is_skipped and has_saved_draft:
+                # These summary counts are independent: a case can be N/A in
+                # Excel while its previously saved Outlook draft still awaits review.
+                counts["Drafted"] = counts.get("Drafted", 0) + 1
             if row.get("reminder_due") is True:
                 counts["Overdue 30+ days"] = counts.get("Overdue 30+ days", 0) + 1
+            alert_item = is_actionable_alert_row(row)
+            if alert_item:
+                counts["Alerts to review"] = counts.get("Alerts to review", 0) + 1
             selected_filter = self.queue_filter.get()
-            if selected_filter == "Overdue 30+ days":
+            if selected_filter == "Alerts to review":
+                if not alert_item:
+                    continue
+            elif selected_filter == "Overdue 30+ days":
                 if row.get("reminder_due") is not True:
+                    continue
+            elif selected_filter == "Skipped":
+                if not is_skipped:
+                    continue
+            elif selected_filter == "Drafted":
+                if label != "Drafted" and not (is_skipped and has_saved_draft):
                     continue
             elif selected_filter not in ("All", label):
                 continue
             detail = (str(row.get('supplier', '')).strip() + ' — ' if row.get('supplier') else '') + row['detail']
             item = self.table.insert("", "end", values=(row["plant"], row["sn"], label, detail), tags=(row["outcome"],))
             self.visible_rows[item] = row
-        self.queue_summary.set(" | ".join(f"{label}: {counts.get(label, 0)}" for label in ("Overdue 30+ days", "Needs attention", "Ready to draft", "Drafts to review", "Sent", "Skipped")))
+        self.queue_summary.set(" | ".join(f"{label}: {counts.get(label, 0)}" for label in ("Alerts to review", "Overdue 30+ days", "Needs attention", "Ready to draft", "Drafted", "Completed", "Skipped")))
 
     def selected_row(self):
         selected = self.table.selection()
@@ -582,19 +670,190 @@ class App:
             return
         try:
             os.startfile(path)
-            self.status.set(f"Find SN {row['sn']} on sheet {row.get('sheet', '')}, row {row.get('row', '')}. Choose Ready, N/A, or Blank; the app sets Completed after drafting. After sending the Outlook draft, use Mark sent here.")
+            self.status.set(f"Find SN {row['sn']} on sheet {row.get('sheet', '')}, row {row.get('row', '')}. Choose Ready, N/A, or Blank in Excel. The app marks a saved Outlook draft Drafted; after sending it yourself, click Mark completed here.")
         except OSError as exc:
             self.status.set(f"Could not open the plant workbook: {exc}")
 
-    def mark_selected_sent(self):
+    def correction_dialog(self, current_no, current_date, workbook_no="", workbook_date=""):
+        window = tk.Toplevel(self.root)
+        window.title("Correct certificate")
+        window.transient(self.root)
+        window.resizable(False, False)
+        window.grab_set()
+        result = {}
+        frame = ttk.Frame(window, padding=14)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(
+            frame,
+            text=("Correct an unsent certificate. The app updates its existing Outlook draft, PDF and Excel row together. "
+                  "The old PDF and correction reason stay in the history. It never sends email."),
+            wraplength=470,
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        from certificate_core import parse_date
+        saved_date = parse_date(current_date)
+        excel_date = parse_date(workbook_date)
+        saved_label = saved_date.strftime("%d.%m.%Y") if saved_date else str(current_date or "blank")
+        excel_label = excel_date.strftime("%d.%m.%Y") if excel_date else str(workbook_date or "blank")
+        ttk.Label(frame, text="Saved certificate:").grid(row=1, column=0, sticky="w", padx=(0, 12))
+        ttk.Label(frame, text=f"{current_no} / {saved_label}").grid(row=1, column=1, sticky="w")
+        ttk.Label(frame, text="Currently in Excel:").grid(row=2, column=0, sticky="w")
+        ttk.Label(frame, text=f"{workbook_no or 'blank'} / {excel_label}").grid(row=2, column=1, sticky="w")
+        ttk.Label(frame, text="Correct COD number:").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        cod = ttk.Entry(frame, width=28)
+        cod.insert(0, current_no)
+        cod.grid(row=3, column=1, sticky="ew", pady=(8, 0))
+        ttk.Label(frame, text="Correct certificate date:").grid(row=4, column=0, sticky="w", pady=(8, 0))
+        issued = ttk.Entry(frame, width=28)
+        try:
+            issued.insert(0, datetime.strptime(current_date, "%Y-%m-%d").strftime("%d.%m.%Y"))
+        except ValueError:
+            issued.insert(0, current_date)
+        issued.grid(row=4, column=1, sticky="ew", pady=(8, 0))
+        ttk.Label(frame, text="Reason for correction:").grid(row=5, column=0, sticky="nw", pady=(8, 0))
+        reason = tk.Text(frame, width=34, height=3, wrap="word")
+        reason.grid(row=5, column=1, sticky="ew", pady=(8, 0))
+        ttk.Label(frame, text="Date format: DD.MM.YYYY. Reason is required.", wraplength=470).grid(
+            row=6, column=0, columnspan=2, sticky="w", pady=(6, 0),
+        )
+        actions = ttk.Frame(frame)
+        actions.grid(row=7, column=0, columnspan=2, sticky="e", pady=(12, 0))
+
+        def save():
+            from certificate_core import parse_date
+            entered_no = cod.get().strip()
+            entered_date = issued.get().strip()
+            entered_reason = reason.get("1.0", "end").strip()
+            if not entered_no or not parse_date(entered_date):
+                messagebox.showerror("Check the certificate details", "Enter a COD number and valid date (DD.MM.YYYY).", parent=window)
+                return
+            if not entered_reason or len(entered_reason) > 500:
+                messagebox.showerror("Add a reason", "Enter a short reason for the correction (up to 500 characters).", parent=window)
+                return
+            result.update(certificate_no=entered_no, certificate_date=entered_date, reason=entered_reason)
+            window.destroy()
+
+        ttk.Button(actions, text="Cancel", command=window.destroy).pack(side="right", padx=(8, 0))
+        ttk.Button(actions, text="Continue", command=save).pack(side="right")
+        window.bind("<Escape>", lambda _: window.destroy())
+        window.protocol("WM_DELETE_WINDOW", window.destroy)
+        cod.focus_set()
+        self.root.wait_window(window)
+        return result or None
+
+    def correct_selected_certificate(self):
+        if self.busy:
+            return
+        row = self.selected_row()
+        if not row:
+            return
+        if row.get("certificate_status") in {"completed", "sent"}:
+            messagebox.showinfo(
+                "Completed certificates are protected",
+                "This certificate is marked Completed. The app will not change a certificate already sent to a client. "
+                "Follow the company's correction or replacement process so the original COD and date remain in the record.",
+                parent=self.root,
+            )
+            return
+        if row.get("certificate_status") != "drafted":
+            self.status.set("Select a Drafted certificate that is still unsent, then use Correct certificate if needed.")
+            return
+        if not self.mailbox.get().strip():
+            self.status.set("Select the Outlook mailbox in Settings before correcting a saved draft.")
+            return
+        from draft_service import History
+        try:
+            key = ("plant2|" if row["plant"] == "plant2" else "") + str(row["sn"])
+            history = History(self.base / "Data" / "certificate-history.sqlite")
+            try:
+                record = history.record({"case_id": key})
+                pending = history.correction_for_case(key)
+                sent_ack = history.sent_acknowledgement(key)
+            finally:
+                history.close()
+            if pending:
+                prompt = (
+                    f"A correction to COD {pending['new_certificate_no']} dated "
+                    f"{pending['new_certificate_date']} was interrupted. Resume it now?\n\n"
+                    f"Reason: {pending['reason']}\n\nThe app will update the existing unsent Outlook draft and Excel. It will not send email."
+                )
+                if not messagebox.askyesno("Resume certificate correction?", prompt, parent=self.root):
+                    return
+                values = {"certificate_no": pending["new_certificate_no"],
+                          "certificate_date": pending["new_certificate_date"], "reason": pending["reason"]}
+            else:
+                if not record or record.get("status") != "saved" or not record.get("status_written"):
+                    self.status.set("No confirmed Drafted certificate was found for this case. Click Check both files before correcting it.")
+                    return
+                if sent_ack:
+                    messagebox.showinfo(
+                        "Completed certificates are protected",
+                        "This certificate is marked Completed. Follow the company's correction or replacement process; the app will preserve its original record.",
+                        parent=self.root,
+                    )
+                    return
+                current_date = record.get("certificate_date") or row.get("certificate_date", "")
+                values = self.correction_dialog(
+                    record["certificate_no"], current_date,
+                    row.get("certificate_no", ""), row.get("certificate_date", ""),
+                )
+                if not values:
+                    return
+                if not messagebox.askyesno(
+                    "Update this certificate?",
+                    f"The existing unsent Outlook draft and Excel row will be updated to COD "
+                    f"{values['certificate_no']} dated {values['certificate_date']}.\n\n"
+                    "The old PDF will remain in the output folder and the change will be recorded. "
+                    "No email will be sent. Continue?",
+                    parent=self.root,
+                ):
+                    return
+        except Exception as exc:
+            self.status.set(f"Could not check the saved certificate. Click Check both files and try again. {error_message(exc)}")
+            return
+        paths = [variable.get().strip() for variable in self.workbooks]
+        if not self.save_settings():
+            return
+        self.set_busy(True)
+        self.status.set(f"Correcting the unsent certificate for SN {row['sn']}...")
+        self.launch_worker(self.correction_worker, (
+            paths, self.mailbox.get().strip(), row["plant"], str(row["sn"]),
+            values["certificate_no"], values["certificate_date"], values["reason"],
+        ))
+
+    def correction_worker(self, paths, mailbox, source_id, case_id,
+                          certificate_no, certificate_date, reason):
+        initialized = False
+        try:
+            import pythoncom
+            pythoncom.CoInitialize()
+            initialized = True
+            from certificate_correction import correct_certificate
+            corrected = correct_certificate(
+                paths, mailbox, self.base, source_id, case_id,
+                certificate_no, certificate_date, reason,
+                progress=lambda msg: self.events.put(("status", msg)),
+            )
+            # Refresh the visible queue without creating a new draft.
+            run(
+                paths, mailbox, self.base, create_drafts=False, check_only=True,
+                progress=lambda msg: self.events.put(("status", msg)),
+            )
+            self.events.put(("done", f"Corrected COD {corrected['certificate_no']} saved in the existing unsent Outlook draft and Excel. No email was sent."))
+        except Exception as exc:
+            self.events.put(("error", error_message(exc)))
+        finally:
+            if initialized:
+                pythoncom.CoUninitialize()
+
+    def mark_selected_completed(self):
         if self.busy:
             return
         row = self.selected_row()
         if not row:
             return
         if (row['outcome'] not in {'draft_created', 'updated', 'already_prepared', 'completed', 'sent'}
-                or row.get('certificate_status') not in {'completed', 'sent'}):
-            self.status.set("Only a prepared certificate can be marked sent.")
+                or row.get('certificate_status') not in {'drafted', 'completed', 'sent'}):
+            self.status.set("Select a saved draft or a completed certificate first.")
             return
         history = None
         try:
@@ -606,15 +865,18 @@ class App:
                 key = ('plant2|' if row['plant'] == 'plant2' else '') + str(row['sn'])
                 record = history.record({'case_id': key})
                 if not record or record['status'] != 'saved':
-                    raise ValueError('No confirmed local draft record. Check the existing certificate manually; it will not be marked sent automatically.')
+                    raise ValueError('No confirmed local draft record. Check Outlook Drafts and the results before changing the status.')
                 if str(row.get('certificate_no') or '') != str(record['certificate_no']):
                     raise ValueError('The saved result does not match the COD in the draft history. Click Check both files and try again.')
-                undo = row['certificate_status'] == 'sent'
-                prompt = ('Set this row back to Completed? The email stays sent; if another draft is needed, change Completed to Ready.' if undo else
-                          f"Have you already sent COD {record['certificate_no']} to the client? This updates Certificate Issued in the plant Excel to Sent. It does not send email.")
-                if messagebox.askyesno('Undo sent confirmation?' if undo else 'Confirm already sent', prompt, parent=self.root):
-                    current_status = 'Sent' if undo else 'Completed'
-                    next_status = 'Completed' if undo else 'Sent'
+                undo = row['certificate_status'] in {'completed', 'sent'}
+                prompt = (
+                    "Return the Excel status to Drafted? This does not unsend the email. The case will remain in the 30+ day reminder list until completed again."
+                    if undo else
+                    f"Have you sent COD {record['certificate_no']} to the client in Outlook? Marking it Completed updates Excel and stops reminders. The app will not send the email."
+                )
+                if messagebox.askyesno('Undo completion?' if undo else 'Mark as completed?', prompt, parent=self.root):
+                    current_status = ('Completed', 'Sent') if undo else ('Drafted', 'Completed')
+                    next_status = 'Drafted' if undo else 'Completed'
                     workbook_path = row.get('file')
                     if not workbook_path:
                         raise ValueError('The selected results do not contain the plant workbook location. Click Check both files and try again.')
@@ -628,11 +890,11 @@ class App:
                     else:
                         history.acknowledge_sent(key, record['certificate_no'])
                     row['certificate_status'] = next_status.casefold()
-                    row['outcome'] = 'sent' if next_status == 'Sent' else 'already_prepared'
-                    row['detail'] = (f"COD {record['certificate_no']} marked Sent in Excel; no email was sent by the app."
-                                     if next_status == 'Sent' else
-                                     f"COD {record['certificate_no']} returned to Completed. Choose Ready only if another draft is needed.")
-                    row['reminder_due'] = bool(row.get('age_days') is not None and row['age_days'] >= 30 and next_status != 'Sent')
+                    row['outcome'] = 'completed' if next_status == 'Completed' else 'already_prepared'
+                    row['detail'] = (f"COD {record['certificate_no']} marked Completed in Excel after the operator confirmed sending it. The app did not send the email."
+                                     if next_status == 'Completed' else
+                                     f"COD {record['certificate_no']} returned to Drafted. The email was not unsent; set Ready only if another draft is needed.")
+                    row['reminder_due'] = bool(row.get('age_days') is not None and row['age_days'] >= 30 and next_status == 'Drafted')
                     self.last_result['completed_at'] = datetime.now().isoformat(timespec='seconds')
                     self.last_result['review'] = sum(item.get('outcome') == 'needs_review'
                                                      for item in self.last_result.get('rows', []))
@@ -654,7 +916,7 @@ class App:
                     )
                     (self.base / 'Output' / 'Latest Results.txt').write_text(header + body + "\n", encoding='utf-8')
             self.show_results()
-            self.status.set("Excel updated. This app records Sent only after you confirm you sent the Outlook draft; it never sends email.")
+            self.status.set("Excel updated. Completed means you confirmed that you sent the Outlook draft; the app never sends it.")
         except Exception as exc:
             self.status.set(error_message(exc))
         finally:

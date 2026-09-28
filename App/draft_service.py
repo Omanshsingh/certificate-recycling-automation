@@ -5,6 +5,7 @@ import hashlib
 import json
 import sqlite3
 import time
+import uuid
 from html import escape
 from pathlib import Path
 
@@ -21,6 +22,11 @@ class History:
         self.db.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
         self.db.execute("CREATE TABLE IF NOT EXISTS sent_acknowledgements (case_id TEXT PRIMARY KEY, certificate_no TEXT NOT NULL, sent_at TEXT NOT NULL)")
         self.db.execute("CREATE TABLE IF NOT EXISTS archived_issuances (case_id TEXT NOT NULL, generation INTEGER NOT NULL, fingerprint TEXT, status TEXT, certificate_no TEXT, pdf_path TEXT, entry_id TEXT, updated_at TEXT, certificate_date TEXT, sent_at TEXT, PRIMARY KEY(case_id,generation))")
+        self.db.execute("CREATE TABLE IF NOT EXISTS certificate_corrections (correction_id TEXT PRIMARY KEY, case_id TEXT NOT NULL, generation INTEGER NOT NULL, old_certificate_no TEXT NOT NULL, old_certificate_date TEXT NOT NULL, new_certificate_no TEXT NOT NULL, new_certificate_date TEXT NOT NULL, reason TEXT NOT NULL, old_pdf_path TEXT NOT NULL, new_pdf_path TEXT NOT NULL, entry_id TEXT NOT NULL, stage TEXT NOT NULL, created_at TEXT NOT NULL, completed_at TEXT, observed_excel_certificate_no TEXT, observed_excel_certificate_date TEXT)")
+        correction_columns = {row[1] for row in self.db.execute("PRAGMA table_info(certificate_corrections)")}
+        for name in ("observed_excel_certificate_no", "observed_excel_certificate_date"):
+            if name not in correction_columns:
+                self.db.execute(f"ALTER TABLE certificate_corrections ADD COLUMN {name} TEXT")
         if "certificate_date" not in {row[1] for row in self.db.execute("PRAGMA table_info(batches)")}:
             self.db.execute("ALTER TABLE batches ADD COLUMN certificate_date TEXT")
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(batches)")}
@@ -77,7 +83,7 @@ class History:
             raise ValueError("The confirmed draft could not be matched to its active certificate history")
         self.db.commit()
 
-    def mark_completed(self, batch, certificate_no):
+    def mark_drafted(self, batch, certificate_no):
         changed = self.db.execute(
             "UPDATE batches SET status_written=1,updated_at=datetime('now') "
             "WHERE case_id=? AND status='saved' AND certificate_no=? AND fingerprint=?",
@@ -85,8 +91,12 @@ class History:
         )
         if changed.rowcount != 1:
             self.db.rollback()
-            raise ValueError("The saved certificate history changed before its Completed status could be recorded")
+            raise ValueError("The saved certificate history changed before its Drafted status could be recorded")
         self.db.commit()
+
+    # Retain the old method name for callers from an earlier local install.
+    def mark_completed(self, batch, certificate_no):
+        return self.mark_drafted(batch, certificate_no)
 
     def record(self, batch):
         row = self.db.execute("SELECT * FROM batches WHERE case_id=?", (self.history_id(batch),)).fetchone()
@@ -107,6 +117,145 @@ class History:
             "FROM archived_issuances WHERE COALESCE(entry_id, '') != 'PDF_ONLY'"
         )]
         return active + archived
+
+    def correction_for_case(self, case_id):
+        row = self.db.execute(
+            "SELECT * FROM certificate_corrections WHERE case_id=? AND stage!='completed' "
+            "ORDER BY created_at DESC LIMIT 1", (case_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def begin_correction(self, batch, certificate_no, certificate_date, reason,
+                         pdf_path, settings):
+        """Reserve an audited correction for an unsent, confirmed certificate."""
+        certificate_no = str(certificate_no or "").strip()
+        reason = str(reason or "").strip()
+        certificate_date = parse_date(certificate_date)
+        if not certificate_no or not certificate_date:
+            raise ValueError("Enter a valid COD number and certificate date.")
+        if not reason or len(reason) > 500:
+            raise ValueError("Enter a correction reason (up to 500 characters).")
+        number = certificate_sequence(certificate_no, settings)
+        case_id = self.history_id(batch)
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            pending = self.db.execute(
+                "SELECT * FROM certificate_corrections WHERE case_id=? AND stage!='completed' "
+                "ORDER BY created_at DESC LIMIT 1", (case_id,),
+            ).fetchone()
+            if pending:
+                raise ValueError("A certificate correction is already in progress. Use Correct certificate to resume that correction first.")
+            row = self.db.execute("SELECT * FROM batches WHERE case_id=?", (case_id,)).fetchone()
+            if not row or row["status"] != "saved" or not row["status_written"]:
+                raise ValueError("Only a saved, unsent Drafted certificate can be corrected here. Check both plant files first.")
+            if row["fingerprint"] != self.fingerprint(batch):
+                raise ValueError("The client or inward details have changed since the certificate was drafted. Review the row before correcting its COD or date.")
+            if self.db.execute("SELECT 1 FROM sent_acknowledgements WHERE case_id=?", (case_id,)).fetchone():
+                raise ValueError("This certificate is confirmed Completed. The app will not change it; follow the company's certificate correction process so the original record remains intact.")
+            if not row["entry_id"] or row["entry_id"] == "PDF_ONLY" or not row["pdf_path"]:
+                raise ValueError("The saved Outlook draft or its PDF could not be identified. Check Outlook Drafts before changing this certificate.")
+            if number == certificate_sequence(row["certificate_no"], settings):
+                if certificate_no != row["certificate_no"]:
+                    raise ValueError("That COD has the same number as the saved COD but a different format. Keep the existing COD exactly as shown, or enter a different unused number.")
+            for existing in self.db.execute(
+                "SELECT case_id,generation,certificate_no FROM batches WHERE COALESCE(entry_id,'')!='PDF_ONLY' "
+                "UNION ALL SELECT case_id,generation,certificate_no FROM archived_issuances WHERE COALESCE(entry_id,'')!='PDF_ONLY'"
+            ):
+                same_active_issue = existing["case_id"] == case_id and int(existing["generation"] or 0) == int(row["generation"] or 1)
+                if not same_active_issue and certificate_sequence(existing["certificate_no"], settings) == number:
+                    raise ValueError(f"COD {certificate_no} has already been used. Enter a unique unused COD number.")
+            if certificate_no == row["certificate_no"] and certificate_date == parse_date(row["certificate_date"]):
+                raise ValueError("The COD number and date are unchanged; enter the value that needs correcting.")
+            correction_id = uuid.uuid4().hex
+            self.db.execute(
+                "INSERT INTO certificate_corrections(correction_id,case_id,generation,old_certificate_no,old_certificate_date,"
+                "new_certificate_no,new_certificate_date,reason,old_pdf_path,new_pdf_path,entry_id,stage,created_at,"
+                "observed_excel_certificate_no,observed_excel_certificate_date) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,'pending',datetime('now'),?,?)",
+                (correction_id, case_id, row["generation"], row["certificate_no"], row["certificate_date"],
+                 certificate_no, certificate_date.isoformat(), reason, row["pdf_path"], str(pdf_path), row["entry_id"],
+                 str(batch.get("cod_no", "") or ""),
+                 parse_date(batch.get("cod_date")).isoformat() if parse_date(batch.get("cod_date")) else None),
+            )
+            changed = self.db.execute(
+                "UPDATE batches SET status='correcting',updated_at=datetime('now') "
+                "WHERE case_id=? AND generation=? AND status='saved' AND status_written=1",
+                (case_id, row["generation"]),
+            )
+            if changed.rowcount != 1:
+                raise ValueError("Certificate history changed while correction was being started. Check both plant files and try again.")
+            self.db.commit()
+            return self.correction_for_case(case_id)
+        except Exception:
+            self.db.rollback()
+            raise
+
+    def set_correction_stage(self, correction_id, stage):
+        if stage not in {"outlook_updated", "workbook_updated"}:
+            raise ValueError("Unknown certificate correction stage.")
+        with self.db:
+            if stage == "outlook_updated":
+                changed = self.db.execute(
+                    "UPDATE certificate_corrections SET stage=CASE WHEN stage='workbook_updated' THEN stage ELSE ? END "
+                    "WHERE correction_id=? AND stage!='completed'", (stage, correction_id),
+                )
+            else:
+                changed = self.db.execute(
+                    "UPDATE certificate_corrections SET stage=? WHERE correction_id=? AND stage!='completed'",
+                    (stage, correction_id),
+                )
+            if changed.rowcount != 1:
+                raise ValueError("The certificate correction record could not be updated. Check both the draft and workbook before retrying.")
+
+    def finish_correction(self, correction_id, settings):
+        """Commit the audited issue history only after Outlook and Excel are verified."""
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            correction = self.db.execute(
+                "SELECT * FROM certificate_corrections WHERE correction_id=?", (correction_id,),
+            ).fetchone()
+            if not correction:
+                raise ValueError("The correction record is missing; no certificate history was changed.")
+            if correction["stage"] == "completed":
+                self.db.commit()
+                return dict(correction)
+            if correction["stage"] != "workbook_updated":
+                raise ValueError("The Outlook draft and Excel update must both be verified before correction history is finalized.")
+            row = self.db.execute("SELECT * FROM batches WHERE case_id=?", (correction["case_id"],)).fetchone()
+            if (not row or row["status"] != "correcting"
+                    or int(row["generation"] or 1) != int(correction["generation"])):
+                raise ValueError("Certificate history changed during correction. Ask for review before continuing.")
+            self.db.execute(
+                "INSERT INTO archived_issuances(case_id,generation,fingerprint,status,certificate_no,pdf_path,entry_id,updated_at,certificate_date,sent_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,NULL)",
+                (row["case_id"], row["generation"], row["fingerprint"], "saved", correction["old_certificate_no"],
+                 correction["old_pdf_path"], correction["entry_id"], row["updated_at"], correction["old_certificate_date"]),
+            )
+            next_generation = int(row["generation"] or 1) + 1
+            changed = self.db.execute(
+                "UPDATE batches SET status='saved',certificate_no=?,certificate_date=?,pdf_path=?,entry_id=?,generation=?,"
+                "status_written=1,prior_certificate_no=NULL,prior_certificate_date=NULL,updated_at=datetime('now') "
+                "WHERE case_id=? AND status='correcting' AND generation=?",
+                (correction["new_certificate_no"], correction["new_certificate_date"], correction["new_pdf_path"],
+                 correction["entry_id"], next_generation, correction["case_id"], correction["generation"]),
+            )
+            if changed.rowcount != 1:
+                raise ValueError("The corrected COD could not be saved to certificate history.")
+            sequence = certificate_sequence(correction["new_certificate_no"], settings) + 1
+            current = self.db.execute("SELECT value FROM meta WHERE key='next_sequence'").fetchone()
+            sequence = max(sequence, int(current[0]) if current else 1)
+            self.db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('next_sequence',?)", (str(sequence),))
+            self.db.execute(
+                "UPDATE certificate_corrections SET stage='completed',completed_at=datetime('now') WHERE correction_id=?",
+                (correction_id,),
+            )
+            self.db.commit()
+            return dict(self.db.execute(
+                "SELECT * FROM certificate_corrections WHERE correction_id=?", (correction_id,),
+            ).fetchone())
+        except Exception:
+            self.db.rollback()
+            raise
 
     def validate_sources(self, paths, batches, bind=False):
         """Keep legacy plant-slot keys tied to the files that own them."""
@@ -135,7 +284,7 @@ class History:
                 if reissue:
                     if (row["status"] != "saved" or not row["status_written"]
                             or row["fingerprint"] != self.fingerprint(batch)):
-                        raise ValueError("A new issue is allowed only after a confirmed Completed certificate is deliberately changed back to Ready and its source details are unchanged")
+                        raise ValueError("A new issue is allowed only after a saved certificate is deliberately changed back to Ready and its source details are unchanged")
                     prior_number = row["certificate_no"]
                     prior_date = row["certificate_date"]
                     sent = self.db.execute("SELECT certificate_no,sent_at FROM sent_acknowledgements WHERE case_id=?", (self.history_id(batch),)).fetchone()
@@ -249,16 +398,26 @@ class History:
         with self.db:
             record = self.db.execute("SELECT status,certificate_no FROM batches WHERE case_id=?", (case_id,)).fetchone()
             if not record or record['status'] != 'saved' or record['certificate_no'] != certificate_no:
-                raise ValueError("Only a confirmed draft with completed Excel updates can be marked sent. Check both files first.")
+                raise ValueError("Only a confirmed Drafted certificate with completed Excel updates can be marked Completed. Check both files first.")
             self.db.execute("INSERT OR IGNORE INTO sent_acknowledgements VALUES(?,?,datetime('now'))", (case_id, certificate_no))
+
+    def acknowledge_completed(self, case_id, certificate_no):
+        """Record that the operator has sent the draft and completed the case."""
+        return self.acknowledge_sent(case_id, certificate_no)
 
     def sent_acknowledgement(self, case_id):
         row = self.db.execute("SELECT * FROM sent_acknowledgements WHERE case_id=?", (case_id,)).fetchone()
         return dict(row) if row else None
 
+    def completed_acknowledgement(self, case_id):
+        return self.sent_acknowledgement(case_id)
+
     def undo_sent_acknowledgement(self, case_id):
         with self.db:
             self.db.execute("DELETE FROM sent_acknowledgements WHERE case_id=?", (case_id,))
+
+    def undo_completed_acknowledgement(self, case_id):
+        return self.undo_sent_acknowledgement(case_id)
 
 
 class OutlookWriter:
@@ -308,6 +467,88 @@ class OutlookWriter:
                 raise RuntimeError("Outlook returned no draft ID after Save.")
             self.confirm_saved(entry, batch, subject, pdf_path, banner_path)
             return entry
+        finally:
+            message = None
+
+    def validate_certificate_draft(self, entry_id, batch, expected_subject, pdf_path):
+        """Read-only preflight so a missing/edited draft fails before correction is reserved."""
+        if not Path(pdf_path).is_file():
+            raise FileNotFoundError(f"The original certificate PDF is missing: {pdf_path}")
+        message = None
+        try:
+            message = self.app.Session.GetItemFromID(entry_id, self.folder.StoreID)
+            key = message.UserProperties.Find("EcorecoCertificateKey")
+            if not key or str(key.Value) != batch.get("history_id", batch["case_id"]):
+                raise RuntimeError("the selected draft belongs to a different inward")
+            if bool(message.Sent):
+                raise RuntimeError("the certificate email is already sent; sent certificates cannot be changed here")
+            if str(message.Parent.EntryID) != str(self.folder.EntryID):
+                raise RuntimeError("the saved message is no longer in the selected Drafts folder")
+            if str(message.Subject) != expected_subject:
+                raise RuntimeError("the draft subject was changed outside this app; review it manually before correcting the certificate")
+            names = {str(message.Attachments.Item(i).FileName)
+                     for i in range(1, int(message.Attachments.Count) + 1)}
+            if Path(pdf_path).name not in names:
+                raise RuntimeError("the original certificate PDF is missing from the Outlook draft")
+        finally:
+            message = None
+
+    def update_certificate_draft(self, entry_id, batch, old_subject, new_subject,
+                                 old_pdf_path, new_pdf_path, banner_path=None):
+        """Correct only the COD subject and certificate PDF of an existing unsent draft."""
+        for path in (old_pdf_path, new_pdf_path, banner_path):
+            if path is not None and not Path(path).is_file():
+                raise FileNotFoundError(f"Certificate draft file unavailable: {path}. Restore it before continuing.")
+        message = None
+        try:
+            message = self.app.Session.GetItemFromID(entry_id, self.folder.StoreID)
+            key = message.UserProperties.Find("EcorecoCertificateKey")
+            expected_key = batch.get("history_id", batch["case_id"])
+            if not key or str(key.Value) != expected_key:
+                raise RuntimeError("the selected draft belongs to a different inward")
+            if bool(message.Sent):
+                raise RuntimeError("the certificate email is already sent; sent certificates cannot be changed here")
+            if str(message.Parent.EntryID) != str(self.folder.EntryID):
+                raise RuntimeError("the saved message is no longer in the selected Drafts folder")
+            if str(message.Subject) not in {old_subject, new_subject}:
+                raise RuntimeError("the draft subject was changed outside this app; review it manually before correcting the certificate")
+
+            old_name, new_name = Path(old_pdf_path).name, Path(new_pdf_path).name
+            attachments = {}
+            for index in range(1, int(message.Attachments.Count) + 1):
+                attachment = message.Attachments.Item(index)
+                attachments.setdefault(str(attachment.FileName), []).append(index)
+            if new_name not in attachments and old_name not in attachments:
+                raise RuntimeError("the existing certificate PDF is missing from the Outlook draft; check the draft before correcting it")
+            if new_name not in attachments:
+                attachment = message.Attachments.Add(str(Path(new_pdf_path).resolve()), 1)
+                attachment.PropertyAccessor.SetProperty(
+                    "http://schemas.microsoft.com/mapi/proptag/0x7FFE000B", False,
+                )
+            if banner_path and Path(banner_path).name not in attachments:
+                banner = message.Attachments.Add(str(Path(banner_path).resolve()), 1, 0)
+                banner.PropertyAccessor.SetProperty(
+                    "http://schemas.microsoft.com/mapi/proptag/0x3712001F", "ecoreco-banner",
+                )
+            # Remove only the previous certificate PDF; preserve the banner and
+            # any other attachments. Remove in descending index order so Outlook
+            # does not shift a later attachment into an earlier index.
+            remove_indices = list(attachments.get(old_name, []))
+            if new_name in attachments and old_name != new_name:
+                # Keep one corrected certificate attachment if a previous
+                # interrupted attempt or manual action left duplicate copies.
+                remove_indices.extend(attachments[new_name][1:])
+            for index in sorted(set(remove_indices), reverse=True):
+                if old_name == new_name:
+                    continue
+                message.Attachments.Item(index).Delete()
+            message.Subject = new_subject
+            message.Save()
+            self.confirm_saved(entry_id, batch, new_subject, new_pdf_path, banner_path)
+        except Exception as exc:
+            if isinstance(exc, (FileNotFoundError, RuntimeError)):
+                raise
+            raise RuntimeError(f"Outlook could not safely update the existing unsent draft. Check Outlook before retrying. ({exc})") from exc
         finally:
             message = None
 

@@ -64,7 +64,9 @@ class VolumeTests(unittest.TestCase):
         repeat = self.execute()
         self.assertEqual((repeat["created"], repeat["review"]), (0, 0), repeat)
         self.assertEqual(len(FakeOutlook.saved), 100)
-        self.assertEqual(Counter(r["outcome"] for r in repeat["rows"]), {"completed": 100})
+        self.assertEqual(Counter(r["outcome"] for r in repeat["rows"]), {"already_prepared": 100})
+        self.assertTrue(all(r["certificate_status"] == "drafted" and r.get("awaiting_send")
+                            for r in repeat["rows"]))
         print(f"\n100-dummy-certificate run: {elapsed:.2f}s; real PDF generation and Excel writes; Outlook simulated.", flush=True)
 
     def test_100_mixed_batches_have_complete_results_and_one_quiet_alert(self):

@@ -54,7 +54,8 @@ class AlertTests(unittest.TestCase):
                   "case_id": "1001", "inward_date": TODAY - timedelta(days=30),
                   "cod_no": "0042"}
         report_file = Report(self.root, TODAY, "Outlook drafts", publish_latest=False)
-        for status, expected in (("Blank", True), ("Completed", True), ("N/A", False), ("Sent", False)):
+        for status, expected in (("Blank", True), ("Ready", True), ("Drafted", True),
+                                 ("Completed", False), ("N/A", False), ("Sent", False)):
             report_file.add(dict(source, issued=status), "needs_review", "status check")
             row = report_file.rows[-1]
             self.assertEqual(row["age_days"], 30)
@@ -135,7 +136,7 @@ class AlertTests(unittest.TestCase):
         notify_once(self.root, report("legacy-date-shapes", legacy_rows,
                                        scan_complete=True, observed_sources=["plant1"]),
                     self.notify, TODAY, repeat_pending=True)
-        self.assertIn("3 inward records have missing, invalid, or future Inward Dates",
+        self.assertIn("2 inward records have missing, invalid, or future Inward Dates",
                       self.messages[0])
         self.assertNotIn("private.xlsx", self.messages[0])
         self.assertNotIn("legacy-", self.messages[0])

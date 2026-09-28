@@ -212,30 +212,30 @@ class DataEdges(unittest.TestCase):
         self.addCleanup(book.close)
         self.assertEqual(book.active["L2"].value, "0001")
         self.assertEqual(book.active["M2"].value.date(), TODAY)
-        self.assertEqual(book.active["N2"].value, "Completed")
+        self.assertEqual(book.active["N2"].value, "Drafted")
 
-    def test_mark_sent_changes_only_status_cell_and_keeps_recoverable_backup(self):
-        self.book(changes={"COD No": "0042", "COD Date": TODAY, "Certificate Issued": "Completed"})
+    def test_mark_completed_changes_only_status_cell_and_keeps_recoverable_backup(self):
+        self.book(changes={"COD No": "0042", "COD Date": TODAY, "Certificate Issued": "Drafted"})
         original = self.path.read_bytes()
         before = read_batches(self.path)[0]
         backup = update_issued_status(self.path, self.backups, "1", "Register", 2,
-                                      "0042", "completed", "Sent")
+                                      "0042", "drafted", "Completed")
         self.assertEqual(backup.read_bytes(), original)
         after = read_batches(self.path)[0]
-        self.assertEqual(after["issued"], "Sent")
+        self.assertEqual(after["issued"], "Completed")
         self.assertEqual(after["cod_no"], before["cod_no"])
         self.assertEqual(after["cod_date"], before["cod_date"])
         book = load_workbook(self.path, data_only=False)
         try:
             sheet = book["Register"]
             self.assertEqual(sheet["H2"].value, "=F2*G2")
-            self.assertEqual(sheet["N2"].value, "Sent")
+            self.assertEqual(sheet["N2"].value, "Completed")
         finally:
             book.close()
         saved = self.path.read_bytes()
         with self.assertRaisesRegex(ValueError, "status changed"):
             update_issued_status(self.path, self.backups, "1", "Register", 2,
-                                 "0042", "completed", "Sent")
+                                 "0042", "drafted", "Completed")
         self.assertEqual(self.path.read_bytes(), saved)
 
     def test_date_epoch_and_existing_date_style_survive(self):
@@ -364,7 +364,7 @@ class DataEdges(unittest.TestCase):
         updated = read_batches(self.path)[0]
         self.assertEqual(updated["cod_no"], "0001")
         self.assertEqual(parse_date(updated["cod_date"]), TODAY)
-        self.assertEqual(updated["issued"], "Completed")
+        self.assertEqual(updated["issued"], "Drafted")
 
     def test_xml_attribute_entities_are_not_double_escaped(self):
         xml = '<worksheet><sheetData><row r="2"><c r="L2" custom="a&amp;b"/></row></sheetData></worksheet>'

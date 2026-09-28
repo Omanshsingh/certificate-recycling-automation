@@ -41,11 +41,12 @@ def make_book(path, rows):
     sheet.freeze_panes = "D2"
     sheet.column_dimensions["C"].width = 44
     sheet.auto_filter.ref = sheet.dimensions
-    validation = DataValidation(type="list", formula1='"Ready,N/A,Blank,Completed"', allow_blank=True)
+    validation = DataValidation(type="list", formula1='"Ready,N/A,Blank,Completed,Sent"', allow_blank=True)
     sheet.add_data_validation(validation)
     validation.add("N2:N1000")
     for value, fill, color in (("READY", "C6EFCE", "006100"), ("N/A", "FFFFFF", "202020"),
-                               ("BLANK", "FFC7CE", "9C0006"), ("COMPLETED", "FFEB9C", "7F6000")):
+                               ("BLANK", "FFC7CE", "9C0006"), ("COMPLETED", "FFEB9C", "7F6000"),
+                               ("SENT", "DDEBF7", "1F4E78")):
         sheet.conditional_formatting.add(
             "N2:N1000",
             FormulaRule(formula=[f'UPPER(TRIM($N2))="{value}"'],
@@ -133,7 +134,7 @@ class WorkflowTests(unittest.TestCase):
         make_book(self.paths[1], [{"Certificate Issued": "N/A"}])
         self.execute()
         detail = str(self.report)
-        self.assertIn("Completed is only valid after a confirmed Outlook draft", detail)
+        self.assertIn("Drafted needs a matching saved Outlook draft", detail)
         self.assertIn("missing Form 6 number / manifest number", detail)
         self.assertFalse(FakeOutlook.saved)
         db = sqlite3.connect(self.root / "Data" / "certificate-history.sqlite")
@@ -166,7 +167,7 @@ class WorkflowTests(unittest.TestCase):
         self.one_ready()
         self.execute()
         first = read_batches(self.paths[0])[0]
-        self.assertEqual((first["cod_no"], first["issued"]), ("0062", "Completed"))
+        self.assertEqual((first["cod_no"], first["issued"]), ("0062", "Drafted"))
         original_date = first["cod_date"].date()
 
         from draft_service import History
@@ -183,7 +184,7 @@ class WorkflowTests(unittest.TestCase):
         self.execute()
 
         redrafted = read_batches(self.paths[0])[0]
-        self.assertEqual((redrafted["cod_no"], redrafted["issued"]), ("0062", "Completed"))
+        self.assertEqual((redrafted["cod_no"], redrafted["issued"]), ("0062", "Drafted"))
         self.assertEqual(redrafted["cod_date"].date(), original_date)
         self.assertEqual(len(FakeOutlook.saved), 2)
         self.assertIn("0062", FakeOutlook.saved[1][2])
@@ -238,6 +239,11 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(sheet.column_dimensions["C"].width, 44)
         self.assertEqual(str(sheet.merged_cells), "O2:P2")
         self.assertEqual(len(sheet.data_validations.dataValidation), 1)
+        self.assertEqual(sheet.data_validations.dataValidation[0].formula1, '"Ready,N/A,Blank"')
+        rules = sheet.conditional_formatting["N2:N1000"]
+        by_formula = {rule.formula[0]: rule.dxf.fill.fgColor.rgb[-6:] for rule in rules}
+        self.assertEqual(by_formula['UPPER(TRIM($N2))="DRAFTED"'], "FFEB9C")
+        self.assertEqual(by_formula['UPPER(TRIM($N2))="COMPLETED"'], "DDEBF7")
         book.close()
         backups = list((self.root / "Data" / "Workbook Backups").glob("Plant 1_*.xlsx"))
         self.assertEqual(len(backups), 1)
@@ -323,7 +329,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(self.execute()[:2], (0, 1))
         self.assertIn('future', str(self.report))
 
-    def test_manual_sent_confirmation_is_idempotent_reversible_and_does_not_redraft(self):
+    def test_manual_completion_confirmation_is_idempotent_reversible_and_does_not_redraft(self):
         from draft_service import History
         self.one_ready()
         self.execute()
@@ -333,28 +339,61 @@ class WorkflowTests(unittest.TestCase):
                 history.acknowledge_sent('1', '9999')
             with self.assertRaises(ValueError):
                 history.acknowledge_sent('plant2|1', '0061')
-            history.acknowledge_sent('1', '0062')
-            original = history.sent_acknowledgement('1')
+            history.acknowledge_completed('1', '0062')
+            original = history.completed_acknowledgement('1')
             created_row = next(row for row in self.report['rows'] if row['outcome'] == 'draft_created')
             self.assertTrue(created_row['awaiting_send'])
-            history.acknowledge_sent('1', '0062')
-            self.assertEqual(original, history.sent_acknowledgement('1'))
+            self.assertEqual(created_row['certificate_status'], 'drafted')
+            self.assertTrue(created_row['reminder_due'])
+            history.acknowledge_completed('1', '0062')
+            self.assertEqual(original, history.completed_acknowledgement('1'))
             update_issued_status(self.paths[0], self.root / 'Data' / 'Workbook Backups',
-                                 '1', 'Inward Register', 2, '0062', 'Completed', 'Sent')
-            self.execute()
-            self.assertEqual(len(FakeOutlook.saved), 1)
-            prepared_row = next(row for row in self.report['rows'] if row['outcome'] == 'sent')
-            self.assertFalse(prepared_row.get('awaiting_send', False))
-            history.undo_sent_acknowledgement('1')
-            self.assertIsNone(history.sent_acknowledgement('1'))
-            update_issued_status(self.paths[0], self.root / 'Data' / 'Workbook Backups',
-                                 '1', 'Inward Register', 2, '0062', 'Sent', 'Completed')
+                                 '1', 'Inward Register', 2, '0062', 'Drafted', 'Completed')
             self.execute()
             self.assertEqual(len(FakeOutlook.saved), 1)
             prepared_row = next(row for row in self.report['rows'] if row['outcome'] == 'completed')
+            self.assertFalse(prepared_row.get('awaiting_send', False))
+            self.assertEqual(prepared_row['certificate_status'], 'completed')
+            self.assertFalse(prepared_row['reminder_due'])
+            history.undo_completed_acknowledgement('1')
+            self.assertIsNone(history.completed_acknowledgement('1'))
+            update_issued_status(self.paths[0], self.root / 'Data' / 'Workbook Backups',
+                                 '1', 'Inward Register', 2, '0062', 'Completed', 'Drafted')
+            self.execute()
+            self.assertEqual(len(FakeOutlook.saved), 1)
+            prepared_row = next(row for row in self.report['rows'] if row['outcome'] == 'already_prepared')
             self.assertTrue(prepared_row['awaiting_send'])
+            self.assertEqual(prepared_row['certificate_status'], 'drafted')
+            self.assertTrue(prepared_row['reminder_due'])
         finally:
             history.close()
+        book = load_workbook(self.paths[0])
+        try:
+            rules = book["Inward Register"].conditional_formatting["N2:N1000"]
+            by_formula = {rule.formula[0]: rule.dxf.fill.fgColor.rgb[-6:] for rule in rules}
+            self.assertEqual(by_formula['UPPER(TRIM($N2))="DRAFTED"'], "FFEB9C")
+            self.assertEqual(by_formula['UPPER(TRIM($N2))="COMPLETED"'], "DDEBF7")
+            self.assertEqual(book["Inward Register"].data_validations.dataValidation[0].formula1,
+                             '"Ready,N/A,Blank"')
+        finally:
+            book.close()
+
+    def test_legacy_completed_draft_remains_overdue_until_operator_confirms(self):
+        self.one_ready()
+        self.execute()
+        book = load_workbook(self.paths[0])
+        book["Inward Register"]["N2"] = "Completed"
+        book.save(self.paths[0])
+        book.close()
+
+        self.execute(check_only=True)
+        row = next(item for item in self.report["rows"] if item["sn"] == "1")
+        self.assertEqual(row["certificate_status"], "drafted")
+        self.assertTrue(row["reminder_due"])
+        self.assertTrue(row["awaiting_send"])
+        self.assertEqual(len(FakeOutlook.saved), 1)
+        self.assertEqual(read_batches(self.paths[0])[0]["issued"], "Completed",
+                         "read-only check must not rewrite old workbooks")
 
     def test_no_arbitrary_start_when_both_files_have_no_earlier_cod(self):
         make_book(self.paths[0], [{}])
@@ -469,7 +508,7 @@ class WorkflowTests(unittest.TestCase):
 
         self.assertEqual((created, review), (2, 0), report)
         self.assertEqual(plant1[0]["cod_no"], "0302")
-        self.assertEqual(plant1[0]["issued"], "Completed")
+        self.assertEqual(plant1[0]["issued"], "Drafted")
         self.assertEqual(plant1[1]["cod_no"], "0303")
         self.assertEqual(len(FakeOutlook.saved), 2)
         self.assertIn("0302", FakeOutlook.saved[0][2])
@@ -503,7 +542,7 @@ class WorkflowTests(unittest.TestCase):
         redrafted = read_batches(self.paths[0])[0]
         self.assertEqual((created, review), (1, 0), self.report)
         self.assertEqual(len(FakeOutlook.saved), 2)
-        self.assertEqual((redrafted["cod_no"], redrafted["issued"]), (original["cod_no"], "Completed"))
+        self.assertEqual((redrafted["cod_no"], redrafted["issued"]), (original["cod_no"], "Drafted"))
         self.assertEqual(redrafted["cod_date"].date(), original_date)
         self.assertIn(original["cod_no"], FakeOutlook.saved[-1][2])
         self.assertNotIn("0999", FakeOutlook.saved[-1][2])
@@ -530,7 +569,7 @@ class WorkflowTests(unittest.TestCase):
         restored = read_batches(self.paths[0])[0]
         self.assertEqual((created, review), (0, 0), self.report)
         self.assertEqual(len(FakeOutlook.saved), 1)
-        self.assertEqual((restored["cod_no"], restored["issued"]), (original["cod_no"], "Completed"))
+        self.assertEqual((restored["cod_no"], restored["issued"]), (original["cod_no"], "Drafted"))
         self.assertEqual(restored["cod_date"].date(), original_date)
 
     def test_sent_row_restores_removed_cod_and_date_without_creating_a_message(self):
@@ -559,7 +598,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual((created, review), (0, 0), self.report)
         self.assertEqual(self.report["updated"], 1)
         self.assertEqual(len(FakeOutlook.saved), 1)
-        self.assertEqual((restored["cod_no"], restored["issued"]), (original["cod_no"], "Sent"))
+        self.assertEqual((restored["cod_no"], restored["issued"]), (original["cod_no"], "Completed"))
         self.assertEqual(restored["cod_date"].date(), original_date)
 
     def test_first_cod_setting_is_used_as_the_sequence_floor(self):

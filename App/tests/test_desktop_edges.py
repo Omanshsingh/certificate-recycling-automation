@@ -200,6 +200,36 @@ class DesktopEdges(TemporarySetup):
         self.assertIn('row 2', app.status.get())
         self.assertEqual(app.displayed_results_path, latest.with_suffix('.txt'))
 
+    def test_na_rows_show_in_skipped_even_when_a_previously_saved_draft_remains(self):
+        save_json(self.base / 'Output' / 'Latest Results.json', {'rows': [
+            dict(plant='plant1', sn='1', outcome='already_prepared', detail='N/A; existing Outlook draft remains',
+                 certificate_status='na', awaiting_send=True),
+            dict(plant='plant1', sn='2', outcome='not_applicable', detail='N/A: skipped',
+                 certificate_status='na'),
+            dict(plant='plant2', sn='3', outcome='already_prepared', detail='Saved draft awaiting review',
+                 certificate_status='drafted', awaiting_send=True),
+            dict(plant='plant2', sn='4', outcome='needs_review', detail='Unconfirmed existing draft',
+                 certificate_status='na', system_alert=True),
+        ]})
+        app = self.app()
+        self.assertIn('Drafted: 2', app.queue_summary.get())
+        self.assertIn('Skipped: 3', app.queue_summary.get())
+
+        app.queue_filter.set('Skipped')
+        app.show_results()
+        skipped = {app.table.item(item, 'values')[1]: app.table.item(item, 'values')[2]
+                   for item in app.table.get_children()}
+        self.assertEqual(skipped, {
+            '1': 'Skipped (draft exists)',
+            '2': 'Skipped',
+            '4': 'Needs attention',
+        })
+
+        app.queue_filter.set('Drafted')
+        app.show_results()
+        drafted = {app.table.item(item, 'values')[1] for item in app.table.get_children()}
+        self.assertEqual(drafted, {'1', '3'})
+
     def test_overdue_filter_shows_only_30_day_items(self):
         save_json(self.base / 'Output' / 'Latest Results.json', {'rows': [
             dict(plant='plant1', sn='1', outcome='needs_review', detail='Old blank', reminder_due=True),
@@ -212,16 +242,59 @@ class DesktopEdges(TemporarySetup):
         self.assertEqual(app.table.item(app.table.get_children()[0], 'values')[1], '1')
         self.assertIn('Overdue 30+ days: 1', app.queue_summary.get())
 
-    def test_unsaved_case_cannot_be_marked_sent(self):
+    def test_alerts_to_review_filter_matches_overdue_system_and_date_alerts(self):
+        save_json(self.base / 'Output' / 'Latest Results.json', {'rows': [
+            dict(plant='plant1', sn='1', outcome='already_prepared', detail='Old Drafted',
+                 certificate_status='drafted', reminder_due=True, inward_date_quality='valid'),
+            dict(plant='plant1', sn='2', outcome='needs_review', detail='Outlook recovery',
+                 system_alert=True, reminder_due=False, certificate_status='ready', inward_date_quality='valid'),
+            dict(plant='plant2', sn='3', outcome='needs_review', detail='Missing date',
+                 reminder_due=False, certificate_status='ready', inward_date_quality='missing'),
+            dict(plant='plant1', sn='4', outcome='needs_review', detail='Recent blank',
+                 reminder_due=False, certificate_status='blank', inward_date_quality='valid'),
+            dict(plant='plant2', sn='5', outcome='not_applicable', detail='Skipped',
+                 reminder_due=False, certificate_status='na', inward_date_quality='missing'),
+            dict(plant='plant2', sn='6', outcome='completed', detail='Done',
+                 reminder_due=False, certificate_status='completed', inward_date_quality='missing'),
+        ]})
+        app = self.app()
+        app.queue_filter.set('Alerts to review')
+        app.show_results()
+        visible = {app.table.item(item, 'values')[1] for item in app.table.get_children()}
+        self.assertEqual(visible, {'1', '2', '3'})
+        self.assertIn('Alerts to review: 3', app.queue_summary.get())
+
+    def test_review_alerts_scans_read_only_and_selects_the_real_alert_list(self):
+        app = self.app()
+        with patch.object(app, 'start') as start:
+            app.review_alerts()
+        self.assertEqual(app.queue_filter.get(), 'Alerts to review')
+        start.assert_called_once_with(drafts=False, check_only=True)
+
+    def test_unsaved_case_cannot_be_marked_completed(self):
         save_json(self.base / 'Output' / 'Latest Results.json', {'rows': [
             dict(plant='plant1', sn='1', outcome='ready', detail='Ready')
         ]})
         app = self.app()
         app.table.selection_set(app.table.get_children()[0])
         with patch('desktop_app.messagebox.askyesno') as confirm:
-            app.mark_selected_sent()
+            app.mark_selected_completed()
             confirm.assert_not_called()
-        self.assertIn('Only a prepared', app.status.get())
+        self.assertIn('saved draft', app.status.get())
+
+    def test_sent_certificate_cannot_be_opened_for_automated_correction(self):
+        save_json(self.base / 'Output' / 'Latest Results.json', {'rows': [
+            dict(plant='plant1', sn='1', outcome='completed', detail='COD completed',
+                 certificate_no='0042', certificate_status='completed'),
+        ]})
+        app = self.app()
+        app.table.selection_set(app.table.get_children()[0])
+        with patch('desktop_app.messagebox.showinfo') as info, \
+             patch.object(app, 'launch_worker') as worker:
+            app.correct_selected_certificate()
+        info.assert_called_once()
+        worker.assert_not_called()
+        self.assertIn('marked Completed', info.call_args.args[1])
 
     def test_followup_history_read_failure_does_not_break_work_list(self):
         save_json(self.base / 'Output' / 'Latest Results.json', {'rows': [
@@ -233,7 +306,7 @@ class DesktopEdges(TemporarySetup):
         self.assertNotIn('history unavailable', app.status.get())
         self.assertEqual(len(app.table.get_children()), 1)
 
-    def test_mark_sent_updates_excel_status_and_undo_restores_completed(self):
+    def test_mark_completed_updates_excel_status_and_undo_restores_drafted(self):
         from draft_service import History
         book = Workbook()
         sheet = book.active
@@ -243,7 +316,7 @@ class DesktopEdges(TemporarySetup):
                    "COD No", "COD Date", "Certificate Issued"]
         sheet.append(headers)
         sheet.append(["1", date(2026, 8, 1), "Dummy Client", "Mumbai", "Laptop", 2, 3.5,
-                      7, "FORM-1", "dummy@example.test", "REF-1", "0042", date(2026, 9, 1), "Completed"])
+                      7, "FORM-1", "dummy@example.test", "REF-1", "0042", date(2026, 9, 1), "Drafted"])
         book.save(self.paths[0])
         book.close()
         history = History(self.base / 'Data' / 'certificate-history.sqlite')
@@ -252,24 +325,24 @@ class DesktopEdges(TemporarySetup):
         history.db.commit()
         save_json(self.base / 'Output' / 'Latest Results.json', {'rows': [
             dict(plant='plant1', sn='1', outcome='already_prepared', detail='COD 0042',
-                 certificate_no='0042', certificate_status='completed', file=str(self.paths[0]),
+                 certificate_no='0042', certificate_status='drafted', file=str(self.paths[0]),
                  sheet='Register', row=2, reminder_due=True, age_days=54)
         ]})
         app = self.app()
         for confirm, expected in ((False, False), (True, True), (True, False)):
             app.table.selection_set(app.table.get_children()[0])
             with patch('desktop_app.messagebox.askyesno', return_value=confirm):
-                app.mark_selected_sent()
+                app.mark_selected_completed()
             self.assertEqual(bool(history.sent_acknowledgement('1')), expected)
             label = app.table.item(app.table.get_children()[0], 'values')[2]
-            self.assertEqual(label, 'Sent' if expected else 'Drafts to review')
+            self.assertEqual(label, 'Completed' if expected else 'Drafted')
             if expected:
                 latest = json.loads((self.base / 'Output' / 'Latest Results.json').read_text())
-                self.assertEqual(latest['rows'][0]['certificate_status'], 'sent')
-                self.assertIn('marked Sent', (self.base / 'Output' / 'Latest Results.txt').read_text())
+                self.assertEqual(latest['rows'][0]['certificate_status'], 'completed')
+                self.assertIn('marked Completed', (self.base / 'Output' / 'Latest Results.txt').read_text())
         final = __import__('openpyxl').load_workbook(self.paths[0], data_only=False)
         try:
-            self.assertEqual(final['Register']['N2'].value, 'Completed')
+            self.assertEqual(final['Register']['N2'].value, 'Drafted')
             self.assertEqual(final['Register']['L2'].value, '0042')
         finally:
             final.close()
@@ -304,37 +377,27 @@ class DesktopEdges(TemporarySetup):
         self.assertIn("1 row need attention", app.status.get())
         self.assertIn("Review Outlook Drafts", app.status.get())
 
-    def test_ui_has_draft_batch_and_alert_test_actions(self):
+    def test_ui_has_draft_batch_and_real_alert_review_actions(self):
         app = self.app()
         labels = [str(control.cget("text")) for control in app.controls if control.winfo_class() == "TButton"]
         self.assertIn("Create one draft", labels)
         self.assertIn("Create all Ready drafts", labels)
-        self.assertIn("Test alert", labels)
+        self.assertIn("Review alerts", labels)
+        self.assertNotIn("Test alert", labels)
         self.assertFalse(any("test draft" in label.casefold() or "sample" in label.casefold() for label in labels))
 
-    def test_test_alert_shows_notification_without_scanning_or_using_daily_state(self):
+    def test_review_alerts_does_not_invoke_the_test_notification_or_schedule(self):
         app = self.app()
         settings_before = (self.base / "settings.local.json").read_bytes()
-        with patch("desktop_app.run") as run, patch("workflow_support.show_centered_reminder", return_value="dismiss") as prompt:
-            app.test_alert()
-        prompt.assert_called_once_with(
-            "Ecoreco certificate reminder — test",
-            "This is what the scheduled reminder will look like. It summarizes the items that need review.",
-            parent=app.root,
-            test_mode=True,
-        )
+        with patch.object(app, 'start') as start, patch("desktop_app.run") as run, \
+             patch("workflow_support.show_centered_reminder") as prompt:
+            app.review_alerts()
+        start.assert_called_once_with(drafts=False, check_only=True)
         run.assert_not_called()
         self.assertFalse((self.base / "Data" / "alert-state.json").exists())
         self.assertEqual((self.base / "settings.local.json").read_bytes(), settings_before)
         self.notifier.assert_not_called()
-        self.assertIn("No workbook, schedule, or alert history was changed", app.status.get())
-
-    def test_test_alert_reports_when_centered_prompt_cannot_open(self):
-        app = self.app()
-        with patch("workflow_support.show_centered_reminder", side_effect=RuntimeError("display unavailable")):
-            app.test_alert()
-        self.assertIn("Could not show the test reminder", app.status.get())
-        self.assertIn("display unavailable", app.status.get())
+        prompt.assert_not_called()
 
     def test_one_draft_action_is_confirmed_without_test_only_copy(self):
         app = self.app()

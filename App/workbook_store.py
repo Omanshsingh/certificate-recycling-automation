@@ -99,6 +99,101 @@ def _set_cell(xml, coordinate, value, kind, style=None):
     return xml[:row_match.start()] + row + xml[row_match.end():]
 
 
+def _update_issued_status_formatting(xml, coordinate):
+    """Keep the human-editable choices and app-managed status colors in sync.
+
+    Existing workbooks used Completed for an unsent draft and Sent for a
+    manually confirmed send. Retarget those existing conditional-format rules
+    without rebuilding the worksheet or changing their ranges/styles.
+    """
+    match = re.fullmatch(r"([A-Z]+)(\d+)", coordinate)
+    if not match:
+        return xml
+    status_column = match.group(1)
+
+    def includes_status_column(sqref):
+        for reference in sqref.split():
+            area = re.fullmatch(
+                r"\$?([A-Z]+)\$?\d+(?::\$?([A-Z]+)\$?\d+)?", reference,
+                flags=re.IGNORECASE,
+            )
+            if not area:
+                continue
+            first = column_index_from_string(area.group(1).upper())
+            last = column_index_from_string((area.group(2) or area.group(1)).upper())
+            target = column_index_from_string(status_column)
+            if min(first, last) <= target <= max(first, last):
+                return True
+        return False
+
+    def rewrite_validation(block_match):
+        block = block_match.group()
+        if not includes_status_column(_attributes(block).get("sqref", "")):
+            return block
+        formula_match = re.search(
+            r"(<(?:[A-Za-z_][\w.-]*:)?formula1\b[^>]*>)(.*?)(</(?:[A-Za-z_][\w.-]*:)?formula1\s*>)",
+            block, flags=re.DOTALL,
+        )
+        if not formula_match:
+            return block
+        formula = unescape(formula_match.group(2)).strip()
+        if len(formula) < 2 or formula[0] not in {'"', "'"} or formula[-1] != formula[0]:
+            return block
+        choices = {item.strip().casefold() for item in formula[1:-1].split(",")}
+        allowed = {"ready", "n/a", "blank", "drafted", "completed", "sent"}
+        if not {"ready", "n/a", "blank"}.issubset(choices) or not choices.issubset(allowed):
+            return block
+        return block[:formula_match.start(2)] + '"Ready,N/A,Blank"' + block[formula_match.end(2):]
+
+    xml = _element(xml, "dataValidation").sub(rewrite_validation, xml)
+
+    formula_pattern = re.compile(
+        r"(<(?:[A-Za-z_][\w.-]*:)?formula\b[^>]*>)(.*?)(</(?:[A-Za-z_][\w.-]*:)?formula\s*>)",
+        flags=re.DOTALL,
+    )
+    status_format_blocks = [
+        item.group() for item in _element(xml, "conditionalFormatting").finditer(xml)
+        if includes_status_column(_attributes(item.group()).get("sqref", ""))
+    ]
+    labels = {
+        label.upper()
+        for block in status_format_blocks
+        for item in formula_pattern.finditer(block)
+        if re.search(rf"\$?{re.escape(status_column)}\$?\d+", item.group(2), flags=re.IGNORECASE)
+        for label in re.findall(r'["\'](COMPLETED|SENT|DRAFTED)["\']', item.group(2), flags=re.IGNORECASE)
+    }
+    rename_completed = "COMPLETED" in labels and "DRAFTED" not in labels
+    rename_sent = "SENT" in labels
+
+    def rewrite_conditional_formatting(block_match):
+        block = block_match.group()
+        attributes = _attributes(block)
+        if not includes_status_column(attributes.get("sqref", "")):
+            return block
+
+        def rewrite_formula(formula_match):
+            formula = formula_match.group(2)
+            if not re.search(rf"\$?{re.escape(status_column)}\$?\d+", formula, flags=re.IGNORECASE):
+                return formula_match.group()
+
+            def rename_status(label_match):
+                label = label_match.group(2).casefold()
+                if label == "completed" and rename_completed:
+                    replacement = "DRAFTED"
+                elif label == "sent" and rename_sent:
+                    replacement = "COMPLETED"
+                else:
+                    return label_match.group()
+                return f'{label_match.group(1)}{replacement}{label_match.group(3)}'
+
+            formula = re.sub(r'(["\'])(COMPLETED|SENT)(["\'])', rename_status, formula, flags=re.IGNORECASE)
+            return formula_match.group(1) + formula + formula_match.group(3)
+
+        return formula_pattern.sub(rewrite_formula, block)
+
+    return _element(xml, "conditionalFormatting").sub(rewrite_conditional_formatting, xml)
+
+
 def _date_style(styles_xml, existing_index):
     section = _element(styles_xml, "cellXfs").search(styles_xml)
     if section is None:
@@ -153,7 +248,7 @@ class WorkbookSession:
             finally:
                 self.context = None
 
-    def prepare(self, batch, certificate_no=None, allow_completed=False,
+    def prepare(self, batch, certificate_no=None, allow_drafted=False, allow_completed=False,
                 expected_previous_no=None, expected_previous_date=None,
                 allow_history_restore=False, allow_sent=False):
         if self.context is None:
@@ -163,12 +258,14 @@ class WorkbookSession:
             raise ValueError("The source batch changed; check the worksheet before continuing.")
         current = matches[0]
         valid_statuses = {"ready"}
+        if allow_drafted:
+            valid_statuses.add("drafted")
         if allow_completed:
             valid_statuses.add("completed")
         if allow_sent:
             valid_statuses.add("sent")
         if status_value(current["issued"]) not in valid_statuses:
-            raise ValueError("Choose Ready before creating a new draft. A completed row must be changed back to Ready to request another issue.")
+            raise ValueError("Choose Ready before creating a new draft. Existing Drafted or Completed rows are only updated after matching certificate history is confirmed.")
         if (expected_previous_no and current["cod_no"] not in {certificate_no, expected_previous_no}
                 and not allow_history_restore):
             raise ValueError("The previous COD is no longer in this row; review it before requesting another certificate.")
@@ -176,9 +273,9 @@ class WorkbookSession:
                 and not allow_history_restore):
             raise ValueError("This batch already has a different COD number; it was not overwritten.")
         if expected_previous_no and current["cod_no"] == expected_previous_no and not allow_history_restore:
-            if (status_value(current["issued"]) != "ready"
-                    and not (allow_completed and status_value(current["issued"]) == "completed")):
-                raise ValueError("A previous COD can be replaced only after the row is deliberately changed back to Ready.")
+            if (status_value(current["issued"]) not in {"ready", "drafted", "completed"}
+                    and not (allow_sent and status_value(current["issued"]) == "sent")):
+                raise ValueError("A previous COD can be updated only after the row is deliberately set to Ready or its saved history is confirmed.")
             if parse_date(current["cod_date"]) != parse_date(expected_previous_date):
                 raise ValueError("The previous COD Date changed; review it before requesting another certificate.")
         book = load_workbook(BytesIO(self.data), data_only=False)
@@ -188,7 +285,7 @@ class WorkbookSession:
             if not {"cod_no", "cod_date"}.issubset(cols):
                 raise ValueError("Add COD No and COD Date columns before preparing drafts.")
             if "issued" not in cols:
-                raise ValueError("Add a Certificate Issued column so the app can record Completed after saving the draft.")
+                raise ValueError("Add a Certificate Issued column so the app can record Drafted after saving the draft.")
             cells = [sheet.cell(current["source_row"], cols[key] + 1) for key in ("cod_no", "cod_date", "issued")]
             for cell in cells:
                 if any(cell.coordinate in merged for merged in sheet.merged_cells.ranges):
@@ -202,15 +299,15 @@ class WorkbookSession:
 
     def commit(self, batch, certificate_no, certificate_date,
                expected_previous_no=None, expected_previous_date=None,
-               allow_history_restore=False, target_status="Completed"):
-        if status_value(target_status) not in {"completed", "sent"}:
-            raise ValueError("The workbook can only be updated to Completed or Sent after certificate history is confirmed.")
+               allow_history_restore=False, target_status="Drafted", allow_legacy_sent=False):
+        if status_value(target_status) not in {"drafted", "completed", "sent"}:
+            raise ValueError("The workbook status must be Drafted or Completed after certificate history is confirmed.")
         current, cod_cell, date_cell, status_cell, style_id, has_date_style, epoch = self.prepare(
-            batch, certificate_no, allow_completed=True,
+            batch, certificate_no, allow_drafted=True, allow_completed=True,
             expected_previous_no=expected_previous_no,
             expected_previous_date=expected_previous_date,
             allow_history_restore=allow_history_restore,
-            allow_sent=status_value(target_status) == "sent",
+            allow_sent=allow_legacy_sent or status_value(target_status) == "sent",
         )
         replacing_previous = bool(expected_previous_no and current["cod_no"] == expected_previous_no)
         if replacing_previous and not allow_history_restore:
@@ -226,6 +323,7 @@ class WorkbookSession:
             xml = _set_cell(xml, cod_cell, certificate_no, "inlineStr")
             xml = _set_cell(xml, date_cell, to_excel(certificate_date, epoch), "n", style_id)
             xml = _set_cell(xml, status_cell, target_status, "inlineStr")
+            xml = _update_issued_status_formatting(xml, status_cell)
             ET.fromstring(xml)
             changed[member] = xml.encode("utf-8")
             buffer = BytesIO()
@@ -250,8 +348,8 @@ class WorkbookSession:
             expected_status = (expected_status,)
         expected = {status_value(value) for value in expected_status}
         target = status_value(new_status)
-        if target not in {"completed", "sent"}:
-            raise ValueError("Only Completed or Sent can be recorded by this action.")
+        if target not in {"drafted", "completed"}:
+            raise ValueError("Only Drafted or Completed can be recorded by this action.")
         matches = [batch for batch in read_batches(BytesIO(self.data))
                    if batch["case_id"] == str(case_id)
                    and batch["source_sheet"] == source_sheet
@@ -268,7 +366,7 @@ class WorkbookSession:
             sheet = book[current["source_sheet"]]
             cols = columns([cell.value for cell in sheet[1]])
             if "issued" not in cols:
-                raise ValueError("Add a Certificate Issued column before updating the sent status.")
+                raise ValueError("Add a Certificate Issued column before updating the completion status.")
             cell = sheet.cell(current["source_row"], cols["issued"] + 1)
             if any(cell.coordinate in merged for merged in sheet.merged_cells.ranges):
                 raise ValueError(f"{cell.coordinate} belongs to merged cells; unmerge it before changing the status.")
@@ -281,6 +379,7 @@ class WorkbookSession:
             member = _sheet_member(source, current["source_sheet"])
             xml = source.read(member).decode("utf-8")
             xml = _set_cell(xml, coordinate, new_status, "inlineStr")
+            xml = _update_issued_status_formatting(xml, coordinate)
             ET.fromstring(xml)
             buffer = BytesIO()
             with ZipFile(buffer, "w") as target_archive:

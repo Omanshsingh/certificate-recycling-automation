@@ -8,7 +8,7 @@ from pathlib import Path
 import re
 
 from certificate_core import (batch_content, certificate_layout, certificate_number, certificate_sequence,
-                              make_certificate, parse_date, read_batches,
+                              effective_certificate_status, make_certificate, parse_date, read_batches,
                               status_value, supplier_lines)
 from draft_service import History, OutlookWriter, draft_html
 from workbook_store import WorkbookSession
@@ -150,9 +150,25 @@ def run(workbook_path, mailbox, root, limit=None, create_drafts=True, as_of=None
                                 f"Reserved COD {record['certificate_no']} has no matching source row. Restore the original row and reconcile the saved certificate before issuing."))
                     blocked = True
             for batch in batches:
-                state = status_value(batch["issued"])
+                raw_state = status_value(batch["issued"])
                 issues = list(batch["issues"])
                 record = history.record(batch)
+                completion_ack = history.sent_acknowledgement(
+                    record["case_id"] if record else history.history_id(batch)
+                )
+                state = ("sent" if raw_state == "sent"
+                         else effective_certificate_status(batch, record, completion_ack))
+                batch["_effective_certificate_status"] = state
+                batch["_raw_certificate_status"] = raw_state
+                if record and record["status"] == "correcting":
+                    pending = history.correction_for_case(record["case_id"])
+                    target = (f"COD {pending['new_certificate_no']} dated {pending['new_certificate_date']}"
+                              if pending else "the saved correction")
+                    report.add(batch, "needs_review",
+                               f"A correction to {target} was interrupted. Select this row and use Correct certificate to safely resume it; no new drafts will be created until it is finished.",
+                               issue_code="certificate_correction_pending", system_alert=True)
+                    blocked = True
+                    continue
                 if record and record["status"] in {"pending", "saving_draft"}:
                     report.add(batch, "needs_review", _recovery_detail(record),
                                issue_code="draft_recovery", system_alert=True)
@@ -173,12 +189,12 @@ def run(workbook_path, mailbox, root, limit=None, create_drafts=True, as_of=None
 
                 if state == "sent":
                     if record and record["status"] in {"allocated", "draft_saved"}:
-                        report.add(batch, "needs_review", f"Sent is selected while COD {record['certificate_no']} still needs draft recovery. Restore Completed and reconcile the saved draft first.",
+                        report.add(batch, "needs_review", f"This row is marked as previously sent, but COD {record['certificate_no']} still needs draft recovery. Restore Drafted and reconcile the saved draft first.",
                                    issue_code="draft_recovery", system_alert=True)
                         continue
                     if record and record["status"] == "saved":
                         if not parse_date(record["certificate_date"]):
-                            report.add(batch, "needs_review", f"Sent COD {record['certificate_no']} has no saved date; check the sent certificate before continuing.",
+                            report.add(batch, "needs_review", f"Completed COD {record['certificate_no']} has no saved date; check the certificate before continuing.",
                                        issue_code="sent_history_mismatch", system_alert=True)
                             continue
                         if (batch["cod_no"] != record["certificate_no"]
@@ -188,13 +204,13 @@ def run(workbook_path, mailbox, root, limit=None, create_drafts=True, as_of=None
                             continue
                         if not check_only and create_drafts:
                             history.acknowledge_sent(record["case_id"], batch["cod_no"])
-                        report.add(batch, "sent", f"COD {record['certificate_no']} is marked Sent. The automation will not create another draft unless the status is deliberately changed back to Ready.")
+                        report.add(batch, "completed", f"COD {record['certificate_no']} is marked Completed. No new draft or message will be created unless Ready is deliberately selected again.")
                         continue
                     if not batch["cod_no"] or not parse_date(batch["cod_date"]):
-                        report.add(batch, "needs_review", "Sent is selected but COD No or COD Date is missing. Check the sent certificate and record its number and date.",
+                        report.add(batch, "needs_review", "This row is marked as previously sent, but COD No or COD Date is missing. Check the certificate and record its number and date.",
                                    issue_code="sent_without_certificate", system_alert=True)
                         continue
-                    report.add(batch, "sent", f"COD {batch['cod_no']} is marked Sent in Excel. The automation will not create another draft unless the status is deliberately changed back to Ready.")
+                    report.add(batch, "completed", f"COD {batch['cod_no']} is marked Completed. The automation will not create another draft unless Ready is deliberately selected again.")
                     continue
 
                 if state == "na":
@@ -215,7 +231,7 @@ def run(workbook_path, mailbox, root, limit=None, create_drafts=True, as_of=None
                     report.add(batch, "not_applicable", "N/A: skipped")
                     continue
 
-                if state == "completed":
+                if state == "drafted":
                     if record and record["status"] == "draft_saved":
                         if not parse_date(record["certificate_date"]):
                             report.add(batch, "needs_review", f"The saved draft for COD {record['certificate_no']} has no recorded date; review the existing draft before continuing",
@@ -225,26 +241,44 @@ def run(workbook_path, mailbox, root, limit=None, create_drafts=True, as_of=None
                         candidates.append(batch)
                         continue
                     if not record or record["status"] != "saved":
-                        report.add(batch, "needs_review", "Completed is only valid after a confirmed Outlook draft and matching COD are recorded. Set Ready only if a new certificate should be prepared; otherwise reconcile the existing certificate.")
+                        report.add(batch, "needs_review", "Drafted needs a matching saved Outlook draft in the local history. Check Outlook Drafts and the certificate register before continuing.",
+                                   issue_code="draft_recovery", system_alert=True)
                         continue
                     if not parse_date(record["certificate_date"]):
-                        report.add(batch, "needs_review", f"Saved certificate COD {record['certificate_no']} has no recorded date; review its history before continuing")
+                        report.add(batch, "needs_review", f"Drafted COD {record['certificate_no']} has no recorded date; review its history before continuing")
                         continue
                     if (batch["cod_no"] != record["certificate_no"]
                             or parse_date(batch["cod_date"]) != parse_date(record["certificate_date"])):
-                        batch["_history_action"] = "repair_saved"
+                        batch["_history_action"] = "repair_drafted"
                         candidates.append(batch)
                         continue
                     if not record["status_written"] and not check_only and create_drafts:
-                        history.mark_completed(batch, record["certificate_no"])
-                    report.add(batch, "completed", f"COD {record['certificate_no']} is recorded as Completed. Its Outlook draft remains unsent until a person reviews and sends it.", awaiting_send=True)
+                        history.mark_drafted(batch, record["certificate_no"])
+                    report.add(batch, "already_prepared", f"COD {record['certificate_no']} is Drafted in Excel. Review it in Outlook and mark it Completed here after you send it.", awaiting_send=True)
+                    continue
+
+                if state == "completed":
+                    if not record or record["status"] != "saved":
+                        report.add(batch, "needs_review", "Completed needs a matching saved certificate and a completion confirmation. Check Outlook Drafts and the certificate register before continuing.",
+                                   issue_code="sent_history_mismatch", system_alert=True)
+                        continue
+                    if not parse_date(record["certificate_date"]):
+                        report.add(batch, "needs_review", f"Completed COD {record['certificate_no']} has no recorded certificate date; review its history before continuing",
+                                   issue_code="sent_history_mismatch", system_alert=True)
+                        continue
+                    if (batch["cod_no"] != record["certificate_no"]
+                            or parse_date(batch["cod_date"]) != parse_date(record["certificate_date"])):
+                        batch["_history_action"] = "repair_completed"
+                        candidates.append(batch)
+                        continue
+                    report.add(batch, "completed", f"COD {record['certificate_no']} is confirmed Completed. It will not be drafted again unless Ready is deliberately selected.")
                     continue
 
                 if batch.get('inward_date') and batch['inward_date'] > as_of:
                     issues.append('Inward Date is in the future; correct it before preparing the certificate')
                 if state == "blank":
                     if "issued" in batch["missing_headers"]:
-                        status_issue = "Add a Certificate Issued column and choose Ready, N/A, Blank, Completed, or Sent for each batch"
+                        status_issue = "Add a Certificate Issued column. Choose Ready, N/A, or Blank in Excel; the app records Drafted and Completed"
                     elif str(batch["issued"] or "").strip().casefold() == "blank":
                         status_issue = "Certificate Issued is marked Blank: choose Ready or N/A when the certificate is approved"
                     else:
@@ -253,7 +287,7 @@ def run(workbook_path, mailbox, root, limit=None, create_drafts=True, as_of=None
                         status_issue += f". A confirmed draft for COD {record['certificate_no']} already exists; this row will not create another draft while status is Blank"
                     issues.insert(0, status_issue)
                 elif state == "unknown":
-                    issues.insert(0, f"Certificate Issued value {batch['issued']!r} is not Ready, N/A, Blank, Completed, or Sent")
+                    issues.insert(0, f"Certificate Issued value {batch['issued']!r} is not Ready, N/A, Blank, Drafted, Completed, or Sent")
 
                 if state == "ready":
                     for key, title in (("cod_no", "COD No"), ("cod_date", "COD Date")):
@@ -262,7 +296,7 @@ def run(workbook_path, mailbox, root, limit=None, create_drafts=True, as_of=None
 
                 if record and record["status"] in {"allocated", "draft_saved"}:
                     if state != "ready":
-                        report.add(batch, "needs_review", f"COD {record['certificate_no']} is reserved ({record['status']}); restore Ready or Completed so the saved draft can be reconciled. No new draft was created")
+                        report.add(batch, "needs_review", f"COD {record['certificate_no']} is reserved ({record['status']}); restore Ready or Drafted so the saved draft can be reconciled. No new draft was created")
                         continue
                     if issues:
                         report.add(batch, "needs_review", "; ".join(dict.fromkeys(issues)))
@@ -317,14 +351,14 @@ def run(workbook_path, mailbox, root, limit=None, create_drafts=True, as_of=None
                 for batch in candidates:
                     record = history.record(batch)
                     awaiting_send = bool(record and record["status"] in {"saved", "draft_saved"}
-                                         and status_value(batch["issued"]) != "sent")
+                                         and state not in {"completed", "sent"})
                     action = batch.get("_history_action")
                     if action == "complete_legacy":
-                        report.add(batch, "already_prepared", f"The confirmed draft for COD {record['certificate_no']} already exists. Create drafts will restore its COD and date in Excel and mark the row Completed, without making another draft.", awaiting_send=awaiting_send)
-                    elif action == "repair_saved":
-                        report.add(batch, "completed", f"The confirmed draft for COD {record['certificate_no']} already exists. Create drafts will restore its COD and date in Excel; it will not create another Outlook draft.", awaiting_send=awaiting_send)
-                    elif action == "repair_sent":
-                        report.add(batch, "sent", f"The sent COD {record['certificate_no']} is confirmed in history. Create drafts will restore its COD and date in Excel without creating or sending a message.")
+                        report.add(batch, "already_prepared", f"The existing draft for COD {record['certificate_no']} is confirmed. Create drafts will restore its COD, date, and Drafted status in Excel without making another draft.", awaiting_send=awaiting_send)
+                    elif action == "repair_drafted":
+                        report.add(batch, "already_prepared", f"The existing draft for COD {record['certificate_no']} is confirmed. Create drafts will restore its COD, date, and Drafted status in Excel without making another draft.", awaiting_send=True)
+                    elif action in {"repair_completed", "repair_sent"}:
+                        report.add(batch, "completed", f"The completed COD {record['certificate_no']} is confirmed in history. Create drafts will restore its COD and date in Excel without creating or sending a message.")
                     elif action == "reissue":
                         report.add(batch, "ready", f"Ready was selected again. Creating drafts will reuse COD {record['certificate_no']} and its original date for a new unsent Outlook draft.", awaiting_send=awaiting_send)
                     elif action == "recover":
@@ -356,14 +390,20 @@ def run(workbook_path, mailbox, root, limit=None, create_drafts=True, as_of=None
                         reported_candidates.add(id(batch))
                         safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", batch["case_id"])
                         action = batch.get("_history_action", "new")
+                        # The eligibility scan handles both plants before any
+                        # writes begin. Re-read each candidate's own status here;
+                        # relying on the last scanned row can reject Drafted
+                        # recovery simply because the other plant ends with N/A.
+                        state = batch.get("_effective_certificate_status", status_value(batch["issued"]))
+                        raw_state = batch.get("_raw_certificate_status", status_value(batch["issued"]))
                         if not create_drafts:
-                            if action in {"complete_legacy", "repair_saved"}:
+                            if action in {"complete_legacy", "repair_drafted"}:
                                 record = history.record(batch)
                                 report.add(batch, "already_prepared", f"COD {record['certificate_no']} already has a confirmed draft; no preview or additional draft was made")
                                 continue
-                            if action == "repair_sent":
+                            if action in {"repair_completed", "repair_sent"}:
                                 record = history.record(batch)
-                                report.add(batch, "sent", f"COD {record['certificate_no']} is already recorded as sent; preview mode does not change Excel or create a message")
+                                report.add(batch, "completed", f"COD {record['certificate_no']} is already recorded as completed; preview mode does not change Excel or create a message")
                                 continue
                             if action in {"allocated", "recover"}:
                                 report.add(batch, "needs_review", "This certificate has a reserved or saved draft. Use Create drafts to finish its existing Excel update; no preview was made.")
@@ -385,30 +425,36 @@ def run(workbook_path, mailbox, root, limit=None, create_drafts=True, as_of=None
                             expected_current_no = batch["cod_no"]
                         session.prepare(
                             batch, expected_current_no,
-                            allow_completed=(status_value(batch["issued"]) == "completed"
-                                             and action in {"recover", "repair_saved"}),
+                            allow_drafted=(state == "drafted" and action in {"recover", "repair_drafted"}),
+                            allow_completed=(
+                                (state == "completed" and action in {"repair_completed", "repair_sent"})
+                                or (raw_state == "completed" and state == "drafted"
+                                    and action in {"recover", "repair_drafted"})
+                            ),
                             expected_previous_no=expected_previous_no,
                             expected_previous_date=expected_previous_date,
-                            allow_history_restore=action in {"complete_legacy", "repair_saved", "repair_sent", "recover", "allocated", "reissue"},
+                            allow_history_restore=action in {"complete_legacy", "repair_drafted", "repair_completed", "repair_sent", "recover", "allocated", "reissue"},
                             allow_sent=action == "repair_sent",
                         )
-                        if action in {"complete_legacy", "repair_saved", "repair_sent"}:
+                        if action in {"complete_legacy", "repair_drafted", "repair_completed", "repair_sent"}:
                             issued_date = parse_date(record["certificate_date"])
-                            target_status = "Sent" if action == "repair_sent" else "Completed"
+                            target_status = "Completed" if action in {"repair_completed", "repair_sent"} else "Drafted"
                             backup = session.commit(
                                 batch, record["certificate_no"], issued_date,
                                 allow_history_restore=True, target_status=target_status,
+                                allow_legacy_sent=action == "repair_sent",
                             )
                             if action == "repair_sent":
                                 history.acknowledge_sent(record["case_id"], record["certificate_no"])
-                            else:
-                                history.mark_completed(batch, record["certificate_no"])
+                            elif action in {"complete_legacy", "repair_drafted"}:
+                                history.mark_drafted(batch, record["certificate_no"])
                             report.updated += 1
-                            awaiting_send = status_value(batch["issued"]) != "sent"
-                            if action == "repair_sent":
-                                report.add(batch, "sent", f"Excel was restored to the confirmed sent COD {record['certificate_no']} and its original date. No message was created or sent. Backup: {backup}")
+                            batch["_effective_certificate_status"] = "completed" if target_status == "Completed" else "drafted"
+                            awaiting_send = target_status == "Drafted"
+                            if target_status == "Completed":
+                                report.add(batch, "completed", f"Excel was restored to the confirmed completed COD {record['certificate_no']} and its original date. No message was created or sent. Backup: {backup}")
                             else:
-                                report.add(batch, "completed", f"Existing draft for COD {record['certificate_no']} confirmed; Excel COD and date were restored and status set to Completed. No additional draft was created. Backup: {backup}", awaiting_send=awaiting_send)
+                                report.add(batch, "already_prepared", f"Existing draft for COD {record['certificate_no']} confirmed; Excel COD and date were restored and status set to Drafted. No additional draft was created. Backup: {backup}", awaiting_send=awaiting_send)
                             continue
                         if action == "recover" and record and record["status"] == "draft_saved":
                             issued_date = parse_date(record["certificate_date"])
@@ -419,12 +465,13 @@ def run(workbook_path, mailbox, root, limit=None, create_drafts=True, as_of=None
                                 expected_previous_no=expected_previous_no,
                                 expected_previous_date=expected_previous_date,
                                 allow_history_restore=True,
+                                target_status="Drafted",
                             )
                             history.complete(batch, record["pdf_path"], record["entry_id"])
                             report.updated += 1
-                            awaiting_send = status_value(batch["issued"]) != "sent"
-                            report.add(batch, "updated", f"COD {record['certificate_no']} written to Excel and marked Completed; the existing draft was retained. Backup: {backup}",
-                                       awaiting_send=awaiting_send)
+                            batch["_effective_certificate_status"] = "drafted"
+                            report.add(batch, "updated", f"COD {record['certificate_no']} written to Excel and marked Drafted; the existing draft was retained. Backup: {backup}",
+                                       awaiting_send=True)
                             continue
                         if action == "reissue":
                             record = history.allocate(batch, settings, minimum, as_of, reissue=True)
@@ -455,15 +502,17 @@ def run(workbook_path, mailbox, root, limit=None, create_drafts=True, as_of=None
                             expected_previous_no=record.get("prior_certificate_no"),
                             expected_previous_date=record.get("prior_certificate_date"),
                             allow_history_restore=action in {"allocated", "reissue"},
+                            target_status="Drafted",
                         )
                         history.complete(batch, pdf, entry)
+                        batch["_effective_certificate_status"] = "drafted"
                         if action == "reissue":
                             detail = (f"Re-draft saved using existing COD {cert_no} and its original date. "
                                       "A new unsent Outlook draft was created; the earlier draft was left untouched. "
-                                      f"Excel was marked Completed. Backup: {backup}")
+                                      f"Excel was marked Drafted. Backup: {backup}")
                         else:
                             detail = (f"COD {cert_no}: PDF attached to an unsent Outlook draft; COD No, COD Date, "
-                                      f"and Certificate Issued = Completed were updated in Excel. Backup: {backup}")
+                                      f"and Certificate Issued = Drafted were updated in Excel. Backup: {backup}")
                         report.add(batch, "draft_created", detail,
                                    awaiting_send=True)
                     except Exception as exc:

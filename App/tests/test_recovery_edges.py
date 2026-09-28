@@ -126,7 +126,7 @@ class RecoveryEdges(unittest.TestCase):
         self.assertEqual(len(FakeOutlook.saved), 1)
         self.assertEqual(self.report["updated"], 1)
         self.assertEqual(_read_sources(self.paths)[0]["cod_no"], "0062")
-        self.assertEqual(_read_sources(self.paths)[0]["issued"], "Completed")
+        self.assertEqual(_read_sources(self.paths)[0]["issued"], "Drafted")
 
     def test_slot_swap_blocks_even_if_case_details_are_identical(self):
         make_book(self.paths[1], [{}])
@@ -199,7 +199,7 @@ class RecoveryEdges(unittest.TestCase):
         self.execute()
         self.assertEqual(self.report["updated"], 1)
         self.assertEqual(_read_sources(self.paths)[0]["cod_no"], "0062")
-        self.assertEqual(_read_sources(self.paths)[0]["issued"], "Completed")
+        self.assertEqual(_read_sources(self.paths)[0]["issued"], "Drafted")
         self.assertEqual(len(FakeOutlook.saved), 1)
 
     def test_rekeyed_saved_batch_without_its_cod_blocks_new_draft(self):
@@ -489,6 +489,87 @@ class OutlookComContracts(unittest.TestCase):
         writer = OutlookWriter("dummy@example.test")
         self.assertEqual(writer.save_draft(self.batch, "Dummy COD", "dummy", self.pdf), "DUMMY-ENTRY")
         message.Save.assert_called_once_with()
+
+    def test_correction_preflights_and_updates_only_existing_unsent_draft(self):
+        class Attachment:
+            def __init__(self, filename, parent):
+                self.FileName = filename
+                self.parent = parent
+                self.PropertyAccessor = Mock()
+                self.PropertyAccessor.GetProperty.return_value = False
+
+            def Delete(self):
+                self.parent.items.remove(self)
+
+        class AttachmentCollection:
+            def __init__(self, items):
+                self.items = items
+
+            @property
+            def Count(self):
+                return len(self.items)
+
+            def Item(self, index):
+                return self.items[index - 1]
+
+            def Add(self, path, *_args):
+                attachment = Attachment(Path(path).name, self)
+                self.items.append(attachment)
+                return attachment
+
+            def __iter__(self):
+                return iter(self.items)
+
+        self.new_pdf = Path(self.temp.name) / "corrected.pdf"
+        self.new_pdf.touch()
+        attachments = AttachmentCollection([
+            Attachment(self.pdf.name, None), Attachment(self.banner.name, None),
+        ])
+        for attachment in attachments.items:
+            attachment.parent = attachments
+        self.saved.Attachments = attachments
+        self.saved.Subject = "Certificate - 0062"
+        self.saved.To = "client@example.test"
+        self.saved.HTMLBody = "Keep the original reviewed email body"
+        writer = OutlookWriter("dummy@example.test")
+        writer.validate_certificate_draft(
+            "DUMMY-ENTRY", self.batch, "Certificate - 0062", self.pdf,
+        )
+        writer.update_certificate_draft(
+            "DUMMY-ENTRY", self.batch, "Certificate - 0062", "Certificate - 0063",
+            self.pdf, self.new_pdf, self.banner,
+        )
+        self.assertEqual(self.saved.Subject, "Certificate - 0063")
+        self.assertEqual(self.saved.To, "client@example.test")
+        self.assertEqual(self.saved.HTMLBody, "Keep the original reviewed email body")
+        self.assertEqual({item.FileName for item in attachments}, {"corrected.pdf", self.banner.name})
+        self.saved.Save.assert_called_once_with()
+        self.saved.Send.assert_not_called()
+        self.saved.Display.assert_not_called()
+        self.message.Send.assert_not_called()
+        self.message.Display.assert_not_called()
+        # Retrying after an interrupted app run is idempotent: it does not add a
+        # second copy of the corrected PDF.
+        writer.update_certificate_draft(
+            "DUMMY-ENTRY", self.batch, "Certificate - 0062", "Certificate - 0063",
+            self.pdf, self.new_pdf, self.banner,
+        )
+        self.assertEqual(sum(item.FileName == "corrected.pdf" for item in attachments), 1)
+        self.assertEqual(self.saved.Save.call_count, 2)
+        self.saved.Send.assert_not_called()
+        self.message.Send.assert_not_called()
+
+    def test_correction_preflight_rejects_sent_or_manually_changed_draft(self):
+        writer = OutlookWriter("dummy@example.test")
+        for sent, subject in ((True, "Dummy COD"), (False, "Manually changed")):
+            with self.subTest(sent=sent, subject=subject):
+                self.saved.Sent = sent
+                self.saved.Subject = subject
+                with self.assertRaisesRegex(RuntimeError, "already sent|subject was changed"):
+                    writer.validate_certificate_draft(
+                        "DUMMY-ENTRY", self.batch, "Certificate - 0062", self.pdf,
+                    )
+        self.message.Send.assert_not_called()
 
     def test_save_error_and_empty_entry_never_display_or_send(self):
         writer = OutlookWriter("dummy@example.test")
