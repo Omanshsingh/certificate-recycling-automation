@@ -1,0 +1,420 @@
+﻿{
+    "width":  960,
+    "height":  540,
+    "shapes":  [
+                   {
+                       "id":  5,
+                       "text":  "CERTIFICATE OF E-WASTE RECYCLING",
+                       "left":  147.010712,
+                       "top":  132.85141,
+                       "width":  684.4235,
+                       "height":  50.8922043,
+                       "font":  "Calibri",
+                       "size":  36,
+                       "bold":  -1,
+                       "align":  2,
+                       "color":  5287936,
+                       "margins":  [
+                                       7.2,
+                                       3.6,
+                                       7.2,
+                                       3.6
+                                   ]
+                   },
+                   {
+                       "id":  6,
+                       "text":  "This is to certify that e-waste received for recycling from",
+                       "left":  145.041885,
+                       "top":  182.334885,
+                       "width":  684.4235,
+                       "height":  26.657795,
+                       "font":  "Calibri",
+                       "size":  16,
+                       "bold":  0,
+                       "align":  2,
+                       "color":  0,
+                       "margins":  [
+                                       7.2,
+                                       3.6,
+                                       7.2,
+                                       3.6
+                                   ]
+                   },
+                   {
+                       "id":  8,
+                       "text":  "Has been processed in an environmentally responsible manner at our R2v3 Certified Facility, in accordance with the applicable E-Waste Management Rules, 2022.\u000bWe thank you for your contribution towards the environment.",
+                       "left":  142.305832,
+                       "top":  258.4655,
+                       "width":  684.4235,
+                       "height":  65.43284,
+                       "font":  "Calibri",
+                       "size":  16,
+                       "bold":  0,
+                       "align":  2,
+                       "color":  0,
+                       "margins":  [
+                                       7.2,
+                                       3.6,
+                                       7.2,
+                                       3.6
+                                   ]
+                   },
+                   {
+                       "id":  9,
+                       "text":  "E-waste Management\t      Secured Data Destruction\t     \t    Lamp Recycling\t    \t Skill Development",
+                       "left":  35.99992,
+                       "top":  387.959137,
+                       "width":  885.1764,
+                       "height":  29.08126,
+                       "font":  "Calibri",
+                       "size":  18,
+                       "bold":  -1,
+                       "align":  4,
+                       "color":  0,
+                       "margins":  [
+                                       7.2,
+                                       3.6,
+                                       7.2,
+                                       3.6
+                                   ]
+                   },
+                   {
+                       "id":  10,
+                       "text":  "MPCB Reg. No.: MPCB-CONSENT-0000132871\t\tCPCB Reg. No.: MPCB/RO(HQ)/HSMD/AUTHO/18/EW-27",
+                       "left":  64.16473,
+                       "top":  424.660858,
+                       "width":  840.7058,
+                       "height":  23.6285038,
+                       "font":  "Calibri",
+                       "size":  13.5,
+                       "bold":  -2,
+                       "align":  2,
+                       "color":  0,
+                       "margins":  [
+                                       7.2,
+                                       3.6,
+                                       7.2,
+                                       3.6
+                                   ]
+                   },
+                   {
+                       "id":  11,
+                       "text":  "Registered Office: Eco Recycling Ltd, 422, The Summit Business Bay, Near WEH Metro Station, Andheri-Kurla Road, Andheri (East), Mumbai – 400093\rRegistered Facility: Eco Recycling Ltd., Eco House, S. No. 22, H. No. 6 \u0026 7, Bhoidapada, Near Range Office, Sativali, Vasai (East), Dist. Palghar – 401208\rCertified for ISO 9001, ISO 14001, ISO 45001 \u0026 ISO 27001, R2V3 Certified",
+                       "left":  36.00008,
+                       "top":  454.6793,
+                       "width":  885.1763,
+                       "height":  50.8922043,
+                       "font":  "Calibri",
+                       "size":  12,
+                       "bold":  -2,
+                       "align":  2,
+                       "color":  0,
+                       "margins":  [
+                                       7.2,
+                                       3.6,
+                                       7.2,
+                                       3.6
+                                   ]
+                   },
+                   {
+                       "id":  12,
+                       "text":  "For Eco Recycling Ltd\r\r\rAuthorized Signatory",
+                       "left":  717.5006,
+                       "top":  296.9019,
+                       "width":  182.329376,
+                       "height":  84.82031,
+                       "font":  "Calibri",
+                       "size":  16,
+                       "bold":  0,
+                       "align":  2,
+                       "color":  0,
+                       "margins":  [
+                                       7.2,
+                                       3.6,
+                                       7.2,
+                                       3.6
+                                   ]
+                   },
+                   {
+                       "id":  14,
+                       "text":  "",
+                       "left":  153.595673,
+                       "top":  232.945755,
+                       "width":  684.4235,
+                       "height":  36.3515739,
+                       "font":  "Sitka Small",
+                       "size":  24,
+                       "bold":  -1,
+                       "align":  2,
+                       "color":  0,
+                       "margins":  [
+                                       7.2,
+                                       3.6,
+                                       7.2,
+                                       3.6
+                                   ]
+                   }
+               ],
+    "cells":  [
+                  {
+                      "row":  1,
+                      "column":  1,
+                      "text":  "Certificate No. \u0026 Date",
+                      "left":  324.324341,
+                      "top":  42.68268,
+                      "width":  174.540558,
+                      "height":  15,
+                      "font":  "Calibri",
+                      "size":  11,
+                      "bold":  -1,
+                      "align":  1,
+                      "color":  -2147483648,
+                      "margins":  [
+                                      6.75,
+                                      0.75,
+                                      0.75,
+                                      0
+                                  ]
+                  },
+                  {
+                      "row":  1,
+                      "column":  2,
+                      "text":  "",
+                      "left":  498.864868,
+                      "top":  42.68268,
+                      "width":  50.54055,
+                      "height":  15,
+                      "font":  "Calibri",
+                      "size":  11,
+                      "bold":  -1,
+                      "align":  2,
+                      "color":  0,
+                      "margins":  [
+                                      0.75,
+                                      0.75,
+                                      0.75,
+                                      0
+                                  ]
+                  },
+                  {
+                      "row":  1,
+                      "column":  3,
+                      "text":  "",
+                      "left":  549.405457,
+                      "top":  42.68268,
+                      "width":  70.05409,
+                      "height":  15,
+                      "font":  "Calibri",
+                      "size":  11,
+                      "bold":  -1,
+                      "align":  2,
+                      "color":  0,
+                      "margins":  [
+                                      0.75,
+                                      0.75,
+                                      0.75,
+                                      0
+                                  ]
+                  },
+                  {
+                      "row":  2,
+                      "column":  1,
+                      "text":  "Date of Material Receipt",
+                      "left":  324.324341,
+                      "top":  57.68268,
+                      "width":  174.540558,
+                      "height":  15,
+                      "font":  "Calibri",
+                      "size":  11,
+                      "bold":  -1,
+                      "align":  1,
+                      "color":  0,
+                      "margins":  [
+                                      6.75,
+                                      0.75,
+                                      0.75,
+                                      0
+                                  ]
+                  },
+                  {
+                      "row":  2,
+                      "column":  2,
+                      "text":  "",
+                      "left":  498.864868,
+                      "top":  57.68268,
+                      "width":  120.594643,
+                      "height":  15,
+                      "font":  "Calibri",
+                      "size":  11,
+                      "bold":  -1,
+                      "align":  2,
+                      "color":  0,
+                      "margins":  [
+                                      0.75,
+                                      0.75,
+                                      0.75,
+                                      0
+                                  ]
+                  },
+                  {
+                      "row":  3,
+                      "column":  1,
+                      "text":  "Weight",
+                      "left":  324.324341,
+                      "top":  72.68268,
+                      "width":  174.540558,
+                      "height":  15,
+                      "font":  "Calibri",
+                      "size":  11,
+                      "bold":  -1,
+                      "align":  1,
+                      "color":  -2147483648,
+                      "margins":  [
+                                      6.75,
+                                      0.75,
+                                      0.75,
+                                      0
+                                  ]
+                  },
+                  {
+                      "row":  3,
+                      "column":  2,
+                      "text":  "",
+                      "left":  498.864868,
+                      "top":  72.68268,
+                      "width":  120.594643,
+                      "height":  15,
+                      "font":  "Calibri",
+                      "size":  11,
+                      "bold":  -1,
+                      "align":  2,
+                      "color":  0,
+                      "margins":  [
+                                      0.75,
+                                      0.75,
+                                      0.75,
+                                      0
+                                  ]
+                  },
+                  {
+                      "row":  4,
+                      "column":  1,
+                      "text":  "Reference No.",
+                      "left":  324.324341,
+                      "top":  87.68268,
+                      "width":  174.540558,
+                      "height":  15,
+                      "font":  "Calibri",
+                      "size":  11,
+                      "bold":  -1,
+                      "align":  1,
+                      "color":  0,
+                      "margins":  [
+                                      6.75,
+                                      0.75,
+                                      0.75,
+                                      0
+                                  ]
+                  },
+                  {
+                      "row":  4,
+                      "column":  2,
+                      "text":  "",
+                      "left":  498.864868,
+                      "top":  87.68268,
+                      "width":  120.594643,
+                      "height":  15,
+                      "font":  "Calibri",
+                      "size":  11,
+                      "bold":  -1,
+                      "align":  2,
+                      "color":  0,
+                      "margins":  [
+                                      0.75,
+                                      0.75,
+                                      0.75,
+                                      0
+                                  ]
+                  },
+                  {
+                      "row":  5,
+                      "column":  1,
+                      "text":  "Manifest No.",
+                      "left":  324.324341,
+                      "top":  102.682678,
+                      "width":  174.540558,
+                      "height":  15,
+                      "font":  "Calibri",
+                      "size":  11,
+                      "bold":  -1,
+                      "align":  1,
+                      "color":  0,
+                      "margins":  [
+                                      6.75,
+                                      0.75,
+                                      0.75,
+                                      0
+                                  ]
+                  },
+                  {
+                      "row":  5,
+                      "column":  2,
+                      "text":  "",
+                      "left":  498.864868,
+                      "top":  102.682678,
+                      "width":  120.594643,
+                      "height":  15,
+                      "font":  "Calibri",
+                      "size":  11,
+                      "bold":  -1,
+                      "align":  2,
+                      "color":  0,
+                      "margins":  [
+                                      0.75,
+                                      0.75,
+                                      0.75,
+                                      0
+                                  ]
+                  },
+                  {
+                      "row":  6,
+                      "column":  1,
+                      "text":  "Date of E-waste Disposal",
+                      "left":  324.324341,
+                      "top":  117.682678,
+                      "width":  174.540558,
+                      "height":  15,
+                      "font":  "Calibri",
+                      "size":  11,
+                      "bold":  -1,
+                      "align":  1,
+                      "color":  0,
+                      "margins":  [
+                                      6.75,
+                                      0.75,
+                                      0.75,
+                                      0
+                                  ]
+                  },
+                  {
+                      "row":  6,
+                      "column":  2,
+                      "text":  "",
+                      "left":  498.864868,
+                      "top":  117.682678,
+                      "width":  120.594643,
+                      "height":  15,
+                      "font":  "Calibri",
+                      "size":  11,
+                      "bold":  -1,
+                      "align":  2,
+                      "color":  0,
+                      "margins":  [
+                                      0.75,
+                                      0.75,
+                                      0.75,
+                                      0
+                                  ]
+                  }
+              ]
+}

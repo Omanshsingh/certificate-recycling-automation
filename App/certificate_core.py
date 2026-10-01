@@ -1,13 +1,13 @@
 """Source parsing, eligibility, and exact-layout certificate generation."""
 from __future__ import annotations
 
+from collections import Counter
 from datetime import date, datetime
 from pathlib import Path
-from email.headerregistry import Address
-from email.errors import HeaderParseError
 import re
 import math
 import os
+import json
 
 from openpyxl import load_workbook
 from openpyxl.utils.cell import get_column_letter
@@ -16,6 +16,13 @@ from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
+
+PDF_WIDTH, PDF_HEIGHT = 960, 540
+TEMPLATE_DESIGN_WIDTH, TEMPLATE_DESIGN_HEIGHT = 1534, 867
+# Vertical grid lines in the supplied certificate template, in source-image pixels.
+CERTIFICATE_NUMBER_CELL = (797, 878)
+CERTIFICATE_DATE_CELL = (878, 990)
+DETAIL_VALUE_CELL = (797, 990)
 
 
 def norm(value):
@@ -53,17 +60,6 @@ def text(value):
     return str(value).strip() if value is not None else ""
 
 
-def valid_email(value):
-    """One mailbox only; never pass address-list syntax or header text to Outlook."""
-    if not value or len(value) > 254 or any(c.isspace() for c in value):
-        return False
-    try:
-        parsed = Address(addr_spec=value)
-    except (ValueError, HeaderParseError):
-        return False
-    return bool(parsed.username and parsed.domain and "." in parsed.domain and parsed.addr_spec == value)
-
-
 ALIASES = {
     "sn": {"sn", "serialnumber", "batchnumber", "inwardnumber"},
     "inward_date": {"inwarddate", "dateofmaterialreceipt", "materialreceiptdate"},
@@ -73,12 +69,22 @@ ALIASES = {
     "quantity": {"quantityinpcs", "quantity", "qty"},
     "per_piece_weight": {"perpcsweightinkg", "perpieceweightinkg", "perpieceweight"},
     "weight": {"weightkg", "weightinkg", "weight"},
+    # Optional batch-level weight requested by clients who want net weight
+    # after the box/packing weight has been removed.
+    "certificate_weight": {
+        "certificateweightkg", "certificateweightinkg", "certificateweight",
+        "certweightkg", "certweight", "netweightkg", "netweightinkg", "netweight",
+        "netweightleavingboxkg", "netweightleavingbox", "weightforcertificate",
+        "certificateweightnetweight", "certificateweightnetweightkg",
+        "certificatenetweight", "certificatenetweightkg",
+    },
     "form6": {"form6no", "form6number"},
-    "email": {"clientemail", "clientemailid", "email", "emailid", "customeremail"},
     "reference": {"referenceno", "referencenumber", "certificatereferenceno"},
     "cod_no": {"codno", "codnumber", "certificateissuedno", "certificateno"},
     "cod_date": {"coddate", "certificateissueddate", "certificatedate"},
     "issued": {"certificateissued", "certificatestatus", "codstatus"},
+    "certificate_type": {"certificatetype", "codtype", "certificatetemplate"},
+    "certificate_fields": {"certificatefields", "certificatedetails"},
 }
 
 
@@ -107,6 +113,12 @@ def read_batches(path):
         sheet = matches[0]
         sheet_name = sheet.title
         rows = list(sheet.iter_rows(values_only=True))
+        header_columns = columns(rows[0]) if rows else {}
+        cod_formats = {}
+        if "cod_no" in header_columns:
+            cod_column = header_columns["cod_no"] + 1
+            cod_formats = {row_number: sheet.cell(row_number, cod_column).number_format
+                           for row_number in range(2, sheet.max_row + 1)}
     finally:
         workbook.close()
     if not rows:
@@ -118,6 +130,13 @@ def read_batches(path):
         missing.append("weight or quantity/per-piece weight")
     if missing:
         raise ValueError("Missing required workbook columns: " + ", ".join(missing))
+
+    def read_cell_text(key, value, excel_row):
+        if key == "cod_no" and isinstance(value, (int, float)) and not isinstance(value, bool):
+            number_format = cod_formats.get(excel_row, "")
+            if re.fullmatch(r"0+", number_format) and float(value).is_integer():
+                return f"{int(value):0{len(number_format)}d}"
+        return text(value)
 
     batches = []
     current = None
@@ -131,23 +150,41 @@ def read_batches(path):
                 "supplier": text(raw[cols["supplier"]]),
                 "location": text(raw[cols["location"]]) if "location" in cols else "",
                 "form6": text(raw[cols["form6"]]) if "form6" in cols else "",
-                "email": text(raw[cols["email"]]) if "email" in cols else "",
                 "reference": text(raw[cols["reference"]]) if "reference" in cols else "",
-                "cod_no": text(raw[cols["cod_no"]]) if "cod_no" in cols else "",
+                "certificate_weight": None,
+                "certificate_weight_invalid": False,
+                "certificate_type": text(raw[cols["certificate_type"]]) if "certificate_type" in cols else "standard",
+                "certificate_fields": {},
+                "cod_no": read_cell_text("cod_no", raw[cols["cod_no"]], excel_row) if "cod_no" in cols else "",
                 "cod_date": raw[cols["cod_date"]] if "cod_date" in cols else None,
                 "issued": text(raw[cols["issued"]]) if "issued" in cols else "",
                 "source_sheet": sheet_name,
-                "missing_headers": [key for key in ("issued", "cod_no", "cod_date", "reference") if key not in cols],
+                # Reference No. is optional; only certificate output columns
+                # are reported here as missing headers.
+                "missing_headers": [key for key in ("issued", "cod_no", "cod_date") if key not in cols],
                 "items": [],
                 "issues": [],
             }
+            from certificate_templates import template_id
+            try:
+                current["certificate_type"] = template_id(current["certificate_type"])
+            except ValueError:
+                current["issues"].append("Unknown certificate type; choose a template in Details")
+            if "certificate_fields" in cols and text(raw[cols["certificate_fields"]]):
+                try:
+                    fields = json.loads(text(raw[cols["certificate_fields"]]))
+                    if not isinstance(fields, dict):
+                        raise ValueError("expected an object")
+                    current["certificate_fields"] = fields
+                except (ValueError, TypeError):
+                    current["issues"].append("Certificate Fields is not valid saved certificate data; open Details and correct it")
             batches.append(current)
         if current is None:
             if any(text(raw[index]) for index in cols.values()):
                 raise ValueError(f"Row {excel_row} has data but no preceding SN; correct this orphan row before issuing.")
             continue
         if not case_id:
-            for key in ("inward_date", "supplier", "location", "form6", "email", "reference", "cod_no", "cod_date", "issued"):
+            for key in ("inward_date", "supplier", "location", "form6", "reference", "cod_no", "cod_date", "issued"):
                 if key not in cols or not text(raw[cols[key]]):
                     continue
                 actual = raw[cols[key]]
@@ -155,14 +192,33 @@ def read_batches(path):
                 if key in {"inward_date", "cod_date"}:
                     same = parse_date(actual) is not None and parse_date(actual) == parse_date(expected)
                 else:
-                    same = text(actual) == text(expected)
+                    same = read_cell_text(key, actual, excel_row) == text(expected)
                 if not same:
                     if key == "cod_no":
                         raise ValueError(f"COD No on continuation row {excel_row} differs from its batch; correct the missing SN or misplaced COD before assigning new numbers.")
                     current["issues"].append(f"conflicting {key} on continuation row {excel_row}; check the missing SN")
-        for key in ("sn", "inward_date", "supplier", "location", "form6", "email", "reference", "issued"):
+        for key in ("sn", "inward_date", "supplier", "location", "form6", "reference", "issued"):
             if key in cols and text(raw[cols[key]]).startswith("="):
                 current["issues"].append(f"formula in {key} on row {excel_row}; enter a confirmed value")
+
+        # Certificate/net weight is a batch-level value.  It is normally
+        # entered on the first row, but accepting it on a continuation row
+        # makes the import tolerant of the way users maintain their sheets.
+        if "certificate_weight" in cols:
+            raw_certificate_weight = raw[cols["certificate_weight"]]
+            if text(raw_certificate_weight):
+                parsed_certificate_weight = number(raw_certificate_weight)
+                if parsed_certificate_weight is None or parsed_certificate_weight <= 0:
+                    current["certificate_weight_invalid"] = True
+                    current["issues"].append(
+                        f"invalid or negative certificate/net weight on row {excel_row}"
+                    )
+                elif current["certificate_weight"] is None:
+                    current["certificate_weight"] = parsed_certificate_weight
+                elif current["certificate_weight"] != parsed_certificate_weight:
+                    current["issues"].append(
+                        f"conflicting certificate/net weight on continuation row {excel_row}"
+                    )
         item = text(raw[cols["item"]]) if "item" in cols else ""
         if not item:
             if any(text(raw[cols[key]]) for key in ("quantity", "per_piece_weight", "weight") if key in cols):
@@ -187,15 +243,13 @@ def read_batches(path):
             current["issues"].append(f"invalid weight or unsupported weight formula on row {excel_row}; enter a confirmed weight or a same-row quantity times per-piece formula")
         current["items"].append({"item": item, "quantity": qty, "per_piece_weight": per, "weight": weight})
 
+    case_id_counts = Counter(batch["case_id"] for batch in batches)
+    form6_counts = Counter(batch["form6"] for batch in batches if batch["form6"])
     for batch in batches:
         if not batch["inward_date"]:
             batch["issues"].append("missing inward date")
         if not batch["supplier"]:
             batch["issues"].append("missing supplier name")
-        if not valid_email(batch["email"]):
-            batch["issues"].append("missing or invalid client email")
-        if not batch["reference"]:
-            batch["issues"].append("Reference No. column missing: ask Chahna to add it" if "reference" not in cols else "missing reference number")
         if not batch["form6"]:
             batch["issues"].append("missing Form 6 number / manifest number")
         if not batch["items"]:
@@ -207,8 +261,21 @@ def read_batches(path):
             batch["issues"].append("total weight must be a positive number")
         if any(item["weight"] is not None and (not math.isfinite(item["weight"]) or item["weight"] < 0) for item in batch["items"]):
             batch["issues"].append("an item has an invalid or negative weight")
-        if sum(b["case_id"] == batch["case_id"] for b in batches) > 1:
+        if (batch["certificate_weight"] is not None
+                and math.isfinite(batch["certificate_weight"])
+                and batch["certificate_weight"] > 0):
+            batch["display_weight"] = batch["certificate_weight"]
+            batch["weight_source"] = "certificate"
+        else:
+            # A bad optional value remains a visible warning, but the
+            # operator can still create a certificate using the inward total
+            # after explicitly accepting that consequence.
+            batch["display_weight"] = batch["total_weight"]
+            batch["weight_source"] = "inward"
+        if case_id_counts[batch["case_id"]] > 1:
             batch["issues"].append("SN is repeated on more than one batch in this plant workbook")
+        if batch["form6"] and form6_counts[batch["form6"]] > 1:
+            batch["issues"].append("Form 6 number is repeated on more than one batch in this plant workbook")
     return batches
 
 
@@ -220,39 +287,28 @@ def status_value(value):
         return "na"
     if cleaned == "blank":
         return "blank"
-    if cleaned == "drafted":
-        return "drafted"
-    if cleaned == "completed":
+    if cleaned in {"created", "drafted", "generated"}:
+        return "generated"
+    if cleaned in {"generatedmanual", "manualgenerated"}:
+        return "generated_manual"
+    if cleaned in {"completed", "sent"}:
         return "completed"
-    if cleaned == "sent":
-        return "sent"
+    if cleaned in {"alert", "checkdetails", "workingdraft"}:
+        # Legacy warning/draft labels must never become eligible for creation.
+        return "alert"
     return "blank" if not cleaned else "unknown"
 
 
 def effective_certificate_status(batch, record=None, completion_ack=None):
-    """Interpret current statuses and safely recognize pre-Drafted workbooks.
-
-    Older app versions wrote ``Completed`` immediately after saving an
-    unsent Outlook draft. In the new workflow, Completed means the operator
-    confirmed the message was sent. Until history contains that confirmation,
-    a legacy Completed cell remains Drafted and overdue.
-    """
-    raw = status_value(batch.get("issued"))
-    if raw == "sent":  # Legacy workbook spelling for operator-confirmed send.
-        return "completed"
-    if raw == "completed":
-        acknowledged = bool(
-            record
-            and completion_ack
-            and record.get("status") == "saved"
-            and completion_ack.get("certificate_no") == record.get("certificate_no")
-        )
-        return "completed" if acknowledged else "drafted"
-    return raw
+    """Normalize the worksheet status, including legacy labels from old installs."""
+    return status_value(batch.get("issued"))
 
 
 def batch_content(batch):
-    return {key: batch.get(key) for key in ("case_id", "inward_date", "supplier", "location", "form6", "email", "reference", "items")}
+    return {key: batch.get(key) for key in (
+        "case_id", "inward_date", "supplier", "location", "form6", "reference",
+        "certificate_weight", "items", "certificate_type", "certificate_fields",
+    )}
 
 
 def eligible(batch, as_of, days):
@@ -260,13 +316,13 @@ def eligible(batch, as_of, days):
     return bool(inward_date and (as_of - inward_date).days >= days)
 
 
-def certificate_reminder_due(batch, as_of, days=30):
-    """A case stays overdue until Completed or N/A, including unsent Drafted."""
+def certificate_reminder_due(batch, as_of, days=25):
+    """Remind from day 25 until the user marks the certificate Completed or N/A."""
     issued = batch.get("_effective_certificate_status", batch.get("issued"))
     return bool(
         batch.get("case_id")
         and eligible(batch, as_of, days)
-        and status_value(issued) not in {"na", "completed", "sent"}
+        and status_value(issued) not in {"na", "completed"}
     )
 
 
@@ -276,21 +332,26 @@ def certificate_number(sequence, settings):
 
 def certificate_sequence(value, settings):
     value = text(value)
-    prefix = settings.get("certificate_number_prefix", "")
-    match = re.fullmatch(re.escape(prefix) + r"(\d+)", value)
-    if not match:
-        raise ValueError(f"COD No {value!r} does not match the configured number format. Check it before assigning new numbers.")
-    return int(match.group(1))
+    match = re.search(r"(\d+)$", value)
+    return int(match.group(1)) if match else 0
 
 
-def fit(value, font, size, max_width):
+def fit(value, font, size, max_width, minimum_size=5, allow_overflow=False):
     value = str(value)
     if any(ord(character) < 32 for character in value):
-        raise ValueError("Certificate field contains a line break or control character; enter a single-line value.")
-    while size > 7 and stringWidth(value, font, size) > max_width:
-        size = max(7, size - 0.5)
+        if not allow_overflow:
+            raise ValueError("Certificate field contains a line break or control character; enter a single-line value.")
+        value = re.sub(r"[\x00-\x1f]+", " ", value).strip()
+    while size > minimum_size and stringWidth(value, font, size) > max_width:
+        size = max(minimum_size, size - 0.5)
     if stringWidth(value, font, size) > max_width:
-        raise ValueError("Certificate field is too long to fit; shorten the display value before issuing.")
+        if not allow_overflow:
+            raise ValueError("Certificate field is too long to fit; shorten the display value before issuing.")
+        # The operator has accepted the warning. Keep the PDF valid and
+        # readable by clipping the display value to the available field.
+        while value and stringWidth(value + "...", font, size) > max_width:
+            value = value[:-1]
+        value = value.rstrip() + ("..." if value else "")
     return value, size
 
 
@@ -305,10 +366,24 @@ def vendor_font():
     return "Helvetica-Bold"
 
 
-def supplier_lines(batch, max_width=620):
+def _template_cell_geometry(cell, template_size=(TEMPLATE_DESIGN_WIDTH, TEMPLATE_DESIGN_HEIGHT)):
+    """Return the center and usable width of a source-template cell in PDF points."""
+    template_width, template_height = template_size
+    scale = min(PDF_WIDTH / template_width, PDF_HEIGHT / template_height)
+    x_offset = (PDF_WIDTH - template_width * scale) / 2
+    design_scale = template_width / TEMPLATE_DESIGN_WIDTH
+    left, right = (edge * design_scale for edge in cell)
+    return x_offset + ((left + right) / 2) * scale, (right - left) * scale
+
+
+def supplier_lines(batch, max_width=620, allow_overflow=False):
     """Keep the vendor block centred and readable inside the template's gap."""
     supplier = " ".join(batch["supplier"].upper().split())
-    location = " ".join(batch.get("location", "").upper().split())
+    # Workbook test data may prefix a supplier with its plant; that is not part
+    # of the client name printed on the certificate.
+    supplier = re.sub(r"^PLANT\s*[12]\s*(?:[-:]\s*)?", "", supplier).strip()
+    # The certificate reference displays the city only, not state/country text.
+    location = " ".join(batch.get("location", "").split(",", 1)[0].upper().split())
     full = f"{supplier}, {location}" if location else supplier
     font = vendor_font()
     for size in (28, 26, 24, 22):
@@ -324,36 +399,62 @@ def supplier_lines(batch, max_width=620):
                 choices.append((abs(widths[0] - widths[1]), lines))
         if choices:
             return min(choices, key=lambda item: item[0])[1], size
+    if allow_overflow:
+        clipped, _ = fit(full, font, 16, max_width, minimum_size=5, allow_overflow=True)
+        return [clipped], 16
     raise ValueError("Supplier name/location is too long for the certificate; shorten the display name before issuing.")
 
 
-def certificate_layout(batch, certificate_no, certificate_date):
+def certificate_layout(batch, certificate_no, certificate_date, allow_warnings=False,
+                       template_size=(TEMPLATE_DESIGN_WIDTH, TEMPLATE_DESIGN_HEIGHT)):
     """Validate overlays before reserving a COD number or opening a PDF file."""
+    inward_date = batch.get("inward_date") or certificate_date
+    display_weight = batch.get("display_weight")
+    if display_weight is None:
+        display_weight = batch.get("total_weight")
+    if display_weight is None or not math.isfinite(display_weight):
+        display_weight = 0
+    cod_center, cod_cell_width = _template_cell_geometry(CERTIFICATE_NUMBER_CELL, template_size)
+    date_center, date_cell_width = _template_cell_geometry(CERTIFICATE_DATE_CELL, template_size)
+    detail_center, detail_cell_width = _template_cell_geometry(DETAIL_VALUE_CELL, template_size)
     fields = [
-        (certificate_no, 506, 54, 7.5, 40),
-        (certificate_date.strftime("%d.%m.%Y"), 566, 54, 7.0, 48),
-        (batch["inward_date"].strftime("%d.%m.%Y"), 506, 69, 8.5, 108),
-        (f"{batch['total_weight']:.1f} KG", 506, 84, 8.5, 108),
-        (batch["reference"], 506, 99, 7.5, 108),
-        (batch["form6"], 506, 114, 7.5, 108),
+        (certificate_no, cod_center, 54, 7.5, cod_cell_width - 2),
+        (certificate_date.strftime("%d.%m.%Y"), date_center, 54, 7.0, date_cell_width - 10),
+        (inward_date.strftime("%d.%m.%Y"), detail_center, 69, 8.5, detail_cell_width - 12),
+        (f"{display_weight:.1f} KG", detail_center, 84, 8.5, detail_cell_width - 12),
+        (batch.get("reference", ""), detail_center, 99, 7.5, detail_cell_width - 12),
+        (batch.get("form6", ""), detail_center, 114, 7.5, detail_cell_width - 12),
     ]
-    fitted = [(fit(raw, "Helvetica-Bold", size, width), x, y) for raw, x, y, size, width in fields]
-    lines, supplier_size = supplier_lines(batch)
+    fitted = [(fit(raw, "Helvetica-Bold", size, width, allow_overflow=allow_warnings), x, y)
+              for raw, x, y, size, width in fields]
+    lines, supplier_size = supplier_lines(batch, allow_overflow=allow_warnings)
     return fitted, lines, supplier_size
 
 
-def make_certificate(batch, certificate_no, certificate_date, template, destination):
-    fitted, lines, supplier_size = certificate_layout(batch, certificate_no, certificate_date)
+def make_certificate(batch, certificate_no, certificate_date, template, destination, allow_warnings=False):
+    if Path(template).suffix.casefold() == ".pdf":
+        from certificate_templates import make_template_certificate
+        return make_template_certificate(batch, certificate_no, certificate_date, destination, allow_warnings=allow_warnings)
+    background = ImageReader(str(template))
+    template_size = background.getSize()
+    fitted, lines, supplier_size = certificate_layout(
+        batch, certificate_no, certificate_date, allow_warnings=allow_warnings,
+        template_size=template_size,
+    )
     destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    W, H = 960, 540
+    W, H = PDF_WIDTH, PDF_HEIGHT
     pdf = canvas.Canvas(str(destination), pagesize=(W, H))
-    pdf.drawImage(ImageReader(str(template)), 0, 0, width=W, height=H, preserveAspectRatio=True, mask="auto")
+    background_scale = min(W / template_size[0], H / template_size[1])
+    background_width = template_size[0] * background_scale
+    background_height = template_size[1] * background_scale
+    pdf.drawImage(background, (W - background_width) / 2, (H - background_height) / 2,
+                  width=background_width, height=background_height, mask="auto")
 
     for (raw, size), x, y in fitted:
         pdf.setFont("Helvetica-Bold", size)
         pdf.setFillColorRGB(0, 0, 0)
-        pdf.drawString(x, H - y, raw)
+        pdf.drawCentredString(x, H - y, raw)
     pdf.setFont(vendor_font(), supplier_size)
     leading = supplier_size + 4
     first_baseline = 262 - (len(lines) - 1) * leading / 2

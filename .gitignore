@@ -4,6 +4,7 @@ __pycache__/
 Data/
 Input/
 Output/
+Certificates/
 outputs/
 Plant Workbooks/
 App/sample/Old test inputs/
@@ -12,6 +13,7 @@ App/sample/Old test inputs/
 *.sqlite*
 *.eml
 *.pdf
+!App/templates/certificate-types/*.pdf
 credentials.json
 .env
 settings.local.json

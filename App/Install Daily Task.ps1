@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('Install', 'Setup', 'Desktop', 'Daily', 'Diagnose', 'Reschedule', 'Snooze', 'CancelSnooze')]
+    [ValidateSet('Install', 'Setup', 'Desktop', 'Daily', 'Diagnose', 'Reschedule', 'Disable', 'Snooze', 'CancelSnooze')]
     [string]$Mode = 'Install',
     [string]$ReminderTime = '',
     [string]$SnoozeAt = ''
@@ -9,7 +9,7 @@ $ErrorActionPreference = 'Stop'
 $certificateRoot = if ((Split-Path $PSScriptRoot -Leaf) -eq 'App') { Split-Path $PSScriptRoot -Parent } else { $PSScriptRoot }
 
 function Resolve-CertificatePython {
-    param([bool]$RequirePackages = $true, [bool]$RequireOutlook = $true)
+    param([bool]$RequirePackages = $true)
     $candidates = [System.Collections.Generic.List[object]]::new()
     $script:CertificatePythonProbeFailures = @()
     $localPython = Join-Path $certificateRoot '.venv\Scripts\python.exe'
@@ -65,8 +65,7 @@ function Resolve-CertificatePython {
     $pathProbe = 'import sys; assert sys.version_info >= (3, 11); print(sys.executable)'
     $packageProbe = ''
     if ($RequirePackages) {
-        $packageProbe = 'import tkinter, openpyxl, reportlab; '
-        if ($RequireOutlook) { $packageProbe += 'import pythoncom, win32com.client, win32api, win32gui; ' }
+        $packageProbe = 'import tkinter, openpyxl, reportlab, pypdf, fontTools, pypdfium2, PIL; '
     }
     foreach ($candidate in $candidates) {
         $arguments = @($candidate.Prefix) + @('-c', $pathProbe)
@@ -128,13 +127,21 @@ try {
         Write-Host 'Any pending one-hour reminder was cleared.'
         exit 0
     }
+    if ($Mode -eq 'Disable') {
+        foreach ($taskName in @('Ecoreco Certificate Reminders', 'Ecoreco Certificate Reminder Snooze', 'Certificate Recycling Drafts', 'Certificate Recycling Daily Reminder')) {
+            $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+            if ($task) { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false }
+        }
+        Write-Host 'Daily certificate reminders are turned off.'
+        exit 0
+    }
     if ($Mode -eq 'Snooze') {
         if ($SnoozeAt -notmatch '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$') {
             throw 'The one-hour reminder time is invalid. Close the reminder and try again.'
         }
         $runAt = [DateTime]::ParseExact($SnoozeAt, 'yyyy-MM-ddTHH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
         if ($runAt -le (Get-Date)) { throw 'The reminder time has already passed. Choose Remind me in 1 hour again.' }
-        $certificatePython = Resolve-CertificatePython -RequirePackages $false -RequireOutlook $false
+        $certificatePython = Resolve-CertificatePython -RequirePackages $false
         if (-not $certificatePython) { throw 'Python could not be found, so Windows could not schedule the reminder. Keep the app open and ask IT to repair Python.' }
         $certificatePythonw = Join-Path (Split-Path $certificatePython) 'pythonw.exe'
         if (-not (Test-Path -LiteralPath $certificatePythonw -PathType Leaf)) {
@@ -161,29 +168,29 @@ try {
                 throw 'Cannot read the saved reminder time. Open the app, correct Settings, and try again.'
             }
         }
-        if (-not $ReminderTime) { $ReminderTime = '09:00' }
+        if (-not $ReminderTime) { $ReminderTime = '11:00' }
     }
     if ($ReminderTime -notmatch '^(?:[01][0-9]|2[0-3]):[0-5][0-9]$') {
-        throw 'Reminder time must use 24-hour format, for example 09:00 or 17:30.'
+        throw 'Reminder time must use 24-hour format, for example 11:00 or 17:30.'
     }
     if ($Mode -eq 'Reschedule') {
-        $taskName = 'Certificate Recycling Drafts'
+        $taskName = 'Ecoreco Certificate Reminders'
         $existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
         if (-not $existingTask) {
-            throw 'The daily task is not installed yet. Run Setup/Create Daily Draft Task.bat once to turn it on.'
+            throw 'The daily reminder is not installed yet. Use Save & update reminder in the app.'
         }
         $certificateUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
         $triggers = @((New-ScheduledTaskTrigger -Daily -At $ReminderTime), (New-ScheduledTaskTrigger -AtLogOn -User $certificateUser))
         # Sign-in remains a catch-up opportunity, but reminders themselves wait until the chosen time.
         $triggers[1].Delay = 'PT2M'
         $existingTask.Triggers = $triggers
-        $existingTask.Description = "Check both Ecoreco plant workbooks daily at $ReminderTime and shortly after sign-in; prepare Ready drafts, and remind for 30-day unsent inward records, un-ageable dates, or automation problems. Never send mail."
+        $existingTask.Description = "Check both Ecoreco plant workbooks daily at $ReminderTime and shortly after sign-in; remind about certificates from inward day 25 until Completed or N/A. Never creates drafts or sends mail."
         # Set-ScheduledTask has no -Description parameter on Windows PowerShell.
         Set-ScheduledTask -InputObject $existingTask | Out-Null
         Write-Host "Daily reminder time updated to $ReminderTime. The sign-in catch-up remains enabled."
         exit 0
     }
-    $certificatePython = Resolve-CertificatePython -RequirePackages ($Mode -ne 'Setup' -and $Mode -ne 'Snooze') -RequireOutlook ($Mode -ne 'Desktop' -and $Mode -ne 'Snooze')
+    $certificatePython = Resolve-CertificatePython -RequirePackages ($Mode -ne 'Setup' -and $Mode -ne 'Snooze')
     if (-not $certificatePython -and $Mode -eq 'Daily') {
         # Let the guarded runner record missing-package failures without a popup.
         $certificatePython = Resolve-CertificatePython -RequirePackages $false
@@ -205,16 +212,25 @@ try {
         $virtual = & $certificatePython -c 'import sys; print(int(sys.prefix != sys.base_prefix))'
         if ($LASTEXITCODE -ne 0) { throw 'Could not check the Python installation.' }
         if ([string]$virtual -eq '0') { $pipArguments += '--user' }
-        $pipArguments += @('-r', (Join-Path $PSScriptRoot 'requirements.txt'))
+        $lockedRequirements = Join-Path $PSScriptRoot 'requirements.lock.txt'
+        $requirementsPath = if (Test-Path -LiteralPath $lockedRequirements -PathType Leaf) { $lockedRequirements } else { Join-Path $PSScriptRoot 'requirements.txt' }
+        $pipArguments += @('-r', $requirementsPath)
         & $certificatePython @pipArguments
         if ($LASTEXITCODE -ne 0) { throw 'Package installation failed. Check internet access or ask IT for help.' }
-        & $certificatePython -c 'import tkinter, openpyxl, reportlab, pythoncom, win32com.client, win32api, win32gui'
+        & $certificatePython -c 'import tkinter, openpyxl, reportlab, pypdf, fontTools, pypdfium2, PIL'
         if ($LASTEXITCODE -ne 0) { throw 'Setup is incomplete. Ask IT to repair this Python installation.' }
         Write-Host 'Setup complete. Double-click Prepare Certificates.bat.'
         exit 0
     }
     if ($Mode -eq 'Desktop') {
-        & $certificatePython (Join-Path $PSScriptRoot 'desktop_app.py')
+        $certificatePythonw = Join-Path (Split-Path $certificatePython) 'pythonw.exe'
+        $dashboard = Join-Path $PSScriptRoot 'web_app.py'
+        if (Test-Path -LiteralPath $certificatePythonw -PathType Leaf) {
+            Start-Process -FilePath $certificatePythonw -ArgumentList ('"' + $dashboard + '"') -WorkingDirectory $PSScriptRoot -WindowStyle Hidden
+            Write-Host 'The local certificate dashboard is starting in your browser.'
+            exit 0
+        }
+        & $certificatePython $dashboard
         exit $LASTEXITCODE
     }
     $certificatePythonw = Join-Path (Split-Path $certificatePython) 'pythonw.exe'
@@ -227,18 +243,22 @@ try {
         exit $process.ExitCode
     }
 
-    # Validate the saved setup without creating drafts or contacting Outlook.
+    # Validate both saved plant workbooks before registering the alert-only task.
     & $certificatePython (Join-Path $PSScriptRoot 'validate_daily_setup.py')
     if ($LASTEXITCODE -ne 0) { throw 'The daily task was not changed. Correct the setup shown above, then try again.' }
     $certificateUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
     $action = New-ScheduledTaskAction -Execute $certificatePythonw -Argument $scriptArgument -WorkingDirectory $PSScriptRoot
     $triggers = @((New-ScheduledTaskTrigger -Daily -At $ReminderTime), (New-ScheduledTaskTrigger -AtLogOn -User $certificateUser))
-    # Give network drives and Classic Outlook time to become available at sign-in.
+    # Give network drives time to become available at sign-in.
     $triggers[1].Delay = 'PT2M'
-    # Do not forcibly terminate a batch halfway through saving Outlook/Excel.
+    # Do not forcibly terminate a batch halfway through updating PDFs or Excel.
     $taskSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
     $principal = New-ScheduledTaskPrincipal -UserId $certificateUser -LogonType Interactive -RunLevel Limited
-    Register-ScheduledTask -TaskName 'Certificate Recycling Drafts' -Action $action -Trigger $triggers -Settings $taskSettings -Principal $principal -Description "Check both Ecoreco plant workbooks at $ReminderTime and shortly after sign-in; prepare Ready drafts, and remind for 30-day unsent inward records, un-ageable dates, or automation problems. Never send mail." -Force | Out-Null
+    Register-ScheduledTask -TaskName 'Ecoreco Certificate Reminders' -Action $action -Trigger $triggers -Settings $taskSettings -Principal $principal -Description "Check both Ecoreco plant workbooks at $ReminderTime and shortly after sign-in; remind about certificates from inward day 25 until Completed or N/A. Never creates drafts or sends mail." -Force | Out-Null
+    foreach ($oldTaskName in @('Certificate Recycling Drafts', 'Certificate Recycling Daily Reminder')) {
+        $oldTask = Get-ScheduledTask -TaskName $oldTaskName -ErrorAction SilentlyContinue
+        if ($oldTask) { Unregister-ScheduledTask -TaskName $oldTaskName -Confirm:$false }
+    }
     Write-Host "Daily check installed for $ReminderTime and two minutes after Windows sign-in. Missed starts catch up when this user is signed in. Overlapping runs are skipped."
     exit 0
 } catch {

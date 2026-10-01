@@ -1,1044 +1,546 @@
-"""Simple desktop controls for the two plant workbooks."""
+"""Small desktop interface for checking inward rows and generating PDFs."""
 from __future__ import annotations
 
+from datetime import datetime
 import json
 import os
 from pathlib import Path
 import queue
 import subprocess
+import sys
 import threading
-import time
 import tkinter as tk
-from datetime import datetime
 from tkinter import filedialog, messagebox, ttk
 
 from app_paths import DATA_ROOT
-BASE = DATA_ROOT
-
-
-def load_settings(base):
-    from workflow_support import load_settings as load
-    return load(base)
-
-
-def save_json(path, value):
-    from workflow_support import save_json as save
-    return save(path, value)
-
-
-def run(*args, **kwargs):
-    # Keep the controls available even when a processing dependency is missing.
-    from run_certificates import run as process
-    return process(*args, **kwargs)
-
-
-def error_message(exc):
-    if isinstance(exc, ImportError):
-        return "A required Python package is missing. Run Setup Once.bat, then reopen the app. " + str(exc)
-    return str(exc)
+from certificate_core import parse_date, status_value
+from run_certificates import run
+from workbook_store import update_issued_status, upsert_certificate_details
+from workflow_support import load_settings, save_json
 
 
 def reminder_picker_parts(value):
-    """Convert stored local 24-hour time to the three read-only picker values."""
-    if not isinstance(value, str) or len(value) != 5 or value[2] != ":":
-        raise ValueError("Reminder time must be a valid 24-hour time.")
     try:
         parsed = datetime.strptime(value, "%H:%M")
-    except ValueError as exc:
-        raise ValueError("Reminder time must be a valid 24-hour time.") from exc
-    if parsed.strftime("%H:%M") != value:
-        raise ValueError("Reminder time must be a valid 24-hour time.")
+    except (TypeError, ValueError):
+        parsed = datetime.strptime("11:00", "%H:%M")
     hour = parsed.hour % 12 or 12
-    return str(hour), f"{parsed.minute:02d}", "PM" if parsed.hour >= 12 else "AM"
+    return f"{hour:02d}", f"{parsed.minute:02d}", "AM" if parsed.hour < 12 else "PM"
 
 
 def reminder_time_from_picker(hour, minute, period):
-    """Convert read-only hour/minute/AM-PM choices to the stored 24-hour form."""
-    if str(hour) not in {str(value) for value in range(1, 13)}:
-        raise ValueError("Choose an hour from 1 to 12.")
-    if str(minute) not in {f"{value:02d}" for value in range(60)}:
-        raise ValueError("Choose a minute from 00 to 59.")
-    period = str(period).upper()
-    if period not in {"AM", "PM"}:
-        raise ValueError("Choose AM or PM.")
-    hour_24 = int(hour) % 12 + (12 if period == "PM" else 0)
-    return f"{hour_24:02d}:{int(minute):02d}"
-
-
-def reminder_time_label(value):
-    hour, minute, period = reminder_picker_parts(value)
-    return f"{hour}:{minute} {period}"
-
-
-def is_actionable_alert_row(row):
-    """Match the case-level items represented by the scheduled reminder."""
-    system_alert_codes = {
-        "source_unavailable", "run_failure", "setup_issue", "draft_recovery",
-        "history_reconcile", "history_source_changed", "sent_without_certificate",
-        "sent_history_mismatch", "outlook_save_uncertain",
-    }
-    outcome = str(row.get("outcome", "")).strip().casefold()
-    if (row.get("system_alert") is True or row.get("issue_code") in system_alert_codes
-            or (outcome == "needs_review" and not row.get("sn"))
-            or row.get("reminder_due") is True):
-        return True
-    status = str(row.get("certificate_status", "")).strip().casefold().replace(" ", "")
-    if status in {"na", "notapplicable", "completed", "sent"} or outcome in {"completed", "sent"}:
-        return False
-    return str(row.get("inward_date_quality", "")).strip().casefold() in {"missing", "invalid", "future"}
+    hour, minute = int(hour), int(minute)
+    if not 1 <= hour <= 12 or not 0 <= minute <= 59 or period not in {"AM", "PM"}:
+        raise ValueError("Choose a valid reminder time.")
+    hour = hour % 12 + (12 if period == "PM" else 0)
+    return f"{hour:02d}:{minute:02d}"
 
 
 class App:
-    def __init__(self, root, base=BASE):
-        self.root, self.base = root, Path(base)
+    FILTERS = ("All rows", "Alerts due (day 25+)", "Ready", "Alert", "Generated", "Generated Manual", "Completed", "Blank", "N/A")
+
+    def __init__(self, root, base=None):
+        self.root = root
+        self.base = Path(base or DATA_ROOT)
+        self.settings = load_settings(self.base)
         self.root.title("Ecoreco Certificate Automation")
-        self.root.geometry("1080x760")
-        self.root.minsize(860, 600)
+        self.root.geometry("1120x720")
+        self.root.minsize(880, 570)
         self.events = queue.Queue()
         self.busy = False
         self.close_when_done = False
-        self.settings_error = ""
-        try:
-            self.settings = load_settings(self.base)
-        except Exception as exc:
-            self.settings_error = error_message(exc)
-            # Display placeholders only; never save over unreadable configuration.
-            self.settings = {"workbook_paths": ["", ""]}
-        self.workbooks = [tk.StringVar(value=p) for p in self.settings["workbook_paths"]]
-        self.mailbox = tk.StringVar(value=self.settings.get("outlook_mailbox", ""))
-        self.notifications = tk.BooleanVar(value=self.settings.get("quiet_notifications", True))
-        self.reminder_time = tk.StringVar(value=self.settings.get("reminder_time", "09:00"))
-        self.reminder_hour = tk.StringVar()
-        self.reminder_minute = tk.StringVar()
-        self.reminder_period = tk.StringVar()
-        self.set_reminder_picker(self.reminder_time.get())
-        self.first_cod = tk.StringVar(value=str(self.settings.get("certificate_number_start", 1)) if self.settings.get("initial_cod_confirmed", False) else "")
-        self.status = tk.StringVar(value="Choose both plant files, then click Check both files.")
-        self.last_result = None
-        self.queue_filter = tk.StringVar(value="All")
-        self.queue_summary = tk.StringVar(value="Check both files to see what needs attention.")
-        self.visible_rows = {}
-        self.displayed_results_path = self.base / "Output" / "Latest Results.txt"
-        self._latest_results_signature = None
-        self._next_latest_results_check = 0.0
-        self.controls = []
-        self.build()
-        if self.settings_error or not all(v.get() for v in self.workbooks) or not self.mailbox.get():
-            self.toggle_settings(force_open=True)
+        self.last_result = {}
+        self.workbooks = [tk.StringVar(value=item) for item in self.settings["workbook_paths"]]
+        self.reminders_enabled = tk.BooleanVar(value=self.settings.get("reminders_enabled", True))
+        hour, minute, period = reminder_picker_parts(self.settings["reminder_time"])
+        self.hour, self.minute, self.period = tk.StringVar(value=hour), tk.StringVar(value=minute), tk.StringVar(value=period)
+        self.status = tk.StringVar(value="Choose both plant workbooks once, then mark approved rows Ready in Excel.")
+        self.filter_value = tk.StringVar(value="All rows")
+        self.custom_cod = tk.StringVar(value="")
+        self.pending_selected = None
+        self._build()
         self.show_results()
-        if self.settings_error:
-            self.status.set("Settings unavailable: " + self.settings_error + " Repair the file, then click Reload settings.")
-        elif self.last_result:
-            previous_status = self.previous_results_message()
-            self.status.set(previous_status)
-            if "Excel files changed after the last check" in previous_status:
-                self.clear_result_table()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.root.after(150, self.poll)
 
-    def button(self, parent, label, command):
-        button = ttk.Button(parent, text=label, command=command)
-        button.pack(side="left", padx=(0, 8))
-        self.controls.append(button)
+    def _build(self):
+        outer = ttk.Frame(self.root, padding=14)
+        outer.pack(fill="both", expand=True)
+        ttk.Label(outer, text="Ecoreco Certificate Automation", font=("Segoe UI", 18, "bold")).pack(anchor="w")
+        ttk.Label(
+            outer,
+            text="Creates certificate PDFs only. It never creates email drafts or sends mail. Mark a row Ready in Excel to generate its certificate.",
+            wraplength=1050,
+        ).pack(anchor="w", pady=(4, 12))
+
+        files = ttk.LabelFrame(outer, text="Plant workbooks — choose each once", padding=9)
+        files.pack(fill="x", pady=(0, 8))
+        for index, variable in enumerate(self.workbooks):
+            ttk.Label(files, text=f"Plant {index + 1}", width=9).grid(row=index, column=0, sticky="w", pady=3)
+            ttk.Entry(files, textvariable=variable).grid(row=index, column=1, sticky="ew", padx=5, pady=3)
+            ttk.Button(files, text="Choose file…", command=lambda i=index: self.choose_file(i)).grid(row=index, column=2, padx=4)
+        files.columnconfigure(1, weight=1)
+
+        actions = ttk.Frame(outer)
+        actions.pack(fill="x", pady=(2, 8))
+        self.button(actions, "Save setup", self.save_setup)
+        self.button(actions, "Check both files", lambda: self.start(check_only=True))
+        self.button(actions, "Review alerts", self.review_alerts)
+        self.button(actions, "Generate selected PDF", lambda: self.start(selected_only=True))
+        self.button(actions, "Generate all Ready PDFs", self.start)
+        self.button(actions, "Create / edit from file…", self.create_from_file)
+        self.button(actions, "Open certificate folder", self.open_certificates)
+
+        custom_cod = ttk.Frame(outer)
+        custom_cod.pack(fill="x", pady=(0, 8))
+        ttk.Label(custom_cod, text="Custom COD for selected PDF (optional):").pack(side="left")
+        ttk.Entry(custom_cod, textvariable=self.custom_cod, width=20).pack(side="left", padx=(6, 8))
+        ttk.Label(custom_cod, text="Leave empty to use the next number automatically.").pack(side="left")
+
+        reminders = ttk.LabelFrame(outer, text="Daily reminder", padding=9)
+        reminders.pack(fill="x", pady=(0, 8))
+        ttk.Checkbutton(reminders, text="Show one reminder when inward details reach day 25", variable=self.reminders_enabled).pack(side="left")
+        ttk.Label(reminders, text="Time:").pack(side="left", padx=(20, 5))
+        ttk.Spinbox(reminders, from_=1, to=12, width=3, textvariable=self.hour, format="%02.0f").pack(side="left")
+        ttk.Label(reminders, text=":").pack(side="left")
+        ttk.Spinbox(reminders, from_=0, to=59, width=3, textvariable=self.minute, format="%02.0f").pack(side="left")
+        ttk.Combobox(reminders, state="readonly", values=("AM", "PM"), width=4, textvariable=self.period).pack(side="left", padx=4)
+        self.button(reminders, "Save & update reminder", self.save_setup_and_schedule)
+        ttk.Label(outer, text="Save and close Excel before checking or generating. Warnings are shown before creation; you can explicitly accept them. PDFs are named COD_Company_city_1.pdf or COD_Company_city_2.pdf; COD matches the number written to Excel.", wraplength=1060).pack(anchor="w", pady=(0, 8))
+
+        line = ttk.Frame(outer)
+        line.pack(fill="x", pady=(2, 3))
+        ttk.Label(line, text="Work list:").pack(side="left")
+        self.filter_box = ttk.Combobox(line, state="readonly", values=self.FILTERS, textvariable=self.filter_value, width=23)
+        self.filter_box.pack(side="left", padx=(6, 14))
+        self.filter_box.bind("<<ComboboxSelected>>", lambda _: self.show_results())
+        self.button(line, "Open selected plant Excel", self.open_selected_workbook)
+        self.button(line, "Mark selected Completed", self.mark_completed)
+        self.summary = ttk.Label(line, text="")
+        self.summary.pack(side="right")
+
+        columns = ("plant", "sn", "status", "client", "reference", "cod", "age", "details")
+        self.table = ttk.Treeview(outer, columns=columns, show="headings", selectmode="browse")
+        headings = {"plant": "Plant", "sn": "Client ID", "status": "Status", "client": "Client", "reference": "Reference", "cod": "COD", "age": "Inward age", "details": "What to do"}
+        widths = {"plant": 70, "sn": 82, "status": 110, "client": 175, "reference": 125, "cod": 75, "age": 86, "details": 390}
+        for column in columns:
+            self.table.heading(column, text=headings[column])
+            self.table.column(column, width=widths[column], minwidth=55, stretch=column in {"client", "details"})
+        yscroll = ttk.Scrollbar(outer, orient="vertical", command=self.table.yview)
+        xscroll = ttk.Scrollbar(outer, orient="horizontal", command=self.table.xview)
+        self.table.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        self.table.pack(side="top", fill="both", expand=True)
+        xscroll.pack(fill="x")
+        yscroll.place(in_=self.table, relx=1.0, rely=0, relheight=1.0, anchor="ne")
+        self.table.tag_configure("alert", background="#c00000", foreground="white")
+        self.table.tag_configure("ready", background="#d9ead3")
+        self.table.tag_configure("generated", background="#fff2cc")
+        self.table.tag_configure("generated_manual", background="#dceaf4")
+        self.table.tag_configure("alert", background="#fce4d6")
+        self.table.tag_configure("completed", background="#d9eaf7")
+        ttk.Label(outer, textvariable=self.status, wraplength=1050).pack(anchor="w", pady=(7, 0))
+
+    @staticmethod
+    def button(parent, text, command):
+        button = ttk.Button(parent, text=text, command=command)
+        button.pack(side="left", padx=(0, 6))
         return button
 
-    def build(self):
-        frame = ttk.Frame(self.root, padding=18)
-        frame.pack(fill="both", expand=True)
-        ttk.Label(frame, text="Ecoreco Certificate Automation", font=("Calibri", 18, "bold")).pack(anchor="w")
-        ttk.Label(frame, text="Creates certificate email drafts in Classic Outlook for review. It never sends them.", wraplength=900).pack(anchor="w", pady=(4, 8))
-
-        self.settings_button = ttk.Button(frame, text="Settings", command=self.toggle_settings)
-        self.settings_button.pack(anchor="e", pady=(0, 6))
-        self.controls.append(self.settings_button)
-        self.settings_frame = ttk.LabelFrame(frame, text="One-time setup", padding=8)
-        self.settings_visible = False
-        self.plants_frame = ttk.LabelFrame(self.settings_frame, text="Plant Excel files", padding=6)
-        self.plants_frame.pack(fill="x", pady=(0, 8))
-        ttk.Label(
-            self.plants_frame,
-            text="Choose each file once. The app remembers both locations. Save and close the workbooks before creating drafts.",
-            wraplength=900,
-        ).pack(anchor="w", pady=(0, 4))
-        for index, variable in enumerate(self.workbooks):
-            row = ttk.Frame(self.plants_frame)
-            row.pack(fill="x", pady=4)
-            ttk.Label(row, text=f"Plant {index + 1}", width=10).pack(side="left")
-            ttk.Entry(row, textvariable=variable, state="readonly").pack(side="left", fill="x", expand=True, padx=(0, 8))
-            self.button(row, "Choose file", lambda i=index: self.choose_workbook(i))
-
-        mailbox_frame = ttk.LabelFrame(self.settings_frame, text="Outlook mailbox", padding=6)
-        mailbox_frame.pack(fill="x", pady=(0, 8))
-        account_row = ttk.Frame(mailbox_frame)
-        account_row.pack(fill="x")
-        self.accounts = ttk.Combobox(account_row, textvariable=self.mailbox, state="readonly", width=38)
-        if self.mailbox.get():
-            self.accounts["values"] = [self.mailbox.get()]
-        self.accounts.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        self.accounts.bind("<<ComboboxSelected>>", lambda _: self.save_settings())
-        self.button(account_row, "Find Outlook mailboxes", self.load_accounts)
-
-        initial = ttk.Frame(self.settings_frame)
-        initial.pack(fill="x", pady=3)
-        ttk.Label(initial, text="First certificate number", width=22).pack(side="left")
-        number_entry = ttk.Entry(initial, textvariable=self.first_cod, width=12)
-        number_entry.pack(side="left", padx=(0, 8))
-        self.controls.append(number_entry)
-        ttk.Label(initial, text="Only if neither plant file has a COD number; otherwise leave blank.", wraplength=650).pack(side="left")
-
-        settings_actions = ttk.Frame(self.settings_frame)
-        settings_actions.pack(fill="x", pady=(4, 0))
-        self.button(settings_actions, "Open settings folder", self.open_settings_folder)
-        self.button(settings_actions, "Reload settings", self.reload_settings)
-        self.button(settings_actions, "Create one draft", lambda: self.start(limit=1))
-        self.button(settings_actions, "Open results", self.open_results)
-        notification_row = ttk.Frame(self.settings_frame)
-        notification_row.pack(fill="x", pady=(4, 0))
-        notification_control = ttk.Checkbutton(notification_row, text="Daily reminder", variable=self.notifications, command=self.save_settings)
-        notification_control.pack(side="left")
-        self.controls.append(notification_control)
-        ttk.Label(notification_row, text="Daily check & reminder time:").pack(side="left", padx=(8, 4))
-        self.reminder_hour_picker = ttk.Combobox(
-            notification_row, textvariable=self.reminder_hour,
-            values=tuple(str(value) for value in range(1, 13)), state="readonly", width=3,
+    def choose_file(self, index):
+        path = filedialog.askopenfilename(
+            parent=self.root, title=f"Choose Plant {index + 1} Excel workbook",
+            filetypes=(("Excel workbooks", "*.xlsx *.xlsm"), ("All files", "*.*")),
         )
-        self.reminder_hour_picker.pack(side="left")
-        ttk.Label(notification_row, text=":").pack(side="left")
-        self.reminder_minute_picker = ttk.Combobox(
-            notification_row, textvariable=self.reminder_minute,
-            values=tuple(f"{value:02d}" for value in range(60)), state="readonly", width=3,
-        )
-        self.reminder_minute_picker.pack(side="left")
-        self.reminder_period_picker = ttk.Combobox(
-            notification_row, textvariable=self.reminder_period,
-            values=("AM", "PM"), state="readonly", width=4,
-        )
-        self.reminder_period_picker.pack(side="left", padx=(4, 8))
-        self.controls.extend((self.reminder_hour_picker, self.reminder_minute_picker, self.reminder_period_picker))
-        self.button(notification_row, "Save & update time", self.apply_reminder_time)
-        ttk.Label(self.settings_frame, text="Default is 9:00 AM. Choose hour, minute, and AM/PM. The computer must be awake and this Windows account signed in for the reminder to appear.", wraplength=900).pack(anchor="w", padx=(4, 0))
-
-        self.actions_frame = ttk.LabelFrame(frame, text="Daily work", padding=10)
-        self.actions_frame.pack(fill="x", pady=(0, 8))
-        ttk.Label(
-            self.actions_frame,
-            text="Save and close Excel before running. Choose Ready (green), N/A (white), or Blank (red) in Excel. After creating a draft, the app marks it Drafted (yellow). Review and send it in Outlook, then click Mark completed here. Drafted stays in the 30+ day reminder list until you confirm it is completed. The app never sends email. Click Review alerts to refresh the real items that need attention; it does not create drafts.",
-            wraplength=900,
-        ).pack(anchor="w", pady=(0, 6))
-        plant_actions = ttk.Frame(self.actions_frame)
-        plant_actions.pack(fill="x")
-        self.button(plant_actions, "Create all Ready drafts", self.start)
-        self.button(plant_actions, "Check both files", lambda: self.start(check_only=True))
-        self.button(plant_actions, "Review alerts", self.review_alerts)
-        extras = ttk.Frame(frame)
-        extras.pack(fill="x", pady=(0, 4))
-        ttk.Label(extras, text="Review saved drafts in Classic Outlook > Drafts.").pack(side="left", padx=(0, 12))
-        self.button(extras, "Open output folder", self.open_output)
-        queue_bar = ttk.Frame(frame)
-        queue_bar.pack(fill="x", pady=4)
-        queue_choices = ttk.Combobox(queue_bar, textvariable=self.queue_filter, state="readonly", width=23,
-                                    values=("All", "Alerts to review", "Overdue 30+ days", "Needs attention", "Ready to draft", "Drafted", "Completed", "Skipped"))
-        queue_choices.pack(side="left", padx=(0, 8))
-        queue_choices.bind("<<ComboboxSelected>>", lambda _: self.show_results())
-        self.button(queue_bar, "Open selected plant", self.open_selected_plant)
-        self.button(queue_bar, "Mark completed / Undo", self.mark_selected_completed)
-        self.button(queue_bar, "Correct certificate", self.correct_selected_certificate)
-        ttk.Label(frame, textvariable=self.queue_summary, wraplength=900).pack(anchor="w", pady=(0, 4))
-        ttk.Label(
-            frame,
-            text="To fix a COD number or date on an unsent certificate, select its Drafted row and click Correct certificate. Completed certificates are kept unchanged.",
-            wraplength=900,
-        ).pack(anchor="w", pady=(0, 4))
-        table_frame = ttk.Frame(frame)
-        table_frame.pack(fill="both", expand=True)
-        self.table = ttk.Treeview(table_frame, columns=("plant", "sn", "status", "detail"), show="headings")
-        for name, title, width in (("plant", "Plant", 70), ("sn", "SN", 70), ("status", "Status", 130), ("detail", "Details", 580)):
-            self.table.heading(name, text=title)
-            self.table.column(name, width=width, minwidth=60)
-        scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.table.yview)
-        horizontal = ttk.Scrollbar(table_frame, orient="horizontal", command=self.table.xview)
-        self.table.configure(yscrollcommand=scroll.set, xscrollcommand=horizontal.set)
-        self.table.grid(row=0, column=0, sticky="nsew")
-        scroll.grid(row=0, column=1, sticky="ns")
-        horizontal.grid(row=1, column=0, sticky="ew")
-        table_frame.rowconfigure(0, weight=1)
-        table_frame.columnconfigure(0, weight=1)
-        self.table.tag_configure("needs_review", background="#C00000", foreground="#FFFFFF")
-        self.table.tag_configure("ready", background="#e2f0d9")
-        self.table.bind("<Double-1>", lambda _: self.open_selected_plant())
-        ttk.Label(frame, textvariable=self.status, wraplength=920).pack(anchor="w", pady=(12, 0))
-
-    def toggle_settings(self, force_open=False):
-        show = force_open or not self.settings_visible
-        if show:
-            self.settings_frame.pack(fill="x", before=self.actions_frame, pady=(0, 8))
-            self.settings_button.configure(text="Done with settings")
-        else:
-            if not self.save_settings():
-                return
-            self.settings_frame.pack_forget()
-            self.settings_button.configure(text="Settings")
-        self.settings_visible = show
-
-    def choose_workbook(self, index):
-        if self.busy or not self.settings_available():
-            return
-        previous = self.workbooks[index].get()
-        path = filedialog.askopenfilename(title=f"Select Plant {index + 1} Excel workbook", initialdir=str(Path(previous).parent) if previous else str(self.base / "Plant Workbooks"), filetypes=[("Excel workbooks", "*.xlsx *.xlsm")])
         if path:
-            if any(Path(v.get()).resolve() == Path(path).resolve() for i, v in enumerate(self.workbooks) if i != index and v.get()):
-                self.status.set("Choose a different file for each plant.")
-                return
             self.workbooks[index].set(path)
-            if self.save_settings():
-                self.status.set(f"Plant {index + 1} location saved. It will be reused next time.")
-            else:
-                self.workbooks[index].set(previous)
 
-    def settings_available(self):
-        if self.settings_error:
-            self.status.set("Settings unavailable: " + self.settings_error + " Repair the file, then click Reload settings.")
+    def selected_paths(self):
+        paths = [variable.get().strip() for variable in self.workbooks]
+        if not all(paths):
+            raise ValueError("Choose the Plant 1 and Plant 2 Excel files first.")
+        resolved = [Path(value).expanduser().resolve() for value in paths]
+        if not all(path.is_file() for path in resolved):
+            raise ValueError("A saved plant workbook cannot be found. Choose its current location in Settings.")
+        if resolved[0] == resolved[1] or resolved[0].samefile(resolved[1]):
+            raise ValueError("Choose two different Excel files, one for each plant.")
+        return [str(path) for path in resolved]
+
+    def save_setup(self):
+        try:
+            paths = [item.strip() for item in (var.get() for var in self.workbooks)]
+            if any(paths) and not all(paths):
+                raise ValueError("Choose both plant files, or leave both blank until they are available.")
+            if all(paths):
+                self.selected_paths()
+            reminder_time = reminder_time_from_picker(self.hour.get(), self.minute.get(), self.period.get())
+            self.settings["workbook_paths"] = paths
+            self.settings["reminder_time"] = reminder_time
+            self.settings["reminders_enabled"] = self.reminders_enabled.get()
+            save_json(self.base / "settings.local.json", self.settings)
+            self.status.set(f"Setup saved. Daily reminder: {'On' if self.reminders_enabled.get() else 'Off'} at {self._time_label(reminder_time)}.")
+            return True
+        except Exception as exc:
+            messagebox.showerror("Setup needs attention", str(exc), parent=self.root)
             return False
-        return True
 
-    def reload_settings(self):
+    def save_setup_and_schedule(self):
+        if not self.save_setup():
+            return
+        if not self.reminders_enabled.get():
+            try:
+                result = self._powershell("Disable")
+                if result.returncode:
+                    raise RuntimeError(result.stderr.strip() or result.stdout.strip())
+                self.status.set("Daily reminders are off; the Windows reminder task was removed.")
+            except Exception as exc:
+                messagebox.showerror("Reminder update failed", str(exc), parent=self.root)
+            return
+        try:
+            self.selected_paths()
+            result = self._powershell("Install", (("-ReminderTime", self.settings["reminder_time"]),))
+            if result.returncode:
+                raise RuntimeError((result.stdout or result.stderr).strip() or "Windows could not set up the daily reminder.")
+            self.status.set(f"Daily reminder is on for {self._time_label(self.settings['reminder_time'])}. It starts at inward day 25 and continues if overdue.")
+        except Exception as exc:
+            messagebox.showerror("Reminder setup failed", str(exc), parent=self.root)
+
+    def _powershell(self, mode, extra=()):
+        script = self.base / "App" / "Install Daily Task.ps1"
+        command = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script), "-Mode", mode]
+        for key, value in extra:
+            command.extend([key, str(value)])
+        return subprocess.run(command, capture_output=True, text=True, timeout=45, check=False)
+
+    def start(self, check_only=False, selected_only=False):
         if self.busy:
             return
         try:
-            settings = load_settings(self.base)
-        except Exception as exc:
-            self.settings_error = error_message(exc)
-            self.settings_available()
-            return
-        self.settings = settings
-        self.settings_error = ""
-        for variable, value in zip(self.workbooks, settings["workbook_paths"]):
-            variable.set(value)
-        self.mailbox.set(settings.get("outlook_mailbox", ""))
-        self.accounts["values"] = [self.mailbox.get()] if self.mailbox.get() else []
-        self.notifications.set(settings.get("quiet_notifications", True))
-        self.reminder_time.set(settings.get("reminder_time", "09:00"))
-        self.set_reminder_picker(self.reminder_time.get())
-        self.first_cod.set(str(settings.get("certificate_number_start", 1)) if settings.get("initial_cod_confirmed", False) else "")
-        self.status.set("Settings reloaded. Both plant locations are available for review.")
-
-    def open_settings_folder(self):
-        try:
-            os.startfile(str(self.base))
-        except OSError as exc:
-            self.status.set(f"Could not open the settings folder: {exc}")
-
-    def save_settings(self):
-        if self.busy or not self.settings_available():
-            return False
-        settings = dict(self.settings)
-        settings.update(workbook_paths=[v.get().strip() for v in self.workbooks], outlook_mailbox=self.mailbox.get().strip(), quiet_notifications=self.notifications.get())
-        initial = self.first_cod.get().strip()
-        if initial and (not initial.isascii() or not initial.isdecimal() or len(initial) > 12 or not 1 <= int(initial) <= 999999999999):
-            self.status.set("First COD number must be a whole number from 1 to 999999999999, or left blank.")
-            return False
-        settings["initial_cod_confirmed"] = bool(initial)
-        if initial:
-            settings["certificate_number_start"] = int(initial)
-        try:
-            # Re-read to detect corruption since startup before replacing anything.
-            latest = load_settings(self.base)
-        except Exception as exc:
-            self.settings_error = error_message(exc)
-            self.settings_available()
-            return False
-        # Preserve unrelated settings changed outside this window since startup.
-        latest.update({key: settings[key] for key in ("workbook_paths", "outlook_mailbox", "quiet_notifications", "initial_cod_confirmed")})
-        if initial:
-            latest["certificate_number_start"] = int(initial)
-        settings = latest
-        try:
-            save_json(self.base / "settings.local.json", settings)
-        except Exception as exc:
-            self.status.set(f"Settings were not saved. Check folder write access and try again. {error_message(exc)}")
-            return False
-        self.settings = settings
-        return True
-
-    def apply_reminder_time(self):
-        if self.busy or not self.settings_available():
-            return
-        try:
-            reminder_time = reminder_time_from_picker(
-                self.reminder_hour.get(), self.reminder_minute.get(), self.reminder_period.get(),
-            )
-        except ValueError:
-            self.status.set("Choose the hour, minute, and AM/PM from the lists, then save again.")
-            return
-        try:
-            latest = load_settings(self.base)
-            latest["reminder_time"] = reminder_time
-            save_json(self.base / "settings.local.json", latest)
-        except Exception as exc:
-            self.status.set(f"Reminder time was not saved. Check folder access and try again. {error_message(exc)}")
-            return
-        self.settings = latest
-        self.reminder_time.set(reminder_time)
-        self.set_busy(True)
-        self.status.set(f"Saving {reminder_time_label(reminder_time)} and updating the daily reminder schedule...")
-        self.launch_worker(self.reminder_schedule_worker, (reminder_time,))
-
-    def set_reminder_picker(self, value):
-        hour, minute, period = reminder_picker_parts(value)
-        self.reminder_hour.set(hour)
-        self.reminder_minute.set(minute)
-        self.reminder_period.set(period)
-
-    def reminder_schedule_worker(self, reminder_time):
-        script = Path(__file__).with_name("Install Daily Task.ps1")
-        try:
-            result = subprocess.run(
-                ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-                 "-File", str(script), "-Mode", "Reschedule", "-ReminderTime", reminder_time],
-                capture_output=True, text=True, timeout=60,
-            )
-        except Exception as exc:
-            self.events.put(("error", f"The time was saved as {reminder_time}, but Windows could not update the daily schedule. Try again or run Setup > Create Daily Draft Task. {error_message(exc)}"))
-            return
-        output = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part and part.strip())
-        if result.returncode == 0:
-            try:
-                from workflow_support import rearm_alerts_after_schedule_change
-                rearm_alerts_after_schedule_change(self.base)
-            except Exception as exc:
-                self.events.put(("error", f"Windows saved the {reminder_time_label(reminder_time)} schedule, but the previous No/remind-tomorrow choice could not be cleared. Save the time again in a moment. {error_message(exc)}"))
-                return
-            message = f"Daily check and reminder set for {reminder_time_label(reminder_time)}."
-            self.events.put(("done", message))
-        elif "not installed" in output.lower() or "does not exist" in output.lower():
-            self.events.put(("error", f"The time is saved as {reminder_time_label(reminder_time)}, but the daily task is not set up yet. Open Setup and choose Create Daily Draft Task once. {output}"))
-        else:
-            self.events.put(("error", f"The time is saved as {reminder_time_label(reminder_time)}, but Windows could not update the daily schedule. Try again or ask IT to allow this user's scheduled task. {output}"))
-
-    def review_alerts(self):
-        if self.busy:
-            return
-        self.queue_filter.set("Alerts to review")
-        self.start(drafts=False, check_only=True)
-
-    def set_busy(self, busy):
-        self.busy = busy
-        for control in self.controls:
-            control.configure(state="disabled" if busy else "normal")
-        for picker in (self.reminder_hour_picker, self.reminder_minute_picker, self.reminder_period_picker):
-            picker.configure(state="disabled" if busy else "readonly")
-        self.accounts.configure(state="disabled" if busy else "readonly")
-
-    def load_accounts(self):
-        if self.busy or not self.settings_available():
-            return
-        self.set_busy(True)
-        self.status.set("Reading Classic Outlook accounts...")
-        def worker():
-            initialized = False
-            try:
-                import pythoncom
-                import win32com.client
-                pythoncom.CoInitialize()
-                initialized = True
-                app = win32com.client.Dispatch("Outlook.Application")
-                self.events.put(("accounts", [str(a.SmtpAddress) for a in app.Session.Accounts]))
-            except Exception as exc:
-                self.events.put(("error", f"Could not load Classic Outlook accounts: {error_message(exc)}"))
-            finally:
-                if initialized:
-                    pythoncom.CoUninitialize()
-        self.launch_worker(worker)
-
-    def launch_worker(self, target, args=()):
-        try:
-            threading.Thread(target=target, args=args, daemon=True).start()
-        except Exception as exc:
-            self.set_busy(False)
-            self.status.set(f"Could not start processing: {error_message(exc)}")
-
-    def start(self, drafts=True, limit=None, check_only=False):
-        if self.busy or not self.settings_available():
-            return
-        paths = [v.get().strip() for v in self.workbooks]
-        if len(paths) != 2 or not all(paths):
-            self.status.set("Choose both plant Excel files in the section above before continuing.")
-            return
-        try:
-            resolved = [Path(p).resolve() for p in paths]
-            if resolved[0] == resolved[1] or (all(p.is_file() for p in resolved) and resolved[0].samefile(resolved[1])):
-                self.status.set("Choose a different file for each plant.")
-                return
-            for path in resolved:
-                if not path.is_file():
-                    self.status.set(f"Saved workbook unavailable: {path}. Reconnect its drive or choose its new location.")
-                    return
-        except OSError as exc:
-            self.status.set(f"Could not access the plant files: {exc}")
-            return
-        if drafts and not check_only and not self.mailbox.get().strip():
-            self.status.set("Click Find Outlook mailboxes, then choose where drafts should be saved. Checking files does not need Outlook.")
-            return
-        if drafts and not check_only:
-            if limit == 1:
-                prompt = (
-                    "This creates one certificate using the normal template and saves its email as an unsent Outlook draft. "
-                    "After Outlook confirms the save, its COD number and date are written to that Excel row. Continue?"
+            manual_cod = self.custom_cod.get().strip()
+            if manual_cod and not (selected_only or check_only):
+                messagebox.showinfo(
+                    "Custom COD is for one client",
+                    "Select one Ready client and use Generate selected PDF, or clear the Custom COD box before generating all Ready PDFs.",
+                    parent=self.root,
                 )
-                title = "Create one draft?"
-            else:
-                prompt = (
-                    "This creates a certificate and unsent Outlook draft for each eligible Ready row in both files. "
-                    "After each confirmed save, its COD number and date are written to Excel. Continue?"
-                )
-                title = "Create all Ready drafts?"
-            if not messagebox.askyesno(title, prompt, parent=self.root):
-                self.status.set("Cancelled. No drafts or Excel updates were made.")
                 return
-        if not self.save_settings():
-            return
-        self.set_busy(True)
-        self.status.set("Checking both plant files..." if check_only else "Creating certificate and Outlook draft...")
-        self.launch_worker(self.worker, (paths, self.mailbox.get().strip(), drafts, limit, check_only))
-
-    def worker(self, paths, mailbox, drafts, limit, check_only):
-        initialized = False
-        try:
-            if drafts and not check_only:
-                import pythoncom
-                pythoncom.CoInitialize()
-                initialized = True
-            created, review, output = run(
-                paths, mailbox, self.base, limit=limit, create_drafts=drafts, check_only=check_only,
-                progress=lambda msg: self.events.put(("status", msg)),
-            )
-            latest = {"rows": [], "scan_complete": False}
-            try:
-                from workflow_support import load_settings, notify_once
-                latest = json.loads((output / "Results.json").read_text(encoding="utf-8"))
-                settings = load_settings(self.base)
-                # Refresh alert observations, but do not count a manual check as
-                # the scheduled reminder having appeared. The daily popup must
-                # remain eligible at the chosen time.
-                notify_once(self.base, latest, lambda *_: True,
-                            enabled=settings.get("quiet_notifications", True), repeat_pending=True,
-                            reminder_time=settings.get("reminder_time", "09:00"), record_only=True)
-            except Exception:
-                # Results remain available in the app even if Windows declines a toast.
-                pass
-            if check_only:
-                alert_count = sum(is_actionable_alert_row(row) for row in latest.get("rows", []))
-                if latest.get("scan_complete"):
-                    message = (f"Both plant files checked. {alert_count} current alert item(s) are in the work list; "
-                               "choose Alerts to review to show only those. No drafts were created.")
+            paths = self.selected_paths()
+            if not self.save_setup():
+                return
+            selected = None
+            if selected_only:
+                row = None
+                if self.pending_selected:
+                    selected = self.pending_selected
+                    self.pending_selected = None
                 else:
-                    message = (f"The alert check is partial: {alert_count} item(s) need review, and at least one "
-                               "plant file could not be checked. No drafts were created.")
-                self.events.put(("done", message))
-            else:
-                self.events.put(("done", f"Finished: {created} draft(s) created; {review} need attention. Open results for details."))
-        except Exception as exc:
-            self.events.put(("error", error_message(exc)))
-        finally:
-            if initialized:
-                pythoncom.CoUninitialize()
-
-    def show_results(self, result_path=None, update_last=True):
-        path = Path(result_path) if result_path else self.base / "Output" / "Latest Results.json"
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            rows = data["rows"]
-            if not isinstance(rows, list) or any(not isinstance(row, dict) or any(key not in row for key in ("plant", "sn", "outcome", "detail")) or any(not isinstance(row[key], str) for key in ("plant", "outcome", "detail")) for row in rows):
-                raise ValueError("The saved results have an invalid format.")
-        except FileNotFoundError:
-            return
-        except (OSError, ValueError, KeyError, TypeError) as exc:
-            self.status.set(f"Could not read the last results. Click Check both files to rebuild them. {exc}")
-            return
-        if update_last:
-            self.last_result = data
-        latest_path = self.base / "Output" / "Latest Results.json"
-        try:
-            if path.resolve() == latest_path.resolve():
-                stat = latest_path.stat()
-                self._latest_results_signature = (stat.st_mtime_ns, stat.st_size)
-        except OSError:
-            pass
-        self.displayed_results_path = path.with_suffix(".txt")
-        self.clear_result_table()
-        self.visible_rows = {}
-        counts = {}
-        history = None
-        history_path = self.base / "Data" / "certificate-history.sqlite"
-        if history_path.is_file() and any(
-                row.get("certificate_status") in {"completed", "sent"} for row in rows):
-            try:
-                from certificate_core import effective_certificate_status
-                from draft_service import History
-                history = History(history_path)
-                for row in rows:
-                    current = row.get("certificate_status")
-                    if current == "sent":
-                        row["certificate_status"] = "completed"
-                    elif current == "completed":
-                        case_id = ("plant2|" if row.get("plant") == "plant2" else "") + str(row.get("sn", ""))
-                        record = history.record({"case_id": case_id})
-                        acknowledgement = history.completed_acknowledgement(case_id)
-                        effective = effective_certificate_status(
-                            {"issued": "Completed"}, record, acknowledgement,
-                        )
-                        row["certificate_status"] = effective
-                        if effective == "drafted" and type(row.get("age_days")) is int:
-                            row["reminder_due"] = row["age_days"] >= 30
-                            row["awaiting_send"] = bool(record and record.get("status") == "saved")
-            except Exception:
-                # A stale results file remains viewable; Check both files will
-                # rebuild it from the workbooks and history.
-                pass
-            finally:
-                if history:
-                    history.close()
-        for row in sorted(rows, key=lambda r: (not bool(r.get("reminder_due")), r["outcome"] != "needs_review")):
-            label = {"needs_review": "Needs attention", "ready": "Ready to draft", "not_applicable": "Skipped",
-                     "draft_created": "Drafted", "updated": "Drafted", "already_prepared": "Drafted",
-                     "completed": "Completed", "sent": "Completed"}.get(row["outcome"], row["outcome"].replace("_", " ").title())
-            certificate_status = row.get("certificate_status")
-            normalized_certificate_status = (str(certificate_status or "").strip().casefold()
-                                             .replace(" ", "").replace("/", "")
-                                             .replace("_", "").replace("-", ""))
-            is_skipped = (normalized_certificate_status in {"na", "notapplicable"}
-                          or row["outcome"] == "not_applicable")
-            if row.get("outcome") != "needs_review" and certificate_status == "drafted":
-                label = "Drafted"
-            elif row.get("outcome") != "needs_review" and certificate_status in {"completed", "sent"}:
-                label = "Completed"
-            has_saved_draft = (row.get("awaiting_send") is True
-                               and row.get("outcome") in {"draft_created", "updated", "already_prepared"})
-            if is_skipped and has_saved_draft and row.get("outcome") != "needs_review":
-                # N/A prevents another draft, but it does not remove a draft
-                # already saved in Outlook. Keep that distinction visible.
-                label = "Skipped (draft exists)"
-            if label not in {"Skipped", "Skipped (draft exists)"}:
-                counts[label] = counts.get(label, 0) + 1
-            if is_skipped:
-                counts["Skipped"] = counts.get("Skipped", 0) + 1
-            if is_skipped and has_saved_draft:
-                # These summary counts are independent: a case can be N/A in
-                # Excel while its previously saved Outlook draft still awaits review.
-                counts["Drafted"] = counts.get("Drafted", 0) + 1
-            if row.get("reminder_due") is True:
-                counts["Overdue 30+ days"] = counts.get("Overdue 30+ days", 0) + 1
-            alert_item = is_actionable_alert_row(row)
-            if alert_item:
-                counts["Alerts to review"] = counts.get("Alerts to review", 0) + 1
-            selected_filter = self.queue_filter.get()
-            if selected_filter == "Alerts to review":
-                if not alert_item:
-                    continue
-            elif selected_filter == "Overdue 30+ days":
-                if row.get("reminder_due") is not True:
-                    continue
-            elif selected_filter == "Skipped":
-                if not is_skipped:
-                    continue
-            elif selected_filter == "Drafted":
-                if label != "Drafted" and not (is_skipped and has_saved_draft):
-                    continue
-            elif selected_filter not in ("All", label):
-                continue
-            detail = (str(row.get('supplier', '')).strip() + ' — ' if row.get('supplier') else '') + row['detail']
-            item = self.table.insert("", "end", values=(row["plant"], row["sn"], label, detail), tags=(row["outcome"],))
-            self.visible_rows[item] = row
-        self.queue_summary.set(" | ".join(f"{label}: {counts.get(label, 0)}" for label in ("Alerts to review", "Overdue 30+ days", "Needs attention", "Ready to draft", "Drafted", "Completed", "Skipped")))
-
-    def selected_row(self):
-        selected = self.table.selection()
-        row = self.visible_rows.get(selected[0]) if selected else None
-        if not row:
-            self.status.set("Select a case in the list first.")
-        return row
-
-    def open_selected_plant(self):
-        if self.busy:
-            return
-        row = self.selected_row()
-        if not row:
-            return
-        path = row.get("file", "")
-        if not path or not Path(path).is_file():
-            self.status.set("This workbook is unavailable. Check the saved plant location.")
-            return
-        try:
-            os.startfile(path)
-            self.status.set(f"Find SN {row['sn']} on sheet {row.get('sheet', '')}, row {row.get('row', '')}. Choose Ready, N/A, or Blank in Excel. The app marks a saved Outlook draft Drafted; after sending it yourself, click Mark completed here.")
-        except OSError as exc:
-            self.status.set(f"Could not open the plant workbook: {exc}")
-
-    def correction_dialog(self, current_no, current_date, workbook_no="", workbook_date=""):
-        window = tk.Toplevel(self.root)
-        window.title("Correct certificate")
-        window.transient(self.root)
-        window.resizable(False, False)
-        window.grab_set()
-        result = {}
-        frame = ttk.Frame(window, padding=14)
-        frame.pack(fill="both", expand=True)
-        ttk.Label(
-            frame,
-            text=("Correct an unsent certificate. The app updates its existing Outlook draft, PDF and Excel row together. "
-                  "The old PDF and correction reason stay in the history. It never sends email."),
-            wraplength=470,
-        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
-        from certificate_core import parse_date
-        saved_date = parse_date(current_date)
-        excel_date = parse_date(workbook_date)
-        saved_label = saved_date.strftime("%d.%m.%Y") if saved_date else str(current_date or "blank")
-        excel_label = excel_date.strftime("%d.%m.%Y") if excel_date else str(workbook_date or "blank")
-        ttk.Label(frame, text="Saved certificate:").grid(row=1, column=0, sticky="w", padx=(0, 12))
-        ttk.Label(frame, text=f"{current_no} / {saved_label}").grid(row=1, column=1, sticky="w")
-        ttk.Label(frame, text="Currently in Excel:").grid(row=2, column=0, sticky="w")
-        ttk.Label(frame, text=f"{workbook_no or 'blank'} / {excel_label}").grid(row=2, column=1, sticky="w")
-        ttk.Label(frame, text="Correct COD number:").grid(row=3, column=0, sticky="w", pady=(8, 0))
-        cod = ttk.Entry(frame, width=28)
-        cod.insert(0, current_no)
-        cod.grid(row=3, column=1, sticky="ew", pady=(8, 0))
-        ttk.Label(frame, text="Correct certificate date:").grid(row=4, column=0, sticky="w", pady=(8, 0))
-        issued = ttk.Entry(frame, width=28)
-        try:
-            issued.insert(0, datetime.strptime(current_date, "%Y-%m-%d").strftime("%d.%m.%Y"))
-        except ValueError:
-            issued.insert(0, current_date)
-        issued.grid(row=4, column=1, sticky="ew", pady=(8, 0))
-        ttk.Label(frame, text="Reason for correction:").grid(row=5, column=0, sticky="nw", pady=(8, 0))
-        reason = tk.Text(frame, width=34, height=3, wrap="word")
-        reason.grid(row=5, column=1, sticky="ew", pady=(8, 0))
-        ttk.Label(frame, text="Date format: DD.MM.YYYY. Reason is required.", wraplength=470).grid(
-            row=6, column=0, columnspan=2, sticky="w", pady=(6, 0),
-        )
-        actions = ttk.Frame(frame)
-        actions.grid(row=7, column=0, columnspan=2, sticky="e", pady=(12, 0))
-
-        def save():
-            from certificate_core import parse_date
-            entered_no = cod.get().strip()
-            entered_date = issued.get().strip()
-            entered_reason = reason.get("1.0", "end").strip()
-            if not entered_no or not parse_date(entered_date):
-                messagebox.showerror("Check the certificate details", "Enter a COD number and valid date (DD.MM.YYYY).", parent=window)
-                return
-            if not entered_reason or len(entered_reason) > 500:
-                messagebox.showerror("Add a reason", "Enter a short reason for the correction (up to 500 characters).", parent=window)
-                return
-            result.update(certificate_no=entered_no, certificate_date=entered_date, reason=entered_reason)
-            window.destroy()
-
-        ttk.Button(actions, text="Cancel", command=window.destroy).pack(side="right", padx=(8, 0))
-        ttk.Button(actions, text="Continue", command=save).pack(side="right")
-        window.bind("<Escape>", lambda _: window.destroy())
-        window.protocol("WM_DELETE_WINDOW", window.destroy)
-        cod.focus_set()
-        self.root.wait_window(window)
-        return result or None
-
-    def correct_selected_certificate(self):
-        if self.busy:
-            return
-        row = self.selected_row()
-        if not row:
-            return
-        if row.get("certificate_status") in {"completed", "sent"}:
-            messagebox.showinfo(
-                "Completed certificates are protected",
-                "This certificate is marked Completed. The app will not change a certificate already sent to a client. "
-                "Follow the company's correction or replacement process so the original COD and date remain in the record.",
-                parent=self.root,
-            )
-            return
-        if row.get("certificate_status") != "drafted":
-            self.status.set("Select a Drafted certificate that is still unsent, then use Correct certificate if needed.")
-            return
-        if not self.mailbox.get().strip():
-            self.status.set("Select the Outlook mailbox in Settings before correcting a saved draft.")
-            return
-        from draft_service import History
-        try:
-            key = ("plant2|" if row["plant"] == "plant2" else "") + str(row["sn"])
-            history = History(self.base / "Data" / "certificate-history.sqlite")
-            try:
-                record = history.record({"case_id": key})
-                pending = history.correction_for_case(key)
-                sent_ack = history.sent_acknowledgement(key)
-            finally:
-                history.close()
-            if pending:
-                prompt = (
-                    f"A correction to COD {pending['new_certificate_no']} dated "
-                    f"{pending['new_certificate_date']} was interrupted. Resume it now?\n\n"
-                    f"Reason: {pending['reason']}\n\nThe app will update the existing unsent Outlook draft and Excel. It will not send email."
-                )
-                if not messagebox.askyesno("Resume certificate correction?", prompt, parent=self.root):
+                    row = self.selected_row()
+                if selected is None and not row:
+                    messagebox.showinfo("Select a client", "Select a Ready row in the work list first.", parent=self.root)
                     return
-                values = {"certificate_no": pending["new_certificate_no"],
-                          "certificate_date": pending["new_certificate_date"], "reason": pending["reason"]}
-            else:
-                if not record or record.get("status") != "saved" or not record.get("status_written"):
-                    self.status.set("No confirmed Drafted certificate was found for this case. Click Check both files before correcting it.")
+                if selected is None and row.get("certificate_status") != "ready":
+                    messagebox.showinfo("Not marked Ready", "In Excel, change this client's Certificate Issued cell to Ready, save and close the workbook, then try again.", parent=self.root)
                     return
-                if sent_ack:
-                    messagebox.showinfo(
-                        "Completed certificates are protected",
-                        "This certificate is marked Completed. Follow the company's correction or replacement process; the app will preserve its original record.",
-                        parent=self.root,
-                    )
-                    return
-                current_date = record.get("certificate_date") or row.get("certificate_date", "")
-                values = self.correction_dialog(
-                    record["certificate_no"], current_date,
-                    row.get("certificate_no", ""), row.get("certificate_date", ""),
-                )
-                if not values:
-                    return
-                if not messagebox.askyesno(
-                    "Update this certificate?",
-                    f"The existing unsent Outlook draft and Excel row will be updated to COD "
-                    f"{values['certificate_no']} dated {values['certificate_date']}.\n\n"
-                    "The old PDF will remain in the output folder and the change will be recorded. "
-                    "No email will be sent. Continue?",
+                if selected is None:
+                    selected = (row["plant"], str(row["sn"]))
+                client_label = (row or {}).get("supplier") or selected[1]
+                if manual_cod and not messagebox.askyesno(
+                    "Use this custom COD?",
+                    f"Generate {client_label} with COD {manual_cod}?\n\n"
+                    "The number must be unique. After the PDF is created, this COD and its date will be saved back to the selected Excel row.",
                     parent=self.root,
                 ):
                     return
+            self.busy = True
+            action = "Checking both plant files…" if check_only else ("Generating selected certificate PDF…" if selected else "Generating PDFs for all Ready rows…")
+            self.status.set(action)
+            threading.Thread(target=self._worker, args=(paths, check_only, selected, manual_cod if selected else None, False), daemon=True).start()
         except Exception as exc:
-            self.status.set(f"Could not check the saved certificate. Click Check both files and try again. {error_message(exc)}")
-            return
-        paths = [variable.get().strip() for variable in self.workbooks]
-        if not self.save_settings():
-            return
-        self.set_busy(True)
-        self.status.set(f"Correcting the unsent certificate for SN {row['sn']}...")
-        self.launch_worker(self.correction_worker, (
-            paths, self.mailbox.get().strip(), row["plant"], str(row["sn"]),
-            values["certificate_no"], values["certificate_date"], values["reason"],
-        ))
+            messagebox.showerror("Cannot start", str(exc), parent=self.root)
 
-    def correction_worker(self, paths, mailbox, source_id, case_id,
-                          certificate_no, certificate_date, reason):
-        initialized = False
+    def _worker(self, paths, check_only, selected, manual_cod=None, allow_warnings=False):
         try:
-            import pythoncom
-            pythoncom.CoInitialize()
-            initialized = True
-            from certificate_correction import correct_certificate
-            corrected = correct_certificate(
-                paths, mailbox, self.base, source_id, case_id,
-                certificate_no, certificate_date, reason,
-                progress=lambda msg: self.events.put(("status", msg)),
-            )
-            # Refresh the visible queue without creating a new draft.
-            run(
-                paths, mailbox, self.base, create_drafts=False, check_only=True,
-                progress=lambda msg: self.events.put(("status", msg)),
-            )
-            self.events.put(("done", f"Corrected COD {corrected['certificate_no']} saved in the existing unsent Outlook draft and Excel. No email was sent."))
+            if not check_only and not allow_warnings:
+                # A dry run prevents valid rows from being generated before
+                # the operator has seen and accepted warnings on other rows.
+                preflight = run(paths, self.base, check_only=True, selected=selected,
+                                custom_cod=manual_cod, progress=lambda _: None)
+                preflight_payload = json.loads((preflight[2] / "Latest Results.json").read_text(encoding="utf-8"))
+                warnings = [row for row in preflight_payload.get("rows", [])
+                            if row.get("outcome") == "needs_review"]
+                if warnings:
+                    self.events.put(("confirm_warnings", preflight_payload, manual_cod, paths, selected))
+                    return
+            result = run(paths, self.base, check_only=check_only, selected=selected,
+                         custom_cod=manual_cod, allow_warnings=allow_warnings,
+                         progress=lambda _: None)
+            payload = json.loads((result[2] / "Latest Results.json").read_text(encoding="utf-8"))
+            if selected and not check_only:
+                generated_rows = {
+                    (row.get("plant"), str(row.get("sn"))): row
+                    for row in payload.get("rows", [])
+                }
+                run(paths, self.base, check_only=True, progress=lambda _: None)
+                refreshed = json.loads((result[2] / "Latest Results.json").read_text(encoding="utf-8"))
+                for row in refreshed.get("rows", []):
+                    prior = generated_rows.get((row.get("plant"), str(row.get("sn"))))
+                    if prior and prior.get("warnings"):
+                        row["warnings"] = prior["warnings"]
+                        row["system_alert"] = True
+                        row["detail"] = prior.get("detail", row.get("detail", ""))
+                payload = refreshed
+                payload["created"] = result[0]
+                save_json(result[2] / "Latest Results.json", payload)
+            self.events.put(("done", payload, manual_cod))
         except Exception as exc:
-            self.events.put(("error", error_message(exc)))
-        finally:
-            if initialized:
-                pythoncom.CoUninitialize()
+            self.events.put(("error", str(exc), manual_cod))
 
-    def mark_selected_completed(self):
-        if self.busy:
+    def create_from_file(self):
+        """Enter certificate details from a workbook chosen in Explorer."""
+        path = filedialog.askopenfilename(
+            parent=self.root, title="Choose the plant workbook for this certificate",
+            filetypes=(("Excel workbooks", "*.xlsx *.xlsm"), ("All files", "*.*")),
+        )
+        if not path:
             return
+        chosen = Path(path).expanduser().resolve()
+        configured = [Path(value).expanduser().resolve() for value in (var.get().strip() for var in self.workbooks) if value.strip()]
+        if chosen not in configured:
+            messagebox.showerror(
+                "Workbook not in setup",
+                "Choose one of the configured Plant 1 or Plant 2 workbooks, or save this file as the plant workbook in setup first.",
+                parent=self.root,
+            )
+            return
+        plant = str(configured.index(chosen) + 1)
+        self._show_details_dialog(chosen, plant)
+
+    def _show_details_dialog(self, path, plant):
+        fields = (
+            ("case_id", "Client ID / SN"), ("inward_date", "Inward date (DD.MM.YYYY)"),
+            ("supplier", "Company / supplier"), ("location", "City"),
+            ("item", "Item"), ("quantity", "Quantity"),
+            ("per_piece_weight", "Per-piece weight (KG)"), ("weight", "Inward weight (KG)"),
+            ("certificate_weight", "Certificate / net weight (KG)"),
+            ("form6", "Form 6 No. (mandatory)"), ("reference", "Reference No. (optional)"),
+            ("cod_no", "COD No. (optional)"), ("cod_date", "COD date (optional)"),
+        )
+        existing = {}
+        selected = self.selected_row()
+        if selected and Path(selected.get("file", "")).resolve() == Path(path).resolve():
+            existing = {
+                "case_id": selected.get("sn", ""), "supplier": selected.get("supplier", ""),
+                "reference": selected.get("reference", ""), "cod_no": selected.get("certificate_no", ""),
+                "inward_date": selected.get("inward_date", ""),
+            }
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Certificate details — Excel will be updated")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        body = ttk.Frame(dialog, padding=12)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="Enter or replace any certificate detail. The values are written to Excel, marked Ready, then checked before PDF creation.", wraplength=560).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        variables = {}
+        for index, (key, label) in enumerate(fields, 1):
+            ttk.Label(body, text=label).grid(row=index, column=0, sticky="w", padx=(0, 8), pady=3)
+            value = existing.get(key, "")
+            variables[key] = tk.StringVar(value=str(value or ""))
+            ttk.Entry(body, textvariable=variables[key], width=44).grid(row=index, column=1, sticky="ew", pady=3)
+        body.columnconfigure(1, weight=1)
+        buttons = ttk.Frame(body)
+        buttons.grid(row=len(fields) + 1, column=0, columnspan=2, sticky="e", pady=(10, 0))
+
+        def save_details():
+            details = {key: variable.get().strip() for key, variable in variables.items()}
+            if not details["case_id"]:
+                messagebox.showerror("Client ID required", "Enter the Client ID / SN so the row can be found or added.", parent=dialog)
+                return
+            try:
+                upsert_certificate_details(
+                    path, self.base / "Data" / "Workbook Backups", details,
+                )
+                dialog.destroy()
+                self.pending_selected = (plant, details["case_id"])
+                self.status.set(f"Details saved to {Path(path).name}. Checking warnings before creating the PDF…")
+                self.start(selected_only=True)
+            except Exception as exc:
+                messagebox.showerror("Could not save certificate details", str(exc), parent=dialog)
+
+        ttk.Button(buttons, text="Save details and create PDF", command=save_details).pack(side="left", padx=4)
+        ttk.Button(buttons, text="Cancel", command=dialog.destroy).pack(side="left")
+        dialog.wait_window()
+
+    def review_alerts(self):
+        self.filter_value.set("Alerts due (day 25+)")
+        self.start(check_only=True)
+
+    def _status_label(self, row):
+        state = status_value(row.get("certificate_status"))
+        if state in {"ready", "alert", "blank", "unknown"} and (
+                row.get("outcome") == "needs_review" or row.get("system_alert")):
+            return "Alert"
+        return {
+            "ready": "Ready",
+            "alert": "Alert",
+            "generated": "Generated",
+            "generated_manual": "Generated Manual",
+            "completed": "Completed",
+            "na": "N/A",
+            "blank": "Blank",
+            "unknown": "Alert",
+        }.get(state, row.get("outcome", "Alert").replace("_", " ").title())
+
+    def _filter_match(self, row, selected_filter):
+        state = status_value(row.get("certificate_status"))
+        if selected_filter == "All rows":
+            return True
+        if selected_filter == "Alerts due (day 25+)":
+            return bool(row.get("reminder_due") or row.get("system_alert"))
+        if selected_filter == "Alert":
+            return bool(row.get("outcome") == "needs_review" or row.get("system_alert")
+                        or state in {"alert", "unknown", "blank"})
+        expected = {"Ready": "ready", "Generated": "generated", "Generated Manual": "generated_manual",
+                    "Completed": "completed", "Blank": "blank", "N/A": "na"}.get(selected_filter)
+        return state == expected
+
+    def show_results(self):
+        for item in self.table.get_children():
+            self.table.delete(item)
+        path = self.base / "Data" / "Reports" / "Latest Results.json"
+        try:
+            result = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(result, dict) or not isinstance(result.get("rows"), list):
+                raise ValueError("The saved results are not in the expected format.")
+            self.last_result = result
+        except (OSError, ValueError, json.JSONDecodeError):
+            result = {"rows": []}
+            self.last_result = result
+        rows = result.get("rows", [])
+        state_counts = {state: sum(status_value(row.get("certificate_status")) == state for row in rows)
+                        for state in ("ready", "alert", "generated", "generated_manual", "completed", "na")}
+        due_count = sum(bool(row.get("reminder_due")) for row in rows)
+        self.summary.configure(text=f"Due: {due_count}  |  Ready: {state_counts['ready']}  |  Alert: {state_counts['alert']}  |  Generated: {state_counts['generated']}  |  Generated Manual: {state_counts['generated_manual']}  |  Completed: {state_counts['completed']}  |  N/A: {state_counts['na']}")
+        selected_filter = self.filter_value.get()
+        for row in rows:
+            if not self._filter_match(row, selected_filter):
+                continue
+            age = row.get("age_days")
+            age_label = f"Day {age}" if isinstance(age, int) else "Date missing"
+            status = self._status_label(row)
+            normalized_status = status_value(row.get("certificate_status"))
+            tags = ("alert",) if row.get("reminder_due") or row.get("system_alert") else (normalized_status,)
+            self.table.insert("", "end", values=(
+                row.get("plant", ""), row.get("sn", ""), status, row.get("supplier", ""),
+                row.get("reference", ""), row.get("certificate_no", ""), age_label, row.get("detail", ""),
+            ), tags=tags, iid=str(len(self.table.get_children())))
+
+    def selected_row(self):
+        chosen = self.table.selection()
+        if not chosen:
+            return None
+        item = self.table.item(chosen[0])
+        values = item.get("values", [])
+        plant, sn = str(values[0]), str(values[1])
+        return next((row for row in self.last_result.get("rows", [])
+                     if row.get("plant") == plant and str(row.get("sn")) == sn), None)
+
+    def open_selected_workbook(self):
+        row = self.selected_row()
+        if not row or not row.get("file"):
+            self.status.set("Select a client row first, then open its plant workbook.")
+            return
+        try:
+            os.startfile(row["file"])
+        except OSError as exc:
+            self.status.set(f"Could not open the workbook: {exc}")
+
+    def mark_completed(self):
         row = self.selected_row()
         if not row:
+            self.status.set("Select a generated certificate row first.")
             return
-        if (row['outcome'] not in {'draft_created', 'updated', 'already_prepared', 'completed', 'sent'}
-                or row.get('certificate_status') not in {'drafted', 'completed', 'sent'}):
-            self.status.set("Select a saved draft or a completed certificate first.")
+        if status_value(row.get("certificate_status")) not in {"generated", "generated_manual"}:
+            self.status.set("Only a Generated or Generated Manual certificate can be marked Completed.")
             return
-        history = None
+        if not messagebox.askyesno("Mark certificate Completed?", f"Have you sent COD {row.get('certificate_no')} to {row.get('supplier')}?\n\nThis only updates Excel. The automation does not send email.", parent=self.root):
+            return
         try:
-            from draft_service import History
-            from workflow_support import run_lock, save_json
-            from workbook_store import update_issued_status
-            with run_lock(self.base):
-                history = History(self.base / 'Data' / 'certificate-history.sqlite')
-                key = ('plant2|' if row['plant'] == 'plant2' else '') + str(row['sn'])
-                record = history.record({'case_id': key})
-                if not record or record['status'] != 'saved':
-                    raise ValueError('No confirmed local draft record. Check Outlook Drafts and the results before changing the status.')
-                if str(row.get('certificate_no') or '') != str(record['certificate_no']):
-                    raise ValueError('The saved result does not match the COD in the draft history. Click Check both files and try again.')
-                undo = row['certificate_status'] in {'completed', 'sent'}
-                prompt = (
-                    "Return the Excel status to Drafted? This does not unsend the email. The case will remain in the 30+ day reminder list until completed again."
-                    if undo else
-                    f"Have you sent COD {record['certificate_no']} to the client in Outlook? Marking it Completed updates Excel and stops reminders. The app will not send the email."
-                )
-                if messagebox.askyesno('Undo completion?' if undo else 'Mark as completed?', prompt, parent=self.root):
-                    current_status = ('Completed', 'Sent') if undo else ('Drafted', 'Completed')
-                    next_status = 'Drafted' if undo else 'Completed'
-                    workbook_path = row.get('file')
-                    if not workbook_path:
-                        raise ValueError('The selected results do not contain the plant workbook location. Click Check both files and try again.')
-                    update_issued_status(
-                        workbook_path, self.base / 'Data' / 'Workbook Backups',
-                        row.get('sn', ''), row.get('sheet', ''), row.get('row', 0),
-                        record['certificate_no'], current_status, next_status,
-                    )
-                    if undo:
-                        history.undo_sent_acknowledgement(key)
-                    else:
-                        history.acknowledge_sent(key, record['certificate_no'])
-                    row['certificate_status'] = next_status.casefold()
-                    row['outcome'] = 'completed' if next_status == 'Completed' else 'already_prepared'
-                    row['detail'] = (f"COD {record['certificate_no']} marked Completed in Excel after the operator confirmed sending it. The app did not send the email."
-                                     if next_status == 'Completed' else
-                                     f"COD {record['certificate_no']} returned to Drafted. The email was not unsent; set Ready only if another draft is needed.")
-                    row['reminder_due'] = bool(row.get('age_days') is not None and row['age_days'] >= 30 and next_status == 'Drafted')
-                    self.last_result['completed_at'] = datetime.now().isoformat(timespec='seconds')
-                    self.last_result['review'] = sum(item.get('outcome') == 'needs_review'
-                                                     for item in self.last_result.get('rows', []))
-                    latest = self.base / 'Output' / 'Latest Results.json'
-                    save_json(latest, self.last_result)
-                    review_count = self.last_result['review']
-                    header = (
-                        f"Mode: {self.last_result.get('mode', 'Review')}\n"
-                        f"Completed: {self.last_result['completed_at']}\n"
-                        f"Both plant files checked: {'Yes' if self.last_result.get('scan_complete') else 'No - some information could not be checked'}\n"
-                        f"Created: {self.last_result.get('created', 0)}\n"
-                        f"Excel updates recovered: {self.last_result.get('updated', 0)}\n"
-                        f"Needs review: {review_count}\n\n"
-                    )
-                    body = "\n".join(
-                        f"{item.get('plant', 'Setup')} | SN {item.get('sn', '')} | row {item.get('row', '')} | "
-                        f"{item.get('supplier', '')} | {item.get('outcome', '')}: {item.get('detail', '')}"
-                        for item in self.last_result.get('rows', [])
-                    )
-                    (self.base / 'Output' / 'Latest Results.txt').write_text(header + body + "\n", encoding='utf-8')
-            self.show_results()
-            self.status.set("Excel updated. Completed means you confirmed that you sent the Outlook draft; the app never sends it.")
-        except Exception as exc:
-            self.status.set(error_message(exc))
-        finally:
-            if history:
-                history.close()
-
-    def clear_result_table(self):
-        for row in self.table.get_children():
-            self.table.delete(row)
-
-    def previous_results_message(self):
-        try:
-            completed = datetime.fromisoformat(self.last_result["completed_at"])
-            cutoff = completed.timestamp() + 1
-        except (KeyError, TypeError, ValueError, OSError):
-            return "Previous results are shown. Click Check both files to refresh them before creating drafts."
-        if str(self.last_result.get("mode", "")).casefold() == "pdf preview":
-            return (
-                f"Last run ({completed:%d %b, %H:%M}) was a PDF-only preview; it did not create a draft. "
-                "Click Create one draft to use the normal certificate and email process."
+            update_issued_status(
+                row["file"], self.base / "Data" / "Workbook Backups",
+                row["sn"], row["sheet"], row["row"], row["certificate_no"],
+                row.get("certificate_status", "generated"), "Completed",
             )
-        if str(self.last_result.get("mode", "")).casefold() == "outlook drafts":
-            outcomes = [row.get("outcome") for row in self.last_result.get("rows", []) if isinstance(row, dict)]
-            created = outcomes.count("draft_created")
-            updated = outcomes.count("updated")
-            needs_review = outcomes.count("needs_review")
-            if created or updated:
-                parts = []
-                if created:
-                    parts.append(f"{created} Outlook draft{'s' if created != 1 else ''} saved")
-                if updated:
-                    parts.append(f"{updated} Excel update{'s' if updated != 1 else ''} recovered")
-                if needs_review:
-                    parts.append(f"{needs_review} row{'s' if needs_review != 1 else ''} need attention")
-                return "Last run: " + "; ".join(parts) + ". Review Outlook Drafts and the results below."
-            return "The last draft run created no new messages. Review the results below before trying again."
-        for variable in self.workbooks:
-            path = Path(variable.get())
-            try:
-                if path.is_file() and path.stat().st_mtime > cutoff:
-                    return f"The Excel files changed after the last check ({completed:%d %b, %H:%M}). Click Check both files to refresh these results."
-            except OSError:
-                continue
-        return f"Last check: {completed:%d %b, %H:%M}. Click Check both files to refresh before creating drafts."
+            self.status.set("Excel updated to Completed. This client will no longer appear in the reminder list.")
+            self.start(check_only=True)
+        except Exception as exc:
+            messagebox.showerror("Could not update Excel", str(exc), parent=self.root)
 
-    def open_results(self):
-        path = self.displayed_results_path
+    def open_certificates(self):
+        folder = self.base / "Certificates"
+        folder.mkdir(parents=True, exist_ok=True)
         try:
-            if path.exists():
-                os.startfile(str(path))
-            else:
-                self.status.set("Click Check both files first to create the results list.")
+            os.startfile(str(folder))
         except OSError as exc:
-            self.status.set(f"Could not open the results: {exc}")
+            self.status.set(f"Could not open the certificate folder: {exc}")
 
-    def open_output(self):
-        path = self.base / "Output"
-        try:
-            path.mkdir(exist_ok=True)
-            os.startfile(str(path))
-        except OSError as exc:
-            self.status.set(f"Could not open the output folder: {exc}")
-
-    def close(self):
-        if self.busy:
-            self.close_when_done = True
-            self.status.set("The app will close when this run finishes saving its work.")
-        else:
-            self.root.destroy()
-
-    def refresh_latest_results_if_changed(self):
-        """Refresh a focused app after the scheduled reminder's read-only scan."""
-        now = time.monotonic()
-        if now < self._next_latest_results_check:
-            return False
-        self._next_latest_results_check = now + 1.0
-        latest = self.base / "Output" / "Latest Results.json"
-        try:
-            stat = latest.stat()
-            signature = (stat.st_mtime_ns, stat.st_size)
-        except OSError:
-            signature = None
-        if signature == self._latest_results_signature:
-            return False
-        previous = self._latest_results_signature
-        self.show_results()
-        try:
-            stat = latest.stat()
-            current = (stat.st_mtime_ns, stat.st_size)
-        except OSError:
-            current = None
-        # If a result was replaced while it was being read, leave the prior
-        # signature in place so the next poll retries instead of missing it.
-        self._latest_results_signature = current if current == signature else previous
-        return True
+    @staticmethod
+    def _time_label(value):
+        return datetime.strptime(value, "%H:%M").strftime("%I:%M %p").lstrip("0")
 
     def poll(self):
         try:
             while True:
-                kind, value = self.events.get_nowait()
-                if kind in {"done", "error", "accounts"}:
-                    self.set_busy(False)
-                if kind == "accounts":
-                    self.accounts["values"] = value
-                    if self.mailbox.get() not in value:
-                        self.mailbox.set(value[0] if value else "")
-                    if self.save_settings():
-                        self.status.set(f"Found {len(value)} Outlook mailbox(es).")
+                event = self.events.get_nowait()
+                kind, value = event[:2]
+                manual_cod = event[2] if len(event) > 2 else None
+                self.busy = False
+                if kind == "done":
+                    self.last_result = value
+                    self.show_results()
+                    created = value.get("created", 0)
+                    if created and manual_cod:
+                        self.custom_cod.set("")
+                    self.status.set(f"Finished. {created} certificate PDF(s) generated. All PDFs are in the Certificates folder.")
+                elif kind == "confirm_warnings":
+                    payload = value
+                    warning_rows = [row for row in payload.get("rows", []) if row.get("outcome") == "needs_review"]
+                    lines = []
+                    for row in warning_rows[:12]:
+                        lines.append(f"{row.get('plant')} / SN {row.get('sn')}: {row.get('detail')}")
+                    if len(warning_rows) > 12:
+                        lines.append(f"…and {len(warning_rows) - 12} more row(s).")
+                    accepted = messagebox.askyesno(
+                        "Warnings found — create anyway?",
+                        "The following issues will be recorded as warnings. If you continue, the PDF may contain blank, fallback, or manually corrected values; Excel will be marked Generated and you must verify the result.\n\n"
+                        + "\n".join(lines), parent=self.root,
+                    )
+                    if accepted:
+                        paths, selected = event[3], event[4]
+                        self.busy = True
+                        self.status.set("Creating certificate PDF(s) with the accepted warnings…")
+                        threading.Thread(target=self._worker, args=(paths, False, selected, manual_cod, True), daemon=True).start()
+                    else:
+                        self.last_result = payload
+                        self.show_results()
+                        self.status.set("No certificate was created. Correct the flagged rows or run again and accept the warnings.")
                 else:
                     self.status.set(value)
-                if kind in {"done", "error", "accounts"}:
-                    self.show_results()
-                    if self.close_when_done:
-                        self.root.destroy()
-                        return
+                    messagebox.showerror("Could not complete", value, parent=self.root)
+                if self.close_when_done:
+                    self.root.destroy()
+                    return
         except queue.Empty:
             pass
-        self.refresh_latest_results_if_changed()
         self.root.after(150, self.poll)
+
+    def close(self):
+        if self.busy:
+            self.close_when_done = True
+            self.status.set("The app will close when its current file update is finished.")
+        else:
+            self.root.destroy()
 
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    App(root)
-    root.mainloop()
+    app_root = tk.Tk()
+    App(app_root)
+    app_root.mainloop()

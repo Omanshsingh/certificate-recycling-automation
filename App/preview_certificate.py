@@ -10,6 +10,6 @@ if __name__ == "__main__":
     batch = read_batches(PROGRAM_ROOT / "sample" / "Dummy_Inward_10_Clients.xlsx")[0]
     batch["supplier"] = "Dummy Advanced Electronics and Resource Recovery Solutions Private Limited"
     batch["location"] = "Mumbai"
-    destination = ROOT / "Output" / "Vendor alignment preview.pdf"
+    destination = ROOT / "Data" / "Reports" / "Vendor alignment preview.pdf"
     make_certificate(batch, "PREVIEW", date.today(), PROGRAM_ROOT / "templates" / "Certificate of Recycling.png", destination)
     print(destination)

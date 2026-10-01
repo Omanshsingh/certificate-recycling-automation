@@ -1,541 +1,568 @@
-"""Read both plants, prepare ready certificates and reconcile Excel updates."""
+"""Generate recycling certificates as PDFs from the two plant workbooks.
+
+This workflow has no email or Outlook integration. A user marks a row Ready,
+generates its PDF, sends it through their normal process, and marks it Completed.
+"""
 from __future__ import annotations
 
 from contextlib import ExitStack
 from datetime import date
 from io import BytesIO
-from pathlib import Path
 import re
+from pathlib import Path
+import shutil
+import sqlite3
+import uuid
+import json
 
-from certificate_core import (batch_content, certificate_layout, certificate_number, certificate_sequence,
-                              effective_certificate_status, make_certificate, parse_date, read_batches,
-                              status_value, supplier_lines)
-from draft_service import History, OutlookWriter, draft_html
-from workbook_store import WorkbookSession
+from certificate_core import (
+    certificate_layout,
+    certificate_number,
+    certificate_reminder_due,
+    certificate_sequence,
+    make_certificate,
+    number,
+    parse_date,
+    read_batches,
+    status_value,
+)
+from workbook_store import WorkbookSession, stage_certificate_details
 from workflow_support import Report, load_settings, run_lock
 from app_paths import resource
+from certificate_templates import TEMPLATE_ROOT, template_id, validate_fields, layout_warnings
+from certificate_inventory import scan_inventory, cod_conflicts, reference_warnings, verify_publication, issuance_paths, record_issuance
+from issuance_safety import IssuanceTransaction, recover_issuances, latest_issuance, valid_pdf, file_digest
 
 
-def _read_sources(paths, data=None, report=None):
+def _safe_cod_name(value: str) -> str:
+    """Make a COD safe as a Windows filename without changing the workbook COD."""
+    raw = str(value).strip()
+    raw_device_name = raw.split(".", 1)[0].rstrip(" .").upper()
+    if raw_device_name in {"CON", "PRN", "AUX", "NUL"} or re.fullmatch(r"(?:COM|LPT)[1-9¹²³]", raw_device_name):
+        raise ValueError("This COD is a reserved Windows filename. Enter a different COD number.")
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip(" ._")
+    if not safe or safe in {".", ".."}:
+        raise ValueError("Enter a COD number that can be used as a PDF filename.")
+    device_name = safe.split(".", 1)[0].upper()
+    if device_name in {"CON", "PRN", "AUX", "NUL"} or re.fullmatch(r"(?:COM|LPT)[1-9¹²³]", device_name):
+        raise ValueError("This COD is a reserved Windows filename. Enter a different COD number.")
+    if len(safe) > 240:
+        raise ValueError("This COD is too long to use as a PDF filename. Shorten it to 240 characters or fewer.")
+    return safe
+
+
+def _safe_name_part(value, fallback):
+    """Keep the requested human-readable PDF name safe on Windows."""
+    raw = re.sub(r"\s+", "_", str(value or "").strip())
+    raw = re.sub(r"[^A-Za-z0-9._-]+", "_", raw)
+    raw = re.sub(r"_+", "_", raw).strip(" ._")
+    return raw or fallback
+
+
+def cod_identity(value):
+    raw = str(value or "").strip()
+    return str(int(raw)) if raw.isdecimal() and raw.isascii() else _safe_name_part(raw, "").casefold()
+
+
+def certificate_filename(batch, plant_number, cod=None):
+    """Return a COD-led name, e.g. 0319_Acme_Mumbai_1.pdf."""
+    cod = str(cod if cod is not None else batch.get("cod_no") or "").strip()
+    if not cod:
+        raise ValueError("Assign a COD number before naming the certificate PDF.")
+    raw_company = str(batch.get("supplier") or "").strip()
+    raw_company = re.sub(r"^plant[\s_-]*[12](?=$|[\s_-])[\s_-]*", "", raw_company, flags=re.I)
+    company = _safe_name_part(raw_company, "Unknown Company")
+    city = _safe_name_part(batch.get("location"), "Unknown City")
+    cod_part = _safe_cod_name(cod)
+    plant_part = f"_{int(plant_number)}"
+    company_city = f"{company}_{city}"
+    available = 240 - len(cod_part) - 1 - len(plant_part)
+    if available < 1:
+        raise ValueError("This COD is too long to include the company, city, and plant number in the PDF filename.")
+    company_city = company_city[:available].rstrip(" ._") or "Client"
+    return f"{cod_part}_{company_city}{plant_part}.pdf"
+
+
+def _read_sources(paths, sessions, report):
     batches = []
     for index, path in enumerate(paths, 1):
         source_id = f"plant{index}"
         try:
-            source = BytesIO(data[str(path)].data) if data else path
-            source_batches = list(read_batches(source))
+            source_batches = list(read_batches(BytesIO(sessions[index - 1].data)))
         except Exception as exc:
-            if report is None:
-                raise
             report.add({"source_id": source_id, "source_path": str(path)}, "needs_review",
-                       f"Saved workbook unavailable or unreadable: {path}. {exc}. Reconnect its drive, save and close Excel, or restore the register.",
-                       issue_code="source_unavailable")
+                       f"Could not read this plant workbook: {exc}", issue_code="source_unavailable")
             continue
-        if report is not None:
-            report.observed_sources.append(source_id)
+        report.observed_sources.append(source_id)
         for batch in source_batches:
             batch.update(source_id=source_id, source_path=str(path))
-            batch["history_id"] = batch["case_id"] if index == 1 else f"{source_id}|{batch['case_id']}"
             batches.append(batch)
-    if report is not None:
-        report.scan_complete = len(report.observed_sources) == 2
+    report.scan_complete = len(report.observed_sources) == 2
     return batches
 
 
-def _snapshot(batches):
-    return [(b["source_id"], b["source_sheet"], b["source_row"], batch_content(b), b["issued"], b["cod_no"], b["cod_date"], b["missing_headers"], b["issues"]) for b in batches]
-
-
-def _number_floor(batches, settings, history=None):
-    highest = 0
+def _highest_sequence(batches, settings, output_folder, legacy_history=None, inventory=None):
+    highest = max(0, int(settings.get("certificate_number_start", 1)) - 1)
     for batch in batches:
-        if not batch["cod_no"]:
-            continue
-        try:
+        if batch.get("cod_no"):
             highest = max(highest, certificate_sequence(batch["cod_no"], settings))
-        except ValueError as exc:
-            raise ValueError(f"COD No {batch['cod_no']!r} does not match the configured number format. Use a COD in that format or clear it if it is not an issued certificate.") from exc
-    if history is not None:
-        identities = [history.history_id(batch) for batch in batches]
-        if len(set(identities)) != len(identities):
-            raise ValueError("Two source rows share a certificate history key. Correct duplicate SN values or a plant2| prefix in the first plant's SN before issuing.")
-        for record in history.all_records():
-            number = certificate_sequence(record["certificate_no"], settings)
-            highest = max(highest, number)
-    return max(highest + 1, int(settings.get("certificate_number_start", 1)))
+    # Existing flat output PDFs are the durable numbering floor if an old
+    # workbook row is archived or its COD cell is cleared by the user.
+    output_folder = Path(output_folder).resolve()
+    output_root = output_folder.parent
+    inventory = inventory if inventory is not None else scan_inventory(output_root)
+    for entry in inventory['entries']:
+        for value in entry['cods']:
+            highest = max(highest, certificate_sequence(value, settings))
+    custom_register = output_root / "Data" / "Custom Certificates.json"
+    if custom_register.is_file():
+        custom_data = json.loads(custom_register.read_text(encoding="utf-8"))
+        for record in custom_data.get("records", []):
+            highest = max(highest, certificate_sequence(record.get("details", {}).get("cod_no", ""), settings))
+    legacy_certificate_folder = output_root / "Output" / "Certificates"
+    # Only durable certificate/history locations, never sample templates,
+    # preview files or development/test directories elsewhere in the project.
+    durable_folders = (output_folder, legacy_certificate_folder, output_root / 'Data' / 'Archive')
+    for durable_folder in durable_folders:
+        for pdf in durable_folder.rglob('*.pdf') if durable_folder.is_dir() else ():
+            if pdf.name.startswith('.'):
+                continue
+            if pdf.is_relative_to(output_root / 'Data' / 'Archive' / 'Uncommitted Certificates'):
+                # A rollback quarantine is diagnostic evidence, not an issued
+                # certificate or a reason to consume its never-committed COD.
+                continue
+            stem = pdf.stem
+            if durable_folder == output_root / 'Data' / 'Archive':
+                # Recovery archives prepend a random ID, not a COD.
+                stem = re.sub(r'^[a-f0-9]{32}_', '', stem, flags=re.I)
+            # New COD-led PDFs end in _1 or _2 for the plant. Read the COD
+            # from the first filename field, never from that trailing marker.
+            new_client_name = re.fullmatch(r"[^_]+_.+_[12]", stem, re.I)
+            if new_client_name:
+                cod_prefix = stem.split("_", 1)[0]
+                highest = max(highest, certificate_sequence(cod_prefix, settings))
+                continue
+            # Do not treat older client-name PDFs as a number source.
+            legacy_client_name = re.fullmatch(r"cod_.+_[12]", stem, re.I)
+            legacy_cod_name = (
+                bool(re.fullmatch(r"(?:cod_|certificate_)\d+", stem, re.I))
+                or ("_" not in stem and stem.casefold().startswith(("cod", "certificate")))
+            )
+            in_flat_certificate_folder = pdf.parent.resolve() in {
+                output_folder,
+                legacy_certificate_folder.resolve(),
+            }
+            if not (legacy_cod_name or (in_flat_certificate_folder and not legacy_client_name)):
+                continue
+            match = re.search(r"(\d+)$", stem)
+            if match:
+                highest = max(highest, int(match.group(1)))
+    # Read only legacy COD values for sequence continuity; no mail state is used.
+    if legacy_history and Path(legacy_history).is_file():
+        try:
+            connection = sqlite3.connect(f"file:{Path(legacy_history).resolve().as_posix()}?mode=ro", uri=True)
+            try:
+                tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                for table in tables.intersection({"batches", "archived_issuances"}):
+                    columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+                    if "certificate_no" not in columns:
+                        continue
+                    for (value,) in connection.execute(f"SELECT certificate_no FROM {table}"):
+                        highest = max(highest, certificate_sequence(value, settings))
+            finally:
+                connection.close()
+        except sqlite3.Error:
+            pass
+    return highest
 
 
-def _custom_cod_issue(batch, batches, history, settings):
-    """Validate a user-entered COD for a first issue without stopping other rows."""
-    value = batch.get("cod_no", "").strip()
-    if not value:
+def _apply_overrides(batch, overrides):
+    """Build the certificate view without mutating the parsed source batch."""
+    if not overrides:
+        return dict(batch)
+    view = dict(batch)
+    view["issues"] = list(batch.get("issues", []))
+    for key in ("supplier", "location", "form6", "reference"):
+        if key in overrides:
+            view[key] = str(overrides[key] or "").strip()
+    for key in ("certificate_type", "certificate_fields"):
+        if key in overrides:
+            view[key] = overrides[key]
+    if "inward_date" in overrides:
+        view["inward_date"] = parse_date(overrides["inward_date"])
+    if "certificate_weight" in overrides:
+        raw = overrides["certificate_weight"]
+        parsed = raw if isinstance(raw, (int, float)) else number(raw)
+        view["certificate_weight"] = parsed
+        view["certificate_weight_invalid"] = parsed is None or parsed <= 0
+    # An override is an explicit correction for the corresponding warning.
+    if view.get("supplier"):
+        view["issues"] = [issue for issue in view["issues"] if issue != "missing supplier name"]
+    if view.get("inward_date"):
+        view["issues"] = [issue for issue in view["issues"] if issue != "missing inward date"]
+    if view.get("form6"):
+        view["issues"] = [issue for issue in view["issues"] if issue != "missing Form 6 number / manifest number"]
+    if "reference" in overrides:
+        view["issues"] = [issue for issue in view["issues"] if "reference" not in issue.casefold()]
+    if "certificate_weight" in overrides:
+        view["issues"] = [issue for issue in view["issues"] if "certificate/net weight" not in issue]
+    certificate_weight = view.get("certificate_weight")
+    if certificate_weight is not None and certificate_weight > 0:
+        view["display_weight"] = certificate_weight
+        view["weight_source"] = "certificate"
+    else:
+        view["display_weight"] = view.get("total_weight") or 0
+        view["weight_source"] = "inward"
+        if "certificate_weight" in overrides:
+            view["issues"].append("certificate/net weight override must be a positive number")
+    return view
+
+
+def find_certificate(output_folder, batch):
+    """Match stable COD + plant, even if the company/city was renamed in Excel."""
+    folder = Path(output_folder)
+    cod = str(batch.get("cod_no") or "").strip()
+    if not cod or not folder.is_dir():
         return None
     try:
-        number = certificate_sequence(value, settings)
+        safe = _safe_cod_name(cod)
     except ValueError:
-        return f"COD No {value!r} must match the configured number format. Leave it blank to assign the next COD automatically, or enter a unique number in that format."
-
-    owner = history.history_id(batch)
-    for other in batches:
-        if other is batch or not other.get("cod_no"):
+        return None
+    plant = str(batch.get("source_id") or "")[-1:]
+    receipt = latest_issuance(folder.parent, 'workbook', batch.get('source_id'), batch.get('case_id'))
+    if receipt and cod_identity(receipt.get('cod')) == cod_identity(cod):
+        current = folder.parent / receipt['pdf_path']
+        return current if valid_pdf(current) and file_digest(current) == receipt['pdf_sha256'] else None
+    for path in folder.rglob("*"):
+        if path.suffix.casefold() != '.pdf' or not valid_pdf(path):
             continue
-        try:
-            other_number = certificate_sequence(other["cod_no"], settings)
-        except ValueError:
-            continue
-        if other_number == number:
-            return f"COD {value} is also entered for {other['source_id']} SN {other['case_id']}. Leave COD No blank to use the next number, or enter a unique COD."
-    for record in history.all_records():
-        if record["case_id"] == owner:
-            continue
-        if certificate_sequence(record["certificate_no"], settings) == number:
-            return f"COD {value} is already assigned to another inward. Leave COD No blank to use the next number, or enter a unique COD."
+        prefix = path.stem.split("_", 1)[0]
+        same_prefix = path.stem.casefold().startswith((safe + "_").casefold())
+        if safe.isdecimal() and prefix.isdecimal():
+            same_prefix = cod_identity(safe) == cod_identity(prefix)
+        if same_prefix and path.stem.endswith(f"_{plant}"):
+            return path
+        if path.stem.casefold() in {safe.casefold(), f"cod_{safe}".casefold(), f"certificate_{safe}".casefold()}:
+            return path
+        if safe.isdecimal() and path.stem.isdecimal() and cod_identity(safe) == cod_identity(path.stem):
+            return path
     return None
 
 
-def _recovery_detail(record):
-    return (f"Earlier Outlook save is unconfirmed for COD {record['certificate_no']} "
-            f"(history key {record['case_id']}; PDF {record.get('pdf_path') or 'not recorded'}). "
-            "Search the selected mailbox for this COD, including Drafts, Sent Items and Deleted Items. "
-            "Retain the reservation and reconcile the existing draft with certificate history; "
-            "automatic re-drafting is blocked.")
-
-
-def run(workbook_path, mailbox, root, limit=None, create_drafts=True, as_of=None, progress=print, check_only=False, publish_latest=True, history_path=None):
+def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
+        publish_latest=True, limit=None, selected=None, custom_cod=None,
+        plants=None, allow_warnings=False, overrides=None, details=None, update_excel=True,
+        override_reason='', expected_revision=None, report_sink=None):
+    """Check both workbooks or generate PDFs for rows explicitly marked Ready."""
     root = Path(root)
     settings = load_settings(root)
     as_of = as_of or date.today()
-    mode = "Check sheets" if check_only else ("Outlook drafts" if create_drafts else "PDF preview")
+    manual_cod = str(custom_cod or "").strip()
+    if plants is not None:
+        if not isinstance(plants, (list, tuple)) or not plants:
+            raise ValueError("Choose Plant 1, Plant 2, or All plants.")
+        plants = tuple(dict.fromkeys(plants))
+        if any(plant not in {"plant1", "plant2"} for plant in plants):
+            raise ValueError("Choose Plant 1, Plant 2, or All plants.")
+        if selected:
+            raise ValueError("Choose one inward or a plant selection, not both.")
+    if manual_cod and not selected:
+        raise ValueError("A custom COD can only be used when generating one selected Ready row.")
+    if details is not None and (not selected or str(details.get('case_id')) != str(selected[1])):
+        raise ValueError("The selected inward ID cannot be changed when editing its certificate.")
+    mode = "Check plant files" if check_only else "Generate certificates"
     with run_lock(root):
+        recover_issuances(root)
+        if expected_revision is not None:
+            from workspace_review import require_revision
+            require_revision(root, expected_revision)
         report = Report(root, as_of, mode, publish_latest=publish_latest)
-        history = None
-        writer = None
-        candidates = []
-        reported_candidates = set()
+        report.result_sink = report_sink
         try:
-            paths = [workbook_path] if isinstance(workbook_path, (str, Path)) else list(workbook_path)
-            if len(paths) != 2 or not all(str(p).strip() for p in paths):
-                raise ValueError("Select the two plant Excel files once in the app.")
-            paths = [Path(p).resolve() for p in paths]
-            if len({str(p).casefold() for p in paths}) != 2:
-                raise ValueError("Choose a different Excel file for each plant.")
-            if paths[0].exists() and paths[1].exists() and paths[0].samefile(paths[1]):
-                raise ValueError("Choose two separate Excel files, not aliases of the same file.")
-            history_path = history_path or (root / "Data" / "certificate-history.sqlite")
-            history = History(history_path)
-            report.observed_sources = []
-            report.scan_complete = False
-            batches = _read_sources(paths, report=report)
-            blocked = not report.scan_complete
-            try:
-                if report.scan_complete:
-                    history.validate_sources(paths, batches)
-                minimum = _number_floor(batches, settings, history)
-                if create_drafts and not any(batch["cod_no"] for batch in batches) and not history.has_numbers() and not settings.get("initial_cod_confirmed", False):
-                    raise ValueError("Neither plant file contains an earlier COD number. Enter the approved first COD number once in the app before issuing.")
-            except ValueError as exc:
-                report.add({}, "needs_review", str(exc))
-                minimum = None
-                blocked = True
-            present = {history.history_id(batch) for batch in batches}
-            for record in history.records():
-                if record["status"] in {"pending", "saving_draft"}:
-                    blocked = True
-                if record["case_id"] not in present:
-                    key = record["case_id"]
-                    plant = "plant2" if key.startswith("plant2|") else "plant1"
-                    report.add({"source_id": plant, "case_id": key.removeprefix("plant2|")}, "needs_review",
-                               _recovery_detail(record) if record["status"] in {"pending", "saving_draft"} else
-                               (f"Previously prepared COD {record['certificate_no']} has no matching source row. Restore the original SN row and COD or ask an administrator to reconcile an archived register before issuing more certificates."
-                                if record["status"] == "saved" else
-                                f"Reserved COD {record['certificate_no']} has no matching source row. Restore the original row and reconcile the saved certificate before issuing."))
-                    blocked = True
-            for batch in batches:
-                raw_state = status_value(batch["issued"])
-                issues = list(batch["issues"])
-                record = history.record(batch)
-                completion_ack = history.sent_acknowledgement(
-                    record["case_id"] if record else history.history_id(batch)
-                )
-                state = ("sent" if raw_state == "sent"
-                         else effective_certificate_status(batch, record, completion_ack))
-                batch["_effective_certificate_status"] = state
-                batch["_raw_certificate_status"] = raw_state
-                if record and record["status"] == "correcting":
-                    pending = history.correction_for_case(record["case_id"])
-                    target = (f"COD {pending['new_certificate_no']} dated {pending['new_certificate_date']}"
-                              if pending else "the saved correction")
-                    report.add(batch, "needs_review",
-                               f"A correction to {target} was interrupted. Select this row and use Correct certificate to safely resume it; no new drafts will be created until it is finished.",
-                               issue_code="certificate_correction_pending", system_alert=True)
-                    blocked = True
-                    continue
-                if record and record["status"] in {"pending", "saving_draft"}:
-                    report.add(batch, "needs_review", _recovery_detail(record),
-                               issue_code="draft_recovery", system_alert=True)
-                    continue
-                if record and record["status"] not in {"saved", "draft_saved", "allocated"}:
-                    report.add(batch, "needs_review", f"Unknown certificate history status {record['status']!r}; reconcile COD {record['certificate_no']} before issuing",
-                               issue_code="history_reconcile", system_alert=True)
-                    blocked = True
-                    continue
-                if record and record["status"] in {"allocated", "draft_saved"} and not parse_date(record["certificate_date"]):
-                    report.add(batch, "needs_review", f"Reserved COD {record['certificate_no']} has no valid certificate date in history. Restore the recorded date before continuing",
-                               issue_code="draft_recovery", system_alert=True)
-                    continue
-                if record and record["fingerprint"] != history.fingerprint(batch):
-                    report.add(batch, "needs_review", "Source details changed after a certificate was saved or reserved; review the existing certificate before continuing",
-                               issue_code="history_source_changed", system_alert=True)
-                    continue
+            paths = [Path(path).expanduser().resolve() for path in workbook_paths]
+            if len(paths) != 2 or any(not str(path) for path in paths):
+                raise ValueError("Select the Plant 1 and Plant 2 Excel files in Settings.")
+            if paths[0] == paths[1] or (paths[0].is_file() and paths[1].is_file() and paths[0].samefile(paths[1])):
+                raise ValueError("Plant 1 and Plant 2 must be two different Excel files.")
 
-                if state == "sent":
-                    if record and record["status"] in {"allocated", "draft_saved"}:
-                        report.add(batch, "needs_review", f"This row is marked as previously sent, but COD {record['certificate_no']} still needs draft recovery. Restore Drafted and reconcile the saved draft first.",
-                                   issue_code="draft_recovery", system_alert=True)
-                        continue
-                    if record and record["status"] == "saved":
-                        if not parse_date(record["certificate_date"]):
-                            report.add(batch, "needs_review", f"Completed COD {record['certificate_no']} has no saved date; check the certificate before continuing.",
-                                       issue_code="sent_history_mismatch", system_alert=True)
-                            continue
-                        if (batch["cod_no"] != record["certificate_no"]
-                                or parse_date(batch["cod_date"]) != parse_date(record["certificate_date"])):
-                            batch["_history_action"] = "repair_sent"
-                            candidates.append(batch)
-                            continue
-                        if not check_only and create_drafts:
-                            history.acknowledge_sent(record["case_id"], batch["cod_no"])
-                        report.add(batch, "completed", f"COD {record['certificate_no']} is marked Completed. No new draft or message will be created unless Ready is deliberately selected again.")
-                        continue
-                    if not batch["cod_no"] or not parse_date(batch["cod_date"]):
-                        report.add(batch, "needs_review", "This row is marked as previously sent, but COD No or COD Date is missing. Check the certificate and record its number and date.",
-                                   issue_code="sent_without_certificate", system_alert=True)
-                        continue
-                    report.add(batch, "completed", f"COD {batch['cod_no']} is marked Completed. The automation will not create another draft unless Ready is deliberately selected again.")
-                    continue
-
-                if state == "na":
-                    if record and record["status"] in {"saved", "draft_saved", "allocated"}:
-                        if record["status"] == "saved":
-                            report.add(
-                                batch, "already_prepared",
-                                f"COD {record['certificate_no']} already has a confirmed Outlook draft. N/A skips new drafts but does not delete that draft.",
-                                awaiting_send=True,
-                            )
-                        else:
-                            report.add(
-                                batch, "needs_review",
-                                f"COD {record['certificate_no']} has an unfinished or unconfirmed draft save. N/A cannot remove it; restore Ready to finish checking the existing draft.",
-                                issue_code="existing_certificate_marked_na", system_alert=True,
-                            )
-                        continue
-                    report.add(batch, "not_applicable", "N/A: skipped")
-                    continue
-
-                if state == "drafted":
-                    if record and record["status"] == "draft_saved":
-                        if not parse_date(record["certificate_date"]):
-                            report.add(batch, "needs_review", f"The saved draft for COD {record['certificate_no']} has no recorded date; review the existing draft before continuing",
-                                       issue_code="draft_recovery", system_alert=True)
-                            continue
-                        batch["_history_action"] = "recover"
-                        candidates.append(batch)
-                        continue
-                    if not record or record["status"] != "saved":
-                        report.add(batch, "needs_review", "Drafted needs a matching saved Outlook draft in the local history. Check Outlook Drafts and the certificate register before continuing.",
-                                   issue_code="draft_recovery", system_alert=True)
-                        continue
-                    if not parse_date(record["certificate_date"]):
-                        report.add(batch, "needs_review", f"Drafted COD {record['certificate_no']} has no recorded date; review its history before continuing")
-                        continue
-                    if (batch["cod_no"] != record["certificate_no"]
-                            or parse_date(batch["cod_date"]) != parse_date(record["certificate_date"])):
-                        batch["_history_action"] = "repair_drafted"
-                        candidates.append(batch)
-                        continue
-                    if not record["status_written"] and not check_only and create_drafts:
-                        history.mark_drafted(batch, record["certificate_no"])
-                    report.add(batch, "already_prepared", f"COD {record['certificate_no']} is Drafted in Excel. Review it in Outlook and mark it Completed here after you send it.", awaiting_send=True)
-                    continue
-
-                if state == "completed":
-                    if not record or record["status"] != "saved":
-                        report.add(batch, "needs_review", "Completed needs a matching saved certificate and a completion confirmation. Check Outlook Drafts and the certificate register before continuing.",
-                                   issue_code="sent_history_mismatch", system_alert=True)
-                        continue
-                    if not parse_date(record["certificate_date"]):
-                        report.add(batch, "needs_review", f"Completed COD {record['certificate_no']} has no recorded certificate date; review its history before continuing",
-                                   issue_code="sent_history_mismatch", system_alert=True)
-                        continue
-                    if (batch["cod_no"] != record["certificate_no"]
-                            or parse_date(batch["cod_date"]) != parse_date(record["certificate_date"])):
-                        batch["_history_action"] = "repair_completed"
-                        candidates.append(batch)
-                        continue
-                    report.add(batch, "completed", f"COD {record['certificate_no']} is confirmed Completed. It will not be drafted again unless Ready is deliberately selected.")
-                    continue
-
-                if batch.get('inward_date') and batch['inward_date'] > as_of:
-                    issues.append('Inward Date is in the future; correct it before preparing the certificate')
-                if state == "blank":
-                    if "issued" in batch["missing_headers"]:
-                        status_issue = "Add a Certificate Issued column. Choose Ready, N/A, or Blank in Excel; the app records Drafted and Completed"
-                    elif str(batch["issued"] or "").strip().casefold() == "blank":
-                        status_issue = "Certificate Issued is marked Blank: choose Ready or N/A when the certificate is approved"
-                    else:
-                        status_issue = "Certificate Issued is blank (white): choose Ready or N/A"
-                    if record and record["status"] == "saved":
-                        status_issue += f". A confirmed draft for COD {record['certificate_no']} already exists; this row will not create another draft while status is Blank"
-                    issues.insert(0, status_issue)
-                elif state == "unknown":
-                    issues.insert(0, f"Certificate Issued value {batch['issued']!r} is not Ready, N/A, Blank, Drafted, Completed, or Sent")
-
-                if state == "ready":
-                    for key, title in (("cod_no", "COD No"), ("cod_date", "COD Date")):
-                        if key in batch["missing_headers"]:
-                            issues.append(f"Add the {title} column before preparing drafts")
-
-                if record and record["status"] in {"allocated", "draft_saved"}:
-                    if state != "ready":
-                        report.add(batch, "needs_review", f"COD {record['certificate_no']} is reserved ({record['status']}); restore Ready or Drafted so the saved draft can be reconciled. No new draft was created")
-                        continue
-                    if issues:
-                        report.add(batch, "needs_review", "; ".join(dict.fromkeys(issues)))
-                        continue
-                    batch["_history_action"] = "recover" if record["status"] == "draft_saved" else "allocated"
-                    candidates.append(batch)
-                    continue
-
-                if state != "ready":
-                    if issues:
-                        report.add(batch, "needs_review", "; ".join(dict.fromkeys(issues)))
-                    else:
-                        report.add(batch, "needs_review", "Choose Ready, N/A, or Blank in Certificate Issued")
-                    continue
-
-                if record and record["status"] == "saved":
-                    recorded_date = parse_date(record["certificate_date"])
-                    if not recorded_date:
-                        report.add(batch, "needs_review", f"Saved certificate COD {record['certificate_no']} has no valid saved date; review its history before continuing")
-                        continue
-                    if issues:
-                        report.add(batch, "needs_review", "; ".join(dict.fromkeys(issues)))
-                        continue
-                    batch["_history_action"] = "reissue" if record["status_written"] else "complete_legacy"
-                    if (record["status_written"] and check_only):
-                        report.add(batch, "ready", f"Ready was selected again. A new unsent draft will reuse the saved COD {record['certificate_no']} and its original date; the existing draft will remain unchanged.")
-                        continue
-                    candidates.append(batch)
-                    continue
-
-                if batch["cod_no"]:
-                    custom_issue = _custom_cod_issue(batch, batches, history, settings)
-                    if custom_issue:
-                        report.add(batch, "needs_review", custom_issue)
-                        continue
-                if issues:
-                    report.add(batch, "needs_review", "; ".join(dict.fromkeys(issues)))
-                    continue
-                try:
-                    display_number = record["certificate_no"] if record else certificate_number(minimum or settings["certificate_number_start"], settings)
-                    certificate_layout(batch, display_number if create_drafts or check_only else "PREVIEW", parse_date(record["certificate_date"]) if record and record["certificate_date"] else as_of)
-                except ValueError as exc:
-                    report.add(batch, "needs_review", str(exc))
-                    continue
-                candidates.append(batch)
-
-            if blocked:
-                for batch in candidates:
-                    report.add(batch, "waiting", "Not processed: both plant registers and global COD history must pass review before issuing")
-                return report.finish()
-            if check_only:
-                for batch in candidates:
-                    record = history.record(batch)
-                    awaiting_send = bool(record and record["status"] in {"saved", "draft_saved"}
-                                         and state not in {"completed", "sent"})
-                    action = batch.get("_history_action")
-                    if action == "complete_legacy":
-                        report.add(batch, "already_prepared", f"The existing draft for COD {record['certificate_no']} is confirmed. Create drafts will restore its COD, date, and Drafted status in Excel without making another draft.", awaiting_send=awaiting_send)
-                    elif action == "repair_drafted":
-                        report.add(batch, "already_prepared", f"The existing draft for COD {record['certificate_no']} is confirmed. Create drafts will restore its COD, date, and Drafted status in Excel without making another draft.", awaiting_send=True)
-                    elif action in {"repair_completed", "repair_sent"}:
-                        report.add(batch, "completed", f"The completed COD {record['certificate_no']} is confirmed in history. Create drafts will restore its COD and date in Excel without creating or sending a message.")
-                    elif action == "reissue":
-                        report.add(batch, "ready", f"Ready was selected again. Creating drafts will reuse COD {record['certificate_no']} and its original date for a new unsent Outlook draft.", awaiting_send=awaiting_send)
-                    elif action == "recover":
-                        report.add(batch, "ready", f"The existing draft for COD {record['certificate_no']} will be kept; Create drafts will finish the Excel update without making another draft.", awaiting_send=awaiting_send)
-                    else:
-                        detail = (f"Ready and complete; custom COD {batch['cod_no']} will be used"
-                                  if batch["cod_no"] else "Ready and complete; eligible for a certificate")
-                        report.add(batch, "ready", detail, awaiting_send=awaiting_send)
-                return report.finish()
-            if not candidates:
-                return report.finish()
+            backup_dir = root / "Data" / "Workbook Backups"
+            output_folder = root / "Certificates"
+            template = resource(root, "templates") / "Certificate of Recycling.png"
             with ExitStack() as stack:
-                sessions = {}
-                if create_drafts:
-                    # Lock both inputs before choosing a global number. Excel's own
-                    # file locks cause a clean stop before any number is allocated.
-                    for path in sorted(paths, key=lambda p: str(p).casefold()):
-                        sessions[str(path)] = stack.enter_context(WorkbookSession(path, root / "Data" / "Workbook Backups"))
-                    if _snapshot(_read_sources(paths, sessions)) != _snapshot(batches):
-                        raise ValueError("A plant workbook changed during the check. Run again using the saved files.")
-                    history.validate_sources(paths, batches, bind=True)
-                for batch in candidates:
-                    if limit is not None and report.created + report.updated >= limit:
-                        report.add(batch, "waiting", "Not processed: the one-draft action was limited to one batch")
-                        reported_candidates.add(id(batch))
+                sessions = [stack.enter_context(WorkbookSession(path, backup_dir)) for path in paths]
+                if expected_revision is not None:
+                    require_revision(root, expected_revision, {str(session.path.resolve()): session.data for session in sessions})
+                inventory = scan_inventory(root, persist=True)
+                report.certificate_inventory = inventory
+                batches = _read_sources(paths, sessions, report)
+                if not report.scan_complete:
+                    report.add({}, "needs_review", "Both plant files must be available so COD numbers stay in one shared sequence.",
+                               issue_code="source_unavailable", system_alert=True)
+                    return report.finish()
+
+                original_form_batch = None
+                staged_data = None
+                numbering_batches = list(batches)
+                if details is not None:
+                    session = sessions[int(selected[0][-1]) - 1]
+                    original_form_batch = next((batch for batch in batches
+                                                if (batch['source_id'], str(batch['case_id'])) == selected), None)
+                    if original_form_batch is None and not update_excel:
+                        raise ValueError("Certificate-only changes require an existing inward. Choose Also update Excel or create a manual certificate.")
+                    staged_data, staged_batch = stage_certificate_details(session, details, validate_cells=update_excel)
+                    staged_batch.update(source_id=selected[0], source_path=str(session.path))
+                    batches = [batch for batch in batches if (batch['source_id'], str(batch['case_id'])) != selected]
+                    batches.append(staged_batch)
+                    numbering_batches.append(staged_batch)
+
+                for index, batch in enumerate(batches):
+                    if plants is not None and batch["source_id"] not in plants:
                         continue
-                    try:
-                        progress(f"{batch['source_id']} / SN {batch['case_id']}: preparing")
-                        reported_candidates.add(id(batch))
-                        safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", batch["case_id"])
-                        action = batch.get("_history_action", "new")
-                        # The eligibility scan handles both plants before any
-                        # writes begin. Re-read each candidate's own status here;
-                        # relying on the last scanned row can reject Drafted
-                        # recovery simply because the other plant ends with N/A.
-                        state = batch.get("_effective_certificate_status", status_value(batch["issued"]))
-                        raw_state = batch.get("_raw_certificate_status", status_value(batch["issued"]))
-                        if not create_drafts:
-                            if action in {"complete_legacy", "repair_drafted"}:
-                                record = history.record(batch)
-                                report.add(batch, "already_prepared", f"COD {record['certificate_no']} already has a confirmed draft; no preview or additional draft was made")
-                                continue
-                            if action in {"repair_completed", "repair_sent"}:
-                                record = history.record(batch)
-                                report.add(batch, "completed", f"COD {record['certificate_no']} is already recorded as completed; preview mode does not change Excel or create a message")
-                                continue
-                            if action in {"allocated", "recover"}:
-                                report.add(batch, "needs_review", "This certificate has a reserved or saved draft. Use Create drafts to finish its existing Excel update; no preview was made.")
-                                continue
-                            pdf = report.output / f"Preview_{batch['source_id']}_{safe_id}.pdf"
-                            make_certificate(batch, "PREVIEW", as_of, resource(root, "templates") / "Certificate of Recycling.png", pdf)
-                            report.created += 1
-                            report.add(batch, "preview", f"{pdf.name}; no COD number allocated and Excel unchanged")
-                            continue
-                        session = sessions[batch["source_path"]]
-                        record = history.record(batch)
-                        expected_current_no = None
-                        expected_previous_no = record.get("prior_certificate_no") if record else None
-                        expected_previous_date = record.get("prior_certificate_date") if record else None
-                        if record:
-                            expected_current_no = (expected_previous_no if expected_previous_no and batch["cod_no"] == expected_previous_no
-                                                   else record["certificate_no"])
-                        elif batch["cod_no"]:
-                            expected_current_no = batch["cod_no"]
-                        session.prepare(
-                            batch, expected_current_no,
-                            allow_drafted=(state == "drafted" and action in {"recover", "repair_drafted"}),
-                            allow_completed=(
-                                (state == "completed" and action in {"repair_completed", "repair_sent"})
-                                or (raw_state == "completed" and state == "drafted"
-                                    and action in {"recover", "repair_drafted"})
-                            ),
-                            expected_previous_no=expected_previous_no,
-                            expected_previous_date=expected_previous_date,
-                            allow_history_restore=action in {"complete_legacy", "repair_drafted", "repair_completed", "repair_sent", "recover", "allocated", "reissue"},
-                            allow_sent=action == "repair_sent",
-                        )
-                        if action in {"complete_legacy", "repair_drafted", "repair_completed", "repair_sent"}:
-                            issued_date = parse_date(record["certificate_date"])
-                            target_status = "Completed" if action in {"repair_completed", "repair_sent"} else "Drafted"
-                            backup = session.commit(
-                                batch, record["certificate_no"], issued_date,
-                                allow_history_restore=True, target_status=target_status,
-                                allow_legacy_sent=action == "repair_sent",
-                            )
-                            if action == "repair_sent":
-                                history.acknowledge_sent(record["case_id"], record["certificate_no"])
-                            elif action in {"complete_legacy", "repair_drafted"}:
-                                history.mark_drafted(batch, record["certificate_no"])
-                            report.updated += 1
-                            batch["_effective_certificate_status"] = "completed" if target_status == "Completed" else "drafted"
-                            awaiting_send = target_status == "Drafted"
-                            if target_status == "Completed":
-                                report.add(batch, "completed", f"Excel was restored to the confirmed completed COD {record['certificate_no']} and its original date. No message was created or sent. Backup: {backup}")
+                    if details is None and (index == 0 or batch["source_id"] != batches[index - 1]["source_id"]):
+                        sessions[int(batch["source_id"][-1]) - 1].ensure_alert_formatting(batch["source_sheet"])
+
+                next_sequence = _highest_sequence(
+                    numbering_batches, settings, output_folder,
+                    root / "Data" / "certificate-history.sqlite",
+                    inventory=inventory,
+                ) + 1
+                ready_count = 0
+                for batch in batches:
+                    if plants is not None and batch["source_id"] not in plants:
+                        continue
+                    if selected and (batch["source_id"], str(batch["case_id"])) != (selected[0], str(selected[1])):
+                        continue
+                    if limit is not None and ready_count >= limit and not check_only:
+                        break
+                    state = status_value(batch.get("issued"))
+                    batch["_effective_certificate_status"] = state
+                    age = (as_of - batch["inward_date"]).days if batch.get("inward_date") else None
+                    due = certificate_reminder_due(batch, as_of, days=25)
+                    overdue = bool(due and age is not None and age > 30)
+
+                    if state == "na":
+                        report.add(batch, "not_applicable", "N/A — no certificate is required.")
+                        continue
+                    if state == "alert":
+                        report.add(batch, "needs_review", "This row is marked Alert. Review it and choose Ready, N/A, or Blank in Excel before creating a PDF.")
+                        continue
+                    if state == "unknown":
+                        report.add(batch, "needs_review", f"Unknown Certificate Issued value {batch.get('issued')!r}; review it, then choose Ready, Alert, N/A, or Blank.")
+                        continue
+                    if state in {"generated", "generated_manual", "completed"}:
+                        existing_pdf = find_certificate(output_folder, batch)
+                        if existing_pdf:
+                            if state == "completed":
+                                report.add(batch, "completed", f"COD {batch.get('cod_no')} is marked Completed.")
+                            elif state == "generated_manual":
+                                report.add(batch, "generated_manual", f"COD {batch.get('cod_no')} has a manually generated PDF. Send it using your normal process, then mark Completed.")
                             else:
-                                report.add(batch, "already_prepared", f"Existing draft for COD {record['certificate_no']} confirmed; Excel COD and date were restored and status set to Drafted. No additional draft was created. Backup: {backup}", awaiting_send=awaiting_send)
+                                report.add(batch, "generated", f"COD {batch.get('cod_no')} has a generated PDF. Send it using your normal process, then mark Completed.")
                             continue
-                        if action == "recover" and record and record["status"] == "draft_saved":
-                            issued_date = parse_date(record["certificate_date"])
-                            if not issued_date:
-                                raise ValueError("The saved draft has no recorded certificate date; review before updating Excel")
-                            backup = session.commit(
-                                batch, record["certificate_no"], issued_date,
-                                expected_previous_no=expected_previous_no,
-                                expected_previous_date=expected_previous_date,
-                                allow_history_restore=True,
-                                target_status="Drafted",
+                        try:
+                            sessions[int(batch["source_id"][-1]) - 1].set_issued_status(
+                                batch["case_id"], batch["source_sheet"], batch["source_row"],
+                                batch["cod_no"], batch["issued"], "Ready",
                             )
-                            history.complete(batch, record["pdf_path"], record["entry_id"])
-                            report.updated += 1
-                            batch["_effective_certificate_status"] = "drafted"
-                            report.add(batch, "updated", f"COD {record['certificate_no']} written to Excel and marked Drafted; the existing draft was retained. Backup: {backup}",
-                                       awaiting_send=True)
+                            batch["issued"] = "Ready"
+                            batch["_effective_certificate_status"] = state = "ready"
+                            batch["_missing_pdf"] = True
+                        except Exception as exc:
+                            report.add(batch, "needs_review", f"The PDF is missing, but Excel could not be changed to Ready: {exc}", system_alert=True)
                             continue
-                        if action == "reissue":
-                            record = history.allocate(batch, settings, minimum, as_of, reissue=True)
-                        elif record and record["status"] == "allocated":
-                            record = history.allocate(batch, settings, minimum, as_of)
-                        elif record and record["status"] != "allocated":
-                            raise ValueError("This batch needs review before another draft can be prepared")
-                        if writer is None:
-                            writer = OutlookWriter(mailbox)
-                        if not record:
-                            issued_date = parse_date(batch["cod_date"]) or as_of
-                            record = history.allocate(
-                                batch, settings, minimum, issued_date,
-                                custom_certificate_no=batch["cod_no"] or None,
-                            )
-                        cert_no = record["certificate_no"]
-                        issued_date = parse_date(record["certificate_date"])
-                        minimum = max(minimum, certificate_sequence(cert_no, settings) + 1)
-                        safe_number = re.sub(r"[^A-Za-z0-9_-]", "_", cert_no)
-                        pdf = report.output / f"Certificate_{batch['source_id']}_{safe_id}_{safe_number}.pdf"
-                        make_certificate(batch, cert_no, issued_date, resource(root, "templates") / "Certificate of Recycling.png", pdf)
-                        history.saving_draft(batch, pdf)
-                        entry = writer.save_draft(batch, f"Certificate of E-Waste Recycling - {batch['supplier']} - {cert_no}", draft_html(batch), pdf, resource(root, "templates") / "signature-banner.png")
-                        history.draft_saved(batch, pdf, entry)
-                        report.created += 1
-                        backup = session.commit(
-                            batch, cert_no, issued_date,
-                            expected_previous_no=record.get("prior_certificate_no"),
-                            expected_previous_date=record.get("prior_certificate_date"),
-                            allow_history_restore=action in {"allocated", "reissue"},
-                            target_status="Drafted",
+                    if state == "blank":
+                        detail = "Choose Ready when the certificate should be generated, N/A to skip, or leave Blank until decided."
+                        report.add(batch, "needs_review", detail)
+                        continue
+                    if state != "ready":
+                        report.add(batch, "needs_review", "Choose Ready, N/A, or Blank in the Certificate Issued column.")
+                        continue
+
+                    ready_count += 1
+                    source_batch = batch
+                    batch = _apply_overrides(batch, overrides if selected and
+                                             (batch["source_id"], str(batch["case_id"])) == selected else None)
+                    issues = list(batch.get("issues", []))
+                    try:
+                        kind = template_id(batch.get("certificate_type"))
+                        batch["certificate_type"] = kind
+                        batch["certificate_fields"] = validate_fields(kind, batch.get("certificate_fields"))
+                    except ValueError as exc:
+                        report.add(batch, "needs_review", str(exc), system_alert=True)
+                        continue
+                    if kind in {"sita", "siemens"}:
+                        issues = [issue for issue in issues if issue != "missing Form 6 number / manifest number"]
+                    if kind == "siemens":
+                        for key, label in (("model_name", "model name"), ("model_serial", "model serial number"),
+                                           ("tube_serial", "X-ray tube serial number"), ("site_location", "site location")):
+                            if not str(batch["certificate_fields"].get(key) or "").strip():
+                                issues.append(f"Missing {label}; enter N/A if it does not apply")
+                    if batch.get("inward_date") and batch["inward_date"] > as_of:
+                        issues.append("Inward Date is in the future; correct it before generating the certificate")
+                    for key, label in (("cod_no", "COD No"), ("cod_date", "COD Date"), ("issued", "Certificate Issued")):
+                        if key in batch.get("missing_headers", []):
+                            issues.append(f"Add the {label} column to the plant workbook")
+                    if batch.get("cod_date") not in (None, "") and parse_date(batch["cod_date"]) is None:
+                        issues.append("COD Date is not a valid date; correct it or clear it to use today")
+                    if str(batch.get("cod_no") or "").startswith("="):
+                        issues.append("COD No contains a formula; enter a fixed COD or clear the cell")
+                    owned_code = manual_cod or source_batch.get('cod_no')
+                    allowed_paths = issuance_paths(inventory, owned_code, 'workbook', source_batch['source_id'], source_batch['case_id'])
+                    owned = bool(allowed_paths)
+                    issues.extend(reference_warnings(inventory, batch.get('reference'), allowed_paths, owned=owned))
+                    for entry in inventory['entries']:
+                        if entry['present'] and not entry['cods']:
+                            issues.append(f"{entry['path']}: its COD could not be checked. Confirm the next COD manually before continuing.")
+                    if issues and not allow_warnings:
+                        report.add(batch, "needs_review", "; ".join(dict.fromkeys(issues)),
+                                   warnings=list(dict.fromkeys(issues)), system_alert=True)
+                        continue
+
+                    row_cod = manual_cod or str(batch.get("cod_no") or "").strip()
+                    try:
+                        cod = row_cod or certificate_number(next_sequence, settings)
+                        cod_owners = []
+                        for owner in batches:
+                            if cod_identity(owner.get("cod_no")) == cod_identity(cod):
+                                cod_owners.append(owner)
+                        custom_register = root / "Data" / "Custom Certificates.json"
+                        if custom_register.is_file():
+                            for record in json.loads(custom_register.read_text(encoding="utf-8")).get("records", []):
+                                if cod_identity(record.get("details", {}).get("cod_no")) == cod_identity(cod):
+                                    cod_owners.append({"source_id": "custom", "case_id": record["id"]})
+                        if any(owner["source_id"] != batch["source_id"] or str(owner["case_id"]) != str(batch["case_id"])
+                               for owner in cod_owners):
+                            message = f"COD {cod} is already assigned to another plant row. Give each certificate a unique COD."
+                            if not allow_warnings:
+                                raise ValueError(message)
+                            issues.append(message + " A new automatic COD was used after confirmation.")
+                            cod = certificate_number(next_sequence, settings)
+                        conflicts = cod_conflicts(inventory, cod, allowed_paths, owned=owned and cod_identity(cod) == cod_identity(source_batch.get('cod_no')))
+                        if conflicts:
+                            names = ', '.join(Path(entry['path']).name for entry in conflicts[:3])
+                            replacement = certificate_number(next_sequence, settings)
+                            message = f"COD {cod} is already recorded in certificate PDF history ({names}). Continuing will use new automatic COD {replacement}; existing PDFs will not be overwritten."
+                            if not allow_warnings:
+                                report.add(batch, 'needs_review', message, warnings=[message], system_alert=True)
+                                continue
+                            issues.append(message)
+                            cod = replacement
+                        try:
+                            safe_cod = _safe_cod_name(cod)
+                        except ValueError as exc:
+                            if not allow_warnings:
+                                raise
+                            issues.append(str(exc) + " A new automatic COD was used after confirmation.")
+                            cod = certificate_number(next_sequence, settings)
+                            safe_cod = _safe_cod_name(cod)
+                        issued_date = parse_date(batch.get("cod_date")) or as_of
+                        destination = output_folder / certificate_filename(
+                            batch, int(batch["source_id"][-1]), cod,
                         )
-                        history.complete(batch, pdf, entry)
-                        batch["_effective_certificate_status"] = "drafted"
-                        if action == "reissue":
-                            detail = (f"Re-draft saved using existing COD {cert_no} and its original date. "
-                                      "A new unsent Outlook draft was created; the earlier draft was left untouched. "
-                                      f"Excel was marked Drafted. Backup: {backup}")
+                        native_template = TEMPLATE_ROOT / f"{kind}.pdf"
+                        batch["_data_root"] = str(root)
+                        if native_template.is_file() and (kind != "standard" or (resource(root, "templates") / "certificate-types" / "standard.pdf").is_file()):
+                            active_template = native_template
+                            issues.extend(layout_warnings(batch, cod, issued_date))
+                            if issues and not allow_warnings:
+                                report.add(batch, "needs_review", "; ".join(dict.fromkeys(issues)), warnings=list(dict.fromkeys(issues)), system_alert=True)
+                                continue
                         else:
-                            detail = (f"COD {cert_no}: PDF attached to an unsent Outlook draft; COD No, COD Date, "
-                                      f"and Certificate Issued = Drafted were updated in Excel. Backup: {backup}")
-                        report.add(batch, "draft_created", detail,
-                                   awaiting_send=True)
-                    except Exception as exc:
-                        record = history.record(batch) if create_drafts else None
-                        recovery = ""
-                        if record and record["status"] == "draft_saved":
-                            recovery = " The draft is saved. The next run will retry only the Excel update with the same COD number."
-                        elif record and record["status"] == "saving_draft":
-                            recovery = " " + _recovery_detail(record)
-                        report.add(batch, "needs_review", str(exc) + recovery,
-                                   issue_code="outlook_save_uncertain" if record and record["status"] == "saving_draft" else "case_processing_failure",
-                                   system_alert=True)
-                        if record and record["status"] == "saving_draft":
-                            for remaining in candidates[candidates.index(batch) + 1:]:
-                                report.add(remaining, "waiting", "Batch stopped because an Outlook save needs review")
+                            active_template = template
+                            certificate_layout(batch, cod, issued_date, allow_warnings=allow_warnings)
+                        if check_only:
+                            detail = f"Ready to generate COD {cod}."
+                            if issues:
+                                detail += " Warnings: " + "; ".join(dict.fromkeys(issues))
+                            report.add(batch, "ready", detail, system_alert=bool(issues),
+                                       warnings=list(dict.fromkeys(issues)))
+                            continue
+
+                        output_folder.mkdir(parents=True, exist_ok=True)
+                        temporary = output_folder / f".{safe_cod}.{uuid.uuid4().hex}.tmp.pdf"
+                        transaction = None
+                        workbook_committed = False
+                        history_pending = False
+                        session = sessions[int(batch["source_id"][-1]) - 1]
+                        try:
+                            make_certificate(batch, cod, issued_date, active_template, temporary,
+                                             allow_warnings=allow_warnings)
+                            old_paths = issuance_paths(inventory, source_batch.get('cod_no'),
+                                                       'workbook', batch['source_id'], batch['case_id'])
+                            verify_publication(root, inventory, cod, batch.get('reference'), list(set(allowed_paths + old_paths)),
+                                               owned=owned and cod_identity(cod) == cod_identity(source_batch.get('cod_no')),
+                                               allow_warnings=allow_warnings)
+                            transaction = IssuanceTransaction(
+                                root, destination, temporary, session.path, session.data,
+                                source_kind='workbook', plant=batch['source_id'], key=batch['case_id'],
+                                cod=cod, issued_date=issued_date, before=original_form_batch or source_batch,
+                                after=dict(batch, cod_no=cod, cod_date=issued_date, edit_scope='update_excel' if update_excel else 'certificate_only'),
+                                warnings=list(dict.fromkeys(issues)), override_reason=override_reason,
+                                old_paths=[root / path for path in old_paths], template_path=active_template)
+                            transaction.publish()
+                            session.before_persist = transaction.expect_source
+                            if details is not None:
+                                backup = session.commit(original_form_batch or source_batch, cod, issued_date,
+                                                        staged_data=staged_data if update_excel else None,
+                                                        allow_reissue=True, new_batch=original_form_batch is None)
+                            else:
+                                backup = session.commit(source_batch, cod, issued_date, target_status="Generated",
+                                                        overrides=overrides if selected and
+                                                        (source_batch["source_id"], str(source_batch["case_id"])) == selected else None)
+                            workbook_committed = True
+                            try:
+                                transaction.mark_source_committed()
+                                transaction.complete()
+                            except (OSError, ValueError) as recovery_error:
+                                history_pending = True
+                                issues.append(f'Certificate and Excel saved; final history update needs recovery on refresh: {recovery_error}')
+                        except Exception as exc:
+                            if transaction and not workbook_committed:
+                                try:
+                                    transaction.rollback()
+                                except (OSError, ValueError) as recovery_error:
+                                    raise RuntimeError(
+                                        f"{exc}. The Excel update failed and the previous PDF could not be restored; "
+                                        f"saved recovery copies were preserved. Ask for help before retrying: {recovery_error}"
+                                    ) from exc
+                            raise
+                        finally:
+                            session.before_persist = None
+                            try:
+                                temporary.unlink(missing_ok=True)
+                            except OSError:
+                                pass
+
+                        batch["cod_no"] = cod
+                        batch["cod_date"] = issued_date
+                        batch["issued"] = "Generated"
+                        batch['pdf_filename'] = destination.name
+                        batch["_effective_certificate_status"] = "generated"
+                        report.created += 1
+                        detail = f"Generated {destination.name}; Excel was updated to COD {cod}, {issued_date:%d.%m.%Y}, Generated. Send it manually, then mark Completed."
+                        if issues:
+                            detail += " Warnings accepted: " + "; ".join(dict.fromkeys(issues))
+                        if backup:
+                            detail += f" Workbook backup: {backup.name}."
+                        report.add(batch, "generated_now", detail,
+                                   system_alert=bool(issues), warnings=list(dict.fromkeys(issues)))
+                        if history_pending:
+                            # Do not commit another row to this source until the
+                            # pending transaction's exact source hash is recovered.
                             break
+                        # Reserve this successful issuance immediately for any
+                        # following row in the same bulk operation.
+                        inventory = scan_inventory(root, persist=True)
+                        if not row_cod:
+                            next_sequence += 1
+                        else:
+                            next_sequence = max(next_sequence, certificate_sequence(cod, settings) + 1)
+                        if progress:
+                            progress(f"{batch['source_id']} SN {batch['case_id']}: saved {destination.name}")
+                    except Exception as exc:
+                        report.add(batch, "needs_review", str(exc), issue_code="certificate_generation_failure", system_alert=True)
+            report.certificate_inventory = scan_inventory(root, persist=True)
             return report.finish()
         except Exception as exc:
-            report.add({}, "needs_review", str(exc), issue_code="run_failure")
-            for batch in candidates:
-                if id(batch) not in reported_candidates:
-                    report.add(batch, "waiting", "Not processed: the run stopped before this batch could be prepared; resolve the reported error and check again")
+            report.add({}, "needs_review", str(exc), issue_code="run_failure", system_alert=True)
             return report.finish()
-        finally:
-            if history is not None:
-                history.close()
