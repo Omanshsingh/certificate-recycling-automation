@@ -16,8 +16,9 @@ from reportlab.pdfgen import canvas
 
 from certificate_core import read_batches
 import certificate_drafts as drafts
-from certificate_inventory import (cod_conflicts, inspect_pdf, issuance_paths, record_issuance,
-                                   reference_warnings, scan_inventory, text_identifiers, verify_publication)
+from certificate_inventory import (CERTIFICATE_FOLDERS, cod_conflicts, ensure_certificate_folders,
+                                   inspect_pdf, issuance_paths, record_issuance, reference_warnings,
+                                   safe_certificate_path, scan_inventory, text_identifiers, verify_publication)
 import run_certificates as runner
 import web_app
 from run_certificates import certificate_filename, run
@@ -81,6 +82,9 @@ class TemporaryInventoryTest(unittest.TestCase):
         self.folder.mkdir()
         self.ledger = self.root / "Data" / "Certificate Inventory.json"
 
+    def issued_pdf(self, response):
+        return self.folder / response.get("relative_path", response["filename"])
+
     def entry(self, inventory, path):
         relative = path.relative_to(self.root).as_posix()
         return next(entry for entry in inventory["entries"] if entry["path"] == relative)
@@ -94,6 +98,34 @@ class TemporaryInventoryTest(unittest.TestCase):
         os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
         after = path.stat()
         self.assertEqual((after.st_size, after.st_mtime_ns), (before.st_size, before.st_mtime_ns))
+
+
+class CertificateFolderStructureTests(TemporaryInventoryTest):
+    def test_startup_creates_three_named_destinations_and_scanner_tracks_all(self):
+        folders = ensure_certificate_folders(self.root)
+        self.assertEqual({kind: path.name for kind, path in folders.items()}, CERTIFICATE_FOLDERS)
+        self.assertTrue(all(path.is_dir() for path in folders.values()))
+        for index, kind in enumerate(('workbook', 'manual', 'external'), 1):
+            external_pdf(folders[kind] / f'{index:04d}_Client_City_1.pdf', cod=f'{index:04d}')
+
+        inventory = scan_inventory(self.root)
+
+        self.assertEqual({entry['path'].split('/')[1] for entry in inventory['entries']},
+                         set(CERTIFICATE_FOLDERS.values()))
+
+    def test_read_only_scan_does_not_create_destination_folders(self):
+        inventory = scan_inventory(self.root)
+        self.assertEqual(inventory['entries'], [])
+        self.assertEqual(list(self.folder.iterdir()), [])
+
+    def test_pdf_path_validation_allows_legacy_and_named_folders_only(self):
+        self.assertEqual(safe_certificate_path(self.root, 'legacy.pdf'), self.folder / 'legacy.pdf')
+        self.assertEqual(safe_certificate_path(self.root, 'Auto Generated/new.pdf'),
+                         self.folder / 'Auto Generated' / 'new.pdf')
+        for unsafe in ('../outside.pdf', 'Unknown/nested.pdf', 'Auto Generated/deeper/file.pdf',
+                       'Manually Added\\..\\outside.pdf'):
+            with self.subTest(path=unsafe), self.assertRaises(ValueError):
+                safe_certificate_path(self.root, unsafe)
 
 
 class InventoryApiTests(TemporaryInventoryTest):
@@ -432,7 +464,7 @@ class InventoryWorkflowTests(TemporaryInventoryTest):
         regenerated = drafts.generate_draft(self.root, record_id=first["record_id"], as_of=AS_OF)
         self.assertFalse(regenerated["requires_confirmation"])
         self.assertEqual(regenerated["certificate_no"], first["certificate_no"])
-        (self.folder / regenerated["filename"]).unlink()
+        self.issued_pdf(regenerated).unlink()
         scan_inventory(self.root, persist=True)
         drafts.reconcile_manual(self.root)
         recreated = drafts.generate_draft(self.root, record_id=first["record_id"], as_of=AS_OF)
@@ -457,7 +489,7 @@ class InventoryWorkflowTests(TemporaryInventoryTest):
 
     def test_owned_manual_recreation_with_external_same_cod_in_other_plant_warns_and_renumbers(self):
         first = self.generate_manual()
-        (self.folder / first["filename"]).unlink()
+        self.issued_pdf(first).unlink()
         drafts.reconcile_manual(self.root)
         external = external_pdf(self.folder / f"{first['certificate_no']}_External_Client_2.pdf",
                                 cod=first["certificate_no"], reference="EXT-REF")
@@ -484,7 +516,7 @@ class InventoryWorkflowTests(TemporaryInventoryTest):
 
     def test_replaced_issued_manual_pdf_before_preflight_is_foreign_and_never_archived(self):
         first = self.generate_manual()
-        replaced = self.folder / first["filename"]
+        replaced = self.issued_pdf(first)
         inventory = scan_inventory(self.root)
         self.assertEqual(issuance_paths(inventory, first["certificate_no"], "manual", "plant1", first["record_id"]),
                          [replaced.relative_to(self.root).as_posix()])
@@ -513,7 +545,7 @@ class InventoryWorkflowTests(TemporaryInventoryTest):
         self.assertEqual((created, review), (1, 0))
         first = read_batches(self.paths[0])[0]
         self.assertEqual(first["issued"], "Generated")
-        replaced = self.folder / certificate_filename(first, 1, first["cod_no"])
+        replaced = self.folder / "Auto Generated" / certificate_filename(first, 1, first["cod_no"])
         self.assertTrue(issuance_paths(scan_inventory(self.root), first["cod_no"], "workbook", "plant1", "NEW-EXCEL"))
         external_pdf(replaced, cod=first["cod_no"], reference="EXT-EDIT")
         replacement = replaced.read_bytes()
@@ -606,7 +638,7 @@ class InventoryWorkflowTests(TemporaryInventoryTest):
 
     def test_owned_pdf_changed_during_manual_render_is_not_overwritten(self):
         first = self.generate_manual()
-        existing = self.folder / first["filename"]
+        existing = self.issued_pdf(first)
         register_path = self.root / "Data" / "Custom Certificates.json"
         original_register = register_path.read_bytes()
         renderer = drafts.make_template_certificate
@@ -623,7 +655,7 @@ class InventoryWorkflowTests(TemporaryInventoryTest):
                 drafts.generate_draft(self.root, record_id=first["record_id"], confirmed=True, as_of=AS_OF)
         self.assertEqual(register_path.read_bytes(), original_register)
         self.assertEqual(existing.read_bytes(), captured[0])
-        self.assertEqual(list(self.folder.iterdir()), [existing])
+        self.assertEqual(list(self.folder.rglob("*.pdf")), [existing])
 
     def test_new_duplicate_reference_during_render_aborts_without_confirmation(self):
         external = self.folder / "0319_External_Client_2.pdf"
@@ -659,7 +691,9 @@ class InventoryWorkflowTests(TemporaryInventoryTest):
         self.assertEqual((response["created"], response["certificate_no"]), (1, "0016"))
         self.assertEqual(drafts.read_register(self.root)["records"][0]["details"]["reference"], "MANUAL-REF")
         self.assertEqual(external.read_bytes(), captured[0])
-        self.assertTrue((self.folder / response["filename"]).is_file())
+        self.assertTrue(self.issued_pdf(response).is_file())
+        self.assertEqual(sorted(path.name for path in self.folder.rglob("*.pdf")),
+                         sorted([external.name, response["filename"]]))
         self.assertFalse(list(self.folder.glob(".*")))
 
 

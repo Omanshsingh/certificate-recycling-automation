@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import patch
 
 from openpyxl import load_workbook
+from pypdf import PdfWriter
 
 from certificate_core import parse_date, read_batches
 import certificate_drafts as drafts
@@ -60,6 +61,9 @@ class MissingCertificateRecoveryTests(unittest.TestCase):
 
     def source_batch(self):
         return read_batches(self.paths[0])[0]
+
+    def certificate_pdfs(self):
+        return list(self.folder.rglob("*.pdf"))
 
     def report_row(self, report=None):
         if report is None:
@@ -137,19 +141,19 @@ class MissingCertificateRecoveryTests(unittest.TestCase):
                 self.assertEqual(row["certificate_status"], "ready")
                 self.assertIn("missing", row["detail"].casefold())
                 self.assertTrue(any(path.read_bytes() == original for path in self.backups.glob("plant1_*.xlsx")))
-                self.assertEqual(list(self.folder.iterdir()), [])
+                self.assertEqual(self.certificate_pdfs(), [])
 
     def test_missing_cod_generated_recovers_without_allocating_until_explicit_generation(self):
         self.source(status="Generated", cod="")
         self.check()
         self.assert_ready_preserves_identity(cod="")
-        self.assertEqual(list(self.folder.iterdir()), [])
+        self.assertEqual(self.certificate_pdfs(), [])
         created, review, _ = runner.run(self.paths, self.root, as_of=AS_OF, selected=("plant1", "RECOVER"), progress=None)
         self.assertEqual((created, review), (1, 0))
         batch = self.source_batch()
         self.assertEqual((batch["issued"], batch["cod_no"], parse_date(batch["cod_date"])),
                          ("Generated", "0041", RECORDED_DATE))
-        self.assertTrue((self.folder / runner.certificate_filename(batch, 1, "0041")).is_file())
+        self.assertTrue((self.folder / "Auto Generated" / runner.certificate_filename(batch, 1, "0041")).is_file())
 
     def test_explicit_regeneration_keeps_existing_cod_and_recorded_date_after_completed_recovery(self):
         self.source(status="Completed")
@@ -160,6 +164,62 @@ class MissingCertificateRecoveryTests(unittest.TestCase):
         batch = self.source_batch()
         self.assertEqual((batch["issued"], batch["cod_no"], parse_date(batch["cod_date"])),
                          ("Generated", COD, RECORDED_DATE))
+
+    def test_manually_placed_pdf_with_expected_name_is_picked_up_without_app_generation(self):
+        self.source(status="Generated")
+        batch = self.source_batch()
+        filename = runner.certificate_filename(batch, 1, COD)
+        manual_pdf = self.folder / filename
+        writer = PdfWriter()
+        writer.add_blank_page(width=612, height=792)
+        with manual_pdf.open("wb") as stream:
+            writer.write(stream)
+        self.assertEqual(filename, "CUSTOM-077_Independent Client Ltd_Pune_1.pdf")
+
+        review = self.check()
+
+        self.assertEqual(review, 0)
+        self.assertEqual(self.source_batch()["issued"], "Generated")
+        row = self.report_row()
+        self.assertEqual(row["certificate_status"], "generated")
+        self.assertIn("generated PDF", row["detail"])
+        self.assertTrue(manual_pdf.is_file())
+        self.assertEqual(list(self.folder.glob("*.pdf")), [manual_pdf])
+
+    def test_pdf_in_manually_added_folder_is_picked_up_without_app_generation(self):
+        self.source(status="Generated")
+        batch = self.source_batch()
+        manual_pdf = self.folder / "Manually Added" / runner.certificate_filename(batch, 1, COD)
+        writer = PdfWriter()
+        writer.add_blank_page(width=612, height=792)
+        manual_pdf.parent.mkdir(parents=True)
+        with manual_pdf.open("wb") as stream:
+            writer.write(stream)
+
+        review = self.check()
+
+        self.assertEqual(review, 0)
+        self.assertEqual(self.source_batch()["issued"], "Generated")
+        self.assertEqual(self.report_row()["certificate_status"], "generated")
+        self.assertEqual(self.certificate_pdfs(), [manual_pdf])
+
+    def test_legacy_underscore_company_filename_is_still_picked_up(self):
+        self.source(status="Generated")
+        batch = self.source_batch()
+        current_name = runner.certificate_filename(batch, 1, COD)
+        legacy_name = current_name.replace("Independent Client Ltd", "Independent_Client_Ltd")
+        manual_pdf = self.folder / legacy_name
+        writer = PdfWriter()
+        writer.add_blank_page(width=612, height=792)
+        with manual_pdf.open("wb") as stream:
+            writer.write(stream)
+
+        review = self.check()
+
+        self.assertEqual(review, 0)
+        self.assertEqual(self.source_batch()["issued"], "Generated")
+        self.assertTrue(manual_pdf.is_file())
+        self.assertEqual(list(self.folder.glob("*.pdf")), [manual_pdf])
 
     def test_repeated_workbook_recovery_is_idempotent_without_reapplying_status(self):
         self.source(status="Completed", continuation=True)
@@ -182,7 +242,7 @@ class MissingCertificateRecoveryTests(unittest.TestCase):
         self.assert_ready_preserves_identity()
         self.assertEqual([path.read_bytes() for path in self.paths], after)
         self.assertEqual({path.name: path.read_bytes() for path in self.backups.glob("*.xlsx")}, backups)
-        self.assertEqual(list(self.folder.iterdir()), [])
+        self.assertEqual(self.certificate_pdfs(), [])
 
     def test_archived_matching_pdf_does_not_count_as_active_presence(self):
         archived = self.root / "Data" / "Archive" / "Superseded Certificates" / f"{'a' * 32}_{COD}_Old_Client_1.pdf"
@@ -193,7 +253,7 @@ class MissingCertificateRecoveryTests(unittest.TestCase):
                 self.check()
                 self.assert_ready_preserves_identity()
                 self.assertEqual(archived.read_bytes(), original)
-                self.assertEqual(list(self.folder.iterdir()), [])
+                self.assertEqual(self.certificate_pdfs(), [])
 
     def test_cached_workspace_rechecks_missing_generated_completed_and_wrong_plant_files(self):
         self.bind_web_workspace()
@@ -218,9 +278,9 @@ class MissingCertificateRecoveryTests(unittest.TestCase):
                         check.assert_called_once()  # Ready cache does not loop back into refresh.
                     if wrong_plant_present:
                         self.assertEqual(unrelated.read_bytes(), original)
-                        self.assertEqual(list(self.folder.iterdir()), [unrelated])
+                        self.assertEqual(self.certificate_pdfs(), [unrelated])
                     else:
-                        self.assertEqual(list(self.folder.iterdir()), [])
+                        self.assertEqual(self.certificate_pdfs(), [])
 
     def test_cached_generated_without_cod_persists_ready_without_rendering_or_allocating(self):
         self.bind_web_workspace()
@@ -232,7 +292,7 @@ class MissingCertificateRecoveryTests(unittest.TestCase):
         self.assertTrue(check.call_args.kwargs.get("check_only"))
         self.assert_ready_preserves_identity(cod="")
         self.assertEqual(self.report_row(state)["certificate_status"], "ready")
-        self.assertEqual(list(self.folder.iterdir()), [])
+        self.assertEqual(self.certificate_pdfs(), [])
 
     def test_cached_issued_row_with_active_matching_pdf_does_not_trigger_recovery(self):
         self.bind_web_workspace()
@@ -277,7 +337,7 @@ class MissingCertificateRecoveryTests(unittest.TestCase):
                 self.assertEqual(path.read_bytes(), before)
                 self.assertEqual(set((self.root / "Data" / "Custom Register Backups").glob("*.json")), backups)
                 self.assertEqual(drafts.manual_rows(self.root)[0]["certificate_status"], "ready")
-                self.assertEqual(list(self.folder.iterdir()), [])
+                self.assertEqual(self.certificate_pdfs(), [])
 
     def test_manually_completed_deleted_pdf_recovers_on_cached_workspace_read_without_generation(self):
         self.bind_web_workspace()
@@ -287,7 +347,7 @@ class MissingCertificateRecoveryTests(unittest.TestCase):
         drafts.complete_draft(self.root, record_id)
         before = drafts.read_register(self.root)["records"][0]
         self.assertEqual(before["status"], "completed")
-        output = self.folder / response["filename"]
+        output = self.folder / response["relative_path"]
         output.unlink()
         save_json(self.results, {"rows": [], "scan_complete": True, "created": 0, "review": 0})
         with self.forbid_generation(), patch.object(web_app, "run", side_effect=AssertionError("Manual recovery must not generate or require a workbook scan")):
@@ -298,7 +358,7 @@ class MissingCertificateRecoveryTests(unittest.TestCase):
         row = next(row for row in state["rows"] if row.get("record_id") == record_id)
         self.assertEqual(row["certificate_status"], "ready")
         self.assertEqual(row["certificate_no"], response["certificate_no"])
-        self.assertEqual(list(self.folder.iterdir()), [])
+        self.assertEqual(self.certificate_pdfs(), [])
 
 
 if __name__ == "__main__":

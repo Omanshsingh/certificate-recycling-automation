@@ -203,9 +203,11 @@ def font_name(region):
 def display_values(batch, cod, issued_date):
     from certificate_core import parse_date
     values = validate_fields(batch.get("certificate_type"), batch.get("certificate_fields"))
+    if template_id(batch.get("certificate_type")) == "siemens" and not values.get("site_location", "").strip():
+        values["site_location"] = str(batch.get("location") or "").strip()
     supplier = str(batch.get("supplier") or "").strip()
     supplier = re.sub(r"^plant[\s_-]*[12](?=$|[\s_-])[\s_-]*", "", supplier, flags=re.I)
-    city = str(batch.get("location") or "").split(",", 1)[0].strip()
+    city = str(batch.get("location") or "").strip()
     company = f"{supplier}, {city}" if city else supplier
     # Empty company override means use the freely entered company/city fields.
     if not values.get("company_display", "").strip():

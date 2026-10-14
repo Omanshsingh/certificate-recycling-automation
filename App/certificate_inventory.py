@@ -13,6 +13,47 @@ from workflow_support import save_json
 
 MAX_PDF_BYTES = 50 * 1024 * 1024
 MAX_PAGES = 8
+CERTIFICATE_FOLDERS = {
+    'workbook': 'Auto Generated',
+    'manual': 'Created in App',
+    'external': 'Manually Added',
+}
+
+
+def ensure_certificate_folders(root):
+    """Create the three source folders while keeping the parent as the watched root."""
+    base = Path(root) / 'Certificates'
+    base.mkdir(parents=True, exist_ok=True)
+    folders = {kind: base / name for kind, name in CERTIFICATE_FOLDERS.items()}
+    for folder in folders.values():
+        folder.mkdir(parents=True, exist_ok=True)
+    return folders
+
+
+def certificate_destination(root, source_kind, filename):
+    """Choose an output folder for an app-issued PDF; external PDFs are never issued here."""
+    if source_kind not in {'workbook', 'manual'}:
+        raise ValueError('Choose the workbook or in-app certificate folder.')
+    name = str(filename or '')
+    if not name or Path(name).name != name or any(char in name for char in '/\\:') or not name.lower().endswith('.pdf'):
+        raise ValueError('Invalid certificate filename.')
+    return Path(root) / 'Certificates' / CERTIFICATE_FOLDERS[source_kind] / name
+
+
+def safe_certificate_path(root, relative_path):
+    """Resolve a path beneath Certificates, rejecting traversal and escaping symlinks."""
+    base = (Path(root) / 'Certificates').resolve()
+    raw = str(relative_path or '').replace('\\', '/')
+    parts = raw.split('/')
+    if (not raw or any(part in {'', '.', '..'} or ':' in part for part in parts)
+            or not raw.lower().endswith('.pdf') or len(parts) > 2
+            or (len(parts) == 2 and parts[0].casefold() not in
+                {name.casefold() for name in CERTIFICATE_FOLDERS.values()})):
+        raise ValueError('Invalid certificate path.')
+    destination = base.joinpath(*parts).resolve()
+    if not destination.is_relative_to(base) or destination.suffix.casefold() != '.pdf':
+        raise ValueError('Invalid certificate path.')
+    return destination
 
 
 def identity(value):

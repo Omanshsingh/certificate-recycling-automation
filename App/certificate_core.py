@@ -11,6 +11,7 @@ import json
 
 from openpyxl import load_workbook
 from openpyxl.utils.cell import get_column_letter
+from excel_values import excel_date, formula_number, weight_number, quantity_number
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.pdfbase import pdfmetrics
@@ -35,9 +36,20 @@ def parse_date(value):
     if isinstance(value, date):
         return value
     text = str(value or "").strip()
-    for fmt in ("%d.%m.%Y", "%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d.%m.%y"):
+    for fmt in ("%d.%m.%Y", "%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y",
+                "%d.%m.%y", "%d/%m/%y", "%d-%m-%y",
+                "%d %b %Y", "%d %B %Y", "%d-%b-%Y", "%d-%B-%Y",
+                "%b %d, %Y", "%B %d, %Y"):
         try:
             return datetime.strptime(text, fmt).date()
+        except ValueError:
+            pass
+    # Preserve the established day-first convention for ambiguous dates.
+    # Month-first text is accepted only when it cannot be a valid day-first date.
+    match = re.fullmatch(r"(\d{1,2})([/.-])(\d{1,2})\2(\d{4})", text)
+    if match and int(match[3]) > 12:
+        try:
+            return date(int(match[4]), int(match[1]), int(match[3]))
         except ValueError:
             pass
     return None
@@ -56,16 +68,60 @@ def number(value):
     return result if math.isfinite(result) else None
 
 
+def material_items(details):
+    """Normalize the material editor's rows and calculate missing per-row weights."""
+    raw_items = details.get("items")
+    source = raw_items if isinstance(raw_items, list) else [details]
+    items, issues = [], []
+    for index, raw in enumerate(source, 1):
+        if not isinstance(raw, dict):
+            issues.append(f"material {index} is not a valid row")
+            continue
+        item = text(raw.get("item"))
+        raw_quantity = text(raw.get("quantity"))
+        raw_per_piece = text(raw.get("per_piece_weight"))
+        raw_weight = text(raw.get("weight"))
+        if not any((item, raw_quantity, raw_per_piece, raw_weight)):
+            continue
+        quantity = number(raw_quantity)
+        per_piece_weight = number(raw_per_piece)
+        weight = number(raw_weight)
+        for label, raw_value, parsed in (("quantity", raw_quantity, quantity),
+                                         ("per-piece weight", raw_per_piece, per_piece_weight),
+                                         ("weight", raw_weight, weight)):
+            if raw_value and parsed is None:
+                issues.append(f"material {index} has an invalid {label}")
+            elif parsed is not None and parsed < 0:
+                issues.append(f"material {index} has a negative {label}")
+        if not item:
+            issues.append(f"material {index} is missing its description")
+        if not raw_weight and quantity is not None and per_piece_weight is not None:
+            weight = quantity * per_piece_weight
+        if weight is None:
+            issues.append(f"material {index} weight is missing or cannot be calculated")
+        items.append({"item": item, "quantity": quantity, "per_piece_weight": per_piece_weight, "weight": weight})
+    if not items:
+        issues.append("no item rows")
+    if any(item["weight"] is None for item in items):
+        issues.append("one or more item weights cannot be calculated")
+    total = sum(item["weight"] or 0 for item in items)
+    if not math.isfinite(total) or total <= 0:
+        issues.append("total weight must be a positive number")
+    if any(item["weight"] is not None and (not math.isfinite(item["weight"]) or item["weight"] < 0) for item in items):
+        issues.append("an item has an invalid or negative weight")
+    return items, list(dict.fromkeys(issues))
+
+
 def text(value):
     return str(value).strip() if value is not None else ""
 
 
 ALIASES = {
-    "sn": {"sn", "serialnumber", "batchnumber", "inwardnumber"},
-    "inward_date": {"inwarddate", "dateofmaterialreceipt", "materialreceiptdate"},
-    "supplier": {"suppliername", "clientname", "companyname"},
-    "location": {"location", "city"},
-    "item": {"item", "itemdescription", "material"},
+    "sn": {"sn", "sno", "serialno", "serialnumber", "batchnumber", "inwardnumber", "inwardno", "inwardid"},
+    "inward_date": {"inwarddate", "dateofmaterialreceipt", "materialreceiptdate", "receiveddate", "receiptdate"},
+    "supplier": {"suppliername", "supplier", "clientname", "client", "companyname", "company", "customer", "customername"},
+    "location": {"location", "city", "sitelocation", "siteaddress", "clientlocation", "clientcity"},
+    "item": {"item", "itemdescription", "material", "description", "materialdescription", "assetdescription"},
     "quantity": {"quantityinpcs", "quantity", "qty"},
     "per_piece_weight": {"perpcsweightinkg", "perpieceweightinkg", "perpieceweight"},
     "weight": {"weightkg", "weightinkg", "weight"},
@@ -78,11 +134,11 @@ ALIASES = {
         "certificateweightnetweight", "certificateweightnetweightkg",
         "certificatenetweight", "certificatenetweightkg",
     },
-    "form6": {"form6no", "form6number"},
-    "reference": {"referenceno", "referencenumber", "certificatereferenceno"},
+    "form6": {"form6", "form6no", "form6number", "manifestno", "manifestnumber"},
+    "reference": {"reference", "referenceno", "referencenumber", "refno", "refnumber", "certificatereferenceno"},
     "cod_no": {"codno", "codnumber", "certificateissuedno", "certificateno"},
     "cod_date": {"coddate", "certificateissueddate", "certificatedate"},
-    "issued": {"certificateissued", "certificatestatus", "codstatus"},
+    "issued": {"certificateissued", "certificatestatus", "codstatus", "status"},
     "certificate_type": {"certificatetype", "codtype", "certificatetemplate"},
     "certificate_fields": {"certificatefields", "certificatedetails"},
 }
@@ -101,24 +157,111 @@ def columns(headers):
     return found
 
 
+def is_mail_tracking_header(heading):
+    """Mail timestamps/status are operational notes, never certificate values."""
+    return re.fullmatch(
+        r'(?:reference|refno|refnumber|site|location|city|manifest|form6|certificateweight|netweight)'
+        r'(?:pog)?(?:copy|copies)?(?:e?mail)(?:sent|received)(?:date|time|on|status)?',
+        norm(heading),
+    ) is not None
+
+
+def register_header(sheet):
+    """Find one authoritative heading row within the first 20 rows."""
+    candidates = []
+    for row in sheet.iter_rows(min_row=1, max_row=min(sheet.max_row, 20)):
+        normalized = [norm(cell.value) for cell in row]
+        if all(ALIASES[key].intersection(normalized) for key in ('sn', 'supplier', 'inward_date')):
+            candidates.append(row[0].row)
+    if not candidates:
+        return None
+    if len(candidates) != 1:
+        raise ValueError(f'Worksheet "{sheet.title}" has more than one heading row. Keep one register header; remove repeated headers from the data.')
+    row_number = candidates[0]
+    return row_number, columns([cell.value for cell in sheet[row_number]])
+
+
+def select_register(workbook):
+    """Use an unambiguous register; an identical hidden copy is harmless."""
+    candidates = []
+    for sheet in workbook.worksheets:
+        header = register_header(sheet)
+        if header:
+            candidates.append((sheet, *header))
+    visible = [entry for entry in candidates if entry[0].sheet_state == 'visible']
+    if len(visible) == 1:
+        selected = visible[0]
+        # An archived register can contain CODs that are absent from PDFs. Never
+        # silently ignore those numbering sources. Only an exact hidden copy is safe.
+        source_rows = list(selected[0].iter_rows(min_row=selected[1], values_only=True))
+        for sheet, header_row, _ in candidates:
+            if sheet is selected[0]:
+                continue
+            if list(sheet.iter_rows(min_row=header_row, values_only=True)) != source_rows:
+                raise ValueError(f'Hidden register "{sheet.title}" contains different records. Move the archive to a separate workbook so its COD history can be checked; keep one current register here.')
+        return selected
+    if len(candidates) > 1:
+        names = ', '.join(f'"{entry[0].title}"' for entry in candidates)
+        raise ValueError(f'More than one inward register was found: {names}. Keep one current register in this workbook; archive the others separately. No rows were combined.')
+    if candidates:
+        raise ValueError(f'The inward register "{candidates[0][0].title}" is hidden. Unhide the current register in Excel, then refresh.')
+    raise ValueError('No inward register found. Put Inward ID / SN, Company / Supplier and Inward Date headings within the first 20 rows, then refresh.')
+
+
+def source_value_issues(batch, as_of=None, certificate_type=None):
+    """One validation policy for automatic Ready, preview and final generation."""
+    as_of = as_of or date.today()
+    kind = certificate_type or batch.get('certificate_type')
+    issues = list(batch.get('issues', []))
+    if kind in {'sita', 'siemens'}:
+        issues = [issue for issue in issues if issue != 'missing Form 6 number / manifest number']
+    received = batch.get('inward_date')
+    if received and received > as_of:
+        issues.append('Inward Date is in the future; correct it before generating the certificate')
+    raw_cod_date = batch.get('cod_date')
+    cod_date = parse_date(raw_cod_date)
+    if text(raw_cod_date) and cod_date is None:
+        issues.append('COD Date is not a valid date; correct it or clear it to use today')
+    elif cod_date and cod_date > as_of:
+        issues.append('COD Date is in the future; check this date before creating the certificate')
+    if text(batch.get('cod_no')).startswith('='):
+        issues.append('COD No contains a formula; enter a fixed COD or clear the cell')
+    labels = {'cod_no':'COD No', 'cod_date':'COD Date', 'issued':'Certificate Issued'}
+    for key in batch.get('missing_headers', []):
+        issues.append(f'Add the {labels.get(key, key)} column to the plant workbook')
+    return list(dict.fromkeys(issues))
+
+
 def read_batches(path):
+    from workbook_metadata import read_details, detail_key
+    saved_details = read_details(path)
     workbook = load_workbook(path, data_only=False, read_only=False)
     try:
-        # Unrelated sheets may use repeated headings; validate the register only.
-        matches = [s for s in workbook.worksheets if all(
-            ALIASES[key].intersection(norm(c.value) for c in s[1])
-            for key in ("sn", "supplier", "inward_date"))]
-        if len(matches) != 1:
-            raise ValueError("Each plant workbook must contain one inward register with SN, Supplier Name and Inward Date headings.")
-        sheet = matches[0]
+        sheet, header_row, header_columns = select_register(workbook)
         sheet_name = sheet.title
-        rows = list(sheet.iter_rows(values_only=True))
-        header_columns = columns(rows[0]) if rows else {}
+        rows = list(sheet.iter_rows(min_row=header_row, values_only=True))
+        epoch = workbook.epoch
+        mapping = {key: {'column': get_column_letter(index + 1), 'heading': text(rows[0][index])}
+                   for key, index in header_columns.items()}
+        header_issues = []
+        for area in sheet.merged_cells.ranges:
+            if area.min_row <= header_row <= area.max_row and area.max_col > area.min_col:
+                unmapped = [col for col in range(area.min_col, area.max_col + 1)
+                            if col - 1 not in header_columns.values()]
+                if any(text(sheet.cell(row, col).value) for col in unmapped
+                       for row in range(header_row + 1, sheet.max_row + 1)):
+                    header_issues.append(f'Merged header {area} hides a populated column. Unmerge the headings and name each column before generating.')
+        for index, heading in enumerate(rows[0]):
+            if index in header_columns.values() or not text(heading) or is_mail_tracking_header(heading):
+                continue
+            if re.match(r'^(?:reference|refno|refnumber|site|location|city|manifest|form6|certificateweight|netweight)', norm(heading)):
+                if any(text(row[index]) for row in rows[1:]):
+                    header_issues.append(f'Column {get_column_letter(index + 1)} "{text(heading)}" has data but is not recognised. Rename its heading to Reference No, Location, Form 6 No or Certificate Weight as appropriate.')
         cod_formats = {}
         if "cod_no" in header_columns:
             cod_column = header_columns["cod_no"] + 1
             cod_formats = {row_number: sheet.cell(row_number, cod_column).number_format
-                           for row_number in range(2, sheet.max_row + 1)}
+                           for row_number in range(header_row + 1, sheet.max_row + 1)}
     finally:
         workbook.close()
     if not rows:
@@ -140,30 +283,70 @@ def read_batches(path):
 
     batches = []
     current = None
-    for excel_row, raw in enumerate(rows[1:], 2):
+    summary_labels = {'total', 'subtotal', 'grandtotal', 'totalweight', 'totalweightkg', 'totalweightinkg'}
+    for excel_row, raw in enumerate(rows[1:], header_row + 1):
         case_id = text(raw[cols["sn"]])
+        item_label = text(raw[cols['item']])
+        # Notes with no certificate/material data are not new company records.
+        if re.match(r'^(?:note|notes|remark|remarks)\s*:', case_id, re.I) and not any(
+                text(raw[index]) for key, index in cols.items() if key != 'sn'):
+            continue
+        summary_label = item_label if norm(item_label) in summary_labels else case_id if norm(case_id) in summary_labels else ''
+        if summary_label:
+            if current is None:
+                raise ValueError(f'Row {excel_row} is a total without an inward. Place totals after their material rows.')
+            raw_total = raw[cols['weight']] if 'weight' in cols else None
+            summary_weight = weight_number(raw_total, number)
+            expected_total = sum(material['weight'] or 0 for material in current['items'])
+            has_inputs = any(text(raw[cols[key]]) for key in ('quantity', 'per_piece_weight') if key in cols)
+            conflicting_facts = any(text(raw[cols[key]]) for key in ('supplier', 'inward_date', 'form6', 'reference', 'cod_no', 'cod_date', 'issued') if key in cols)
+            if text(raw_total).startswith('=') and 'weight' in cols:
+                weight_col = get_column_letter(cols['weight'] + 1)
+                formula = re.sub(r'\s+|\$', '', text(raw_total)).upper()
+                if formula == f'=SUM({weight_col}{current["source_row"]}:{weight_col}{excel_row - 1})' and not current['summary_rows']:
+                    summary_weight = expected_total
+            verified = (current['items'] and all(material['weight'] is not None for material in current['items'])
+                        and not has_inputs and not conflicting_facts and summary_weight is not None
+                        and math.isclose(summary_weight, expected_total, rel_tol=1e-9, abs_tol=1e-8))
+            if verified:
+                current['summary_rows'].append(excel_row)
+                current['summary_records'].append({'row':excel_row, 'label':norm(summary_label), 'weight':summary_weight})
+                current['import_notes'].append(f'Excel row {excel_row}: total checked against the materials; counted once.')
+            else:
+                issue = f'Excel row {excel_row}: total row needs checking. It does not clearly match the materials; correct or remove the summary row before generating.'
+                current['issues'].append(issue)
+                current['blocking_issues'].append(issue)
+            continue
         if case_id:
+            saved = saved_details.get(detail_key(sheet_name, case_id), {})
             current = {
                 "case_id": case_id,
                 "source_row": excel_row,
-                "inward_date": parse_date(raw[cols["inward_date"]]),
+                "inward_date": excel_date(raw[cols["inward_date"]], epoch, parse_date),
+                "raw_inward_date": raw[cols["inward_date"]],
                 "supplier": text(raw[cols["supplier"]]),
                 "location": text(raw[cols["location"]]) if "location" in cols else "",
-                "form6": text(raw[cols["form6"]]) if "form6" in cols else "",
-                "reference": text(raw[cols["reference"]]) if "reference" in cols else "",
-                "certificate_weight": None,
+                "form6": text(raw[cols["form6"]]) if "form6" in cols else text(saved.get('form6')),
+                "reference": text(raw[cols["reference"]]) if "reference" in cols else text(saved.get('reference')),
+                "certificate_weight": None if 'certificate_weight' in cols else number(saved.get('certificate_weight')),
                 "certificate_weight_invalid": False,
-                "certificate_type": text(raw[cols["certificate_type"]]) if "certificate_type" in cols else "standard",
-                "certificate_fields": {},
+                "certificate_type": text(raw[cols["certificate_type"]]) if "certificate_type" in cols else text(saved.get('certificate_type')) or "standard",
+                "certificate_fields": {} if 'certificate_fields' in cols else saved.get('certificate_fields', {}),
                 "cod_no": read_cell_text("cod_no", raw[cols["cod_no"]], excel_row) if "cod_no" in cols else "",
-                "cod_date": raw[cols["cod_date"]] if "cod_date" in cols else None,
+                "cod_date": (excel_date(raw[cols['cod_date']], epoch, parse_date) or raw[cols['cod_date']]) if 'cod_date' in cols else None,
                 "issued": text(raw[cols["issued"]]) if "issued" in cols else "",
                 "source_sheet": sheet_name,
+                "source_header_row": header_row,
+                "column_mapping": mapping,
+                "summary_rows": [],
+                'summary_records': [],
+                "import_notes": [],
+                "blocking_issues": list(header_issues),
                 # Reference No. is optional; only certificate output columns
                 # are reported here as missing headers.
                 "missing_headers": [key for key in ("issued", "cod_no", "cod_date") if key not in cols],
                 "items": [],
-                "issues": [],
+                "issues": list(header_issues),
             }
             from certificate_templates import template_id
             try:
@@ -207,7 +390,7 @@ def read_batches(path):
         if "certificate_weight" in cols:
             raw_certificate_weight = raw[cols["certificate_weight"]]
             if text(raw_certificate_weight):
-                parsed_certificate_weight = number(raw_certificate_weight)
+                parsed_certificate_weight = weight_number(raw_certificate_weight, number)
                 if parsed_certificate_weight is None or parsed_certificate_weight <= 0:
                     current["certificate_weight_invalid"] = True
                     current["issues"].append(
@@ -221,26 +404,27 @@ def read_batches(path):
                     )
         item = text(raw[cols["item"]]) if "item" in cols else ""
         if not item:
-            if any(text(raw[cols[key]]) for key in ("quantity", "per_piece_weight", "weight") if key in cols):
-                current["issues"].append(f"missing item description on row {excel_row}")
-            continue
-        qty = number(raw[cols["quantity"]]) if "quantity" in cols else None
-        per = number(raw[cols["per_piece_weight"]]) if "per_piece_weight" in cols else None
+            has_material_values = any(text(raw[cols[key]]) for key in ("quantity", "per_piece_weight", "weight") if key in cols)
+            if not has_material_values:
+                continue
+            current["issues"].append(f"missing item description on row {excel_row}")
+        qty = quantity_number(raw[cols["quantity"]], number) if "quantity" in cols else None
+        per = weight_number(raw[cols["per_piece_weight"]], number) if "per_piece_weight" in cols else None
         for key, parsed in (("quantity", qty), ("per_piece_weight", per)):
             if key in cols and text(raw[cols[key]]) and (parsed is None or parsed < 0):
                 current["issues"].append(f"invalid or negative {key} on row {excel_row}")
         raw_weight = raw[cols["weight"]] if "weight" in cols else None
-        weight = number(raw_weight)
+        weight = weight_number(raw_weight, number)
         may_calculate = not text(raw_weight)
-        if text(raw_weight).startswith("=") and {"quantity", "per_piece_weight"}.issubset(cols):
-            formula = re.sub(r"\s+|\$", "", text(raw_weight)).upper()
-            qty_ref = f"{get_column_letter(cols['quantity'] + 1)}{excel_row}"
-            per_ref = f"{get_column_letter(cols['per_piece_weight'] + 1)}{excel_row}"
-            may_calculate = formula in {f"={qty_ref}*{per_ref}", f"={per_ref}*{qty_ref}"}
+        if text(raw_weight).startswith("="):
+            references = {f"{get_column_letter(cols[key] + 1)}{excel_row}": parsed
+                          for key, parsed in (('quantity', qty), ('per_piece_weight', per)) if key in cols}
+            weight = formula_number(text(raw_weight), references)
+            may_calculate = False
         if may_calculate:
             weight = qty * per if qty is not None and per is not None else None
         elif weight is None:
-            current["issues"].append(f"invalid weight or unsupported weight formula on row {excel_row}; enter a confirmed weight or a same-row quantity times per-piece formula")
+            current["issues"].append(f"invalid weight or unsupported weight formula on row {excel_row}; enter a confirmed weight in kg, or use same-row quantity/per-piece arithmetic, SUM or ROUND. External and other-row formulas are not read.")
         current["items"].append({"item": item, "quantity": qty, "per_piece_weight": per, "weight": weight})
 
     case_id_counts = Counter(batch["case_id"] for batch in batches)
@@ -257,6 +441,11 @@ def read_batches(path):
         if any(item["weight"] is None for item in batch["items"]):
             batch["issues"].append("one or more item weights cannot be calculated")
         batch["total_weight"] = sum(item["weight"] or 0 for item in batch["items"])
+        for summary in batch['summary_records']:
+            if summary['label'] != 'subtotal' and not math.isclose(summary['weight'], batch['total_weight'], rel_tol=1e-9, abs_tol=1e-8):
+                issue = f'Excel row {summary["row"]}: total row needs checking. More materials follow this total; move the total below all materials and check its value.'
+                batch['issues'].append(issue)
+                batch['blocking_issues'].append(issue)
         if not math.isfinite(batch["total_weight"]) or batch["total_weight"] <= 0:
             batch["issues"].append("total weight must be a positive number")
         if any(item["weight"] is not None and (not math.isfinite(item["weight"]) or item["weight"] < 0) for item in batch["items"]):
@@ -277,6 +466,21 @@ def read_batches(path):
         if batch["form6"] and form6_counts[batch["form6"]] > 1:
             batch["issues"].append("Form 6 number is repeated on more than one batch in this plant workbook")
     return batches
+
+
+def inward_details_complete(batch, as_of=None):
+    """Approve an unselected status only when its Excel source facts are valid.
+
+    Template-only manual identifiers are entered on the preview page. Optional
+    reference/COD/date values may be empty; COD and date are assigned on creation.
+    """
+    as_of = as_of or date.today()
+    if source_value_issues(batch, as_of):
+        return False
+    received = batch.get("inward_date")
+    if not received or received > as_of:
+        return False
+    return True
 
 
 def status_value(value):
@@ -382,8 +586,8 @@ def supplier_lines(batch, max_width=620, allow_overflow=False):
     # Workbook test data may prefix a supplier with its plant; that is not part
     # of the client name printed on the certificate.
     supplier = re.sub(r"^PLANT\s*[12]\s*(?:[-:]\s*)?", "", supplier).strip()
-    # The certificate reference displays the city only, not state/country text.
-    location = " ".join(batch.get("location", "").split(",", 1)[0].upper().split())
+    # Print the complete location supplied by Excel or the PDF editor.
+    location = " ".join(str(batch.get("location") or "").upper().split())
     full = f"{supplier}, {location}" if location else supplier
     font = vendor_font()
     for size in (28, 26, 24, 22):

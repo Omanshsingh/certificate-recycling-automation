@@ -63,6 +63,9 @@ class TemporaryCertificateTest(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.backups = self.root / "Data" / "Workbook Backups"
 
+    def manual_pdf(self, result):
+        return self.root / "Certificates" / result.get("relative_path", result["filename"])
+
     def batch(self, kind="standard", **changes):
         batch = {
             "case_id": "CLIENT", "supplier": "Independent Client Ltd", "location": "Pune",
@@ -75,6 +78,14 @@ class TemporaryCertificateTest(unittest.TestCase):
 
 
 class NativeTemplateTests(TemporaryCertificateTest):
+    def test_full_location_is_printed_for_all_certificate_types(self):
+        for kind in ('standard', 'sita', 'siemens'):
+            with self.subTest(kind=kind):
+                output = self.root / f'{kind}-full-location.pdf'
+                make_template_certificate(self.batch(kind, location='Pune, Maharashtra, India'),
+                                          '0001', AS_OF, output, allow_warnings=True)
+                self.assertIn('PUNE, MAHARASHTRA, INDIA', ' '.join(pdf_text(output).split()))
+
     def test_native_title_imports_only_referenced_resources_without_unused_transparency(self):
         for kind in ("standard", "sita", "siemens"):
             with self.subTest(kind=kind):
@@ -310,10 +321,11 @@ class WorkbookTemplateTests(TemporaryCertificateTest):
         book = load_workbook(path)
         try:
             headers = [cell.value for cell in book.active[1]]
-            self.assertEqual(headers.count("Certificate Type"), 1)
-            self.assertEqual(headers.count("Certificate Fields"), 1)
-            raw = book.active.cell(2, headers.index("Certificate Fields") + 1).value
-            self.assertEqual(json.loads(raw), fields)
+            self.assertNotIn("Certificate Type", headers)
+            self.assertNotIn("Certificate Fields", headers)
+            from workbook_metadata import read_details, detail_key
+            saved = read_details(path)[detail_key(book.active.title, 'CLIENT')]
+            self.assertEqual(saved['certificate_fields'], fields)
         finally:
             book.close()
 
@@ -482,7 +494,7 @@ class DraftWorkflowTests(TemporaryCertificateTest):
         self.assertEqual(result["created"], 1)
         self.assertFalse(result["requires_confirmation"])
         self.assertTrue(result["warnings"])
-        output = self.root / "Certificates" / result["filename"]
+        output = self.manual_pdf(result)
         self.assertIn("INDEPENDENT CLIENT LTD, PUNE", pdf_text(output))
         rows = drafts.manual_rows(self.root)
         self.assertEqual((len(rows), rows[0]["source_kind"], rows[0]["certificate_type"]), (1, "manual", "sita"))
@@ -494,7 +506,7 @@ class DraftWorkflowTests(TemporaryCertificateTest):
         result = self.generate(plant="plant2", details=details)
         self.assertFalse(result["requires_confirmation"])
         self.assertEqual(result["created"], 1)
-        output = self.root / "Certificates" / result["filename"]
+        output = self.manual_pdf(result)
         extracted = pdf_text(output)
         self.assertIn("ALTERNATE MEDICAL LTD, PUNE", extracted)
         for value in details["certificate_fields"].values():
@@ -516,7 +528,7 @@ class DraftWorkflowTests(TemporaryCertificateTest):
                          (record_id, cod, "ready"))
         regenerated = drafts.generate_draft(self.root, record_id=record_id, as_of=AS_OF)
         self.assertEqual((regenerated["record_id"], regenerated["certificate_no"]), (record_id, cod))
-        self.assertIn("RENAMED CLIENT LTD, PUNE", pdf_text(self.root / "Certificates" / regenerated["filename"]))
+        self.assertIn("RENAMED CLIENT LTD, PUNE", pdf_text(self.manual_pdf(regenerated)))
 
     def test_shared_sequence_accounts_for_both_workbooks_manual_and_pdf_floor(self):
         first = self.generate()
@@ -548,7 +560,7 @@ class DraftWorkflowTests(TemporaryCertificateTest):
         self.assertEqual(row["warnings"], [])
         batch = read_batches(self.paths[0])[0]
         self.assertEqual((batch["issued"], batch["cod_no"]), ("Generated", "0016"))
-        self.assertEqual(len(list((self.root / "Certificates").glob("*.pdf"))), 1)
+        self.assertEqual(len(list((self.root / "Certificates").rglob("*.pdf"))), 1)
 
     def test_manual_standard_without_disposal_date_generates_without_warning(self):
         result = self.generate(details=self.details("standard"))
@@ -616,7 +628,7 @@ class DraftWorkflowTests(TemporaryCertificateTest):
 
     def test_deleted_manual_pdf_preserves_sequence_and_can_recreate_same_cod(self):
         first = self.generate()
-        (self.root / "Certificates" / first["filename"]).unlink()
+        self.manual_pdf(first).unlink()
         drafts.reconcile_manual(self.root)
         rows = drafts.manual_rows(self.root)
         self.assertEqual((rows[0]["certificate_status"], rows[0]["certificate_no"]), ("ready", "0016"))
@@ -643,7 +655,7 @@ class DraftWorkflowTests(TemporaryCertificateTest):
     def test_missing_custom_cod_pdf_reconciles_and_recreates_without_clearing_number(self):
         first = self.generate(plant="plant2", details=self.details(cod_no="SITA-CUSTOM-77"))
         folder = self.root / "Certificates"
-        (folder / first["filename"]).unlink()
+        self.manual_pdf(first).unlink()
         # An unrelated other-plant certificate must not count as this output.
         # Same-COD external conflicts have their own inventory regression test.
         unrelated = folder / "OTHER-COD-88_Other_Company_1.pdf"
@@ -659,7 +671,7 @@ class DraftWorkflowTests(TemporaryCertificateTest):
         regenerated = drafts.generate_draft(self.root, record_id=first["record_id"], as_of=AS_OF)
         self.assertEqual((regenerated["record_id"], regenerated["certificate_no"]),
                          (first["record_id"], "SITA-CUSTOM-77"))
-        self.assertTrue((folder / regenerated["filename"]).exists())
+        self.assertTrue(self.manual_pdf(regenerated).exists())
         self.assertTrue(unrelated.exists())
 
     def test_workbook_preflight_keeps_own_cod_but_manual_source_flags_duplicate(self):
@@ -719,7 +731,7 @@ class DraftWorkflowTests(TemporaryCertificateTest):
         response = self.generate(confirmed=True)
         self.assertEqual((response["created"], response["certificate_no"]), (1, "0011"))
         self.assertTrue(any("Plant 2 workbook could not be checked" in warning for warning in response["warnings"]))
-        self.assertTrue((self.root / "Certificates" / response["filename"]).is_file())
+        self.assertTrue(self.manual_pdf(response).is_file())
         self.assertEqual(self.paths[1].read_bytes(), corrupted)
 
     def test_unsupported_workbook_extension_keeps_other_source_and_returns_warning(self):
@@ -738,7 +750,7 @@ class DraftWorkflowTests(TemporaryCertificateTest):
         self.assertEqual((record["id"], record["status"], record["details"]["cod_no"]),
                          (result["record_id"], "completed", result["certificate_no"]))
         self.assertEqual(drafts.manual_rows(self.root)[0]["certificate_status"], "completed")
-        (self.root / "Certificates" / result["filename"]).unlink()
+        self.manual_pdf(result).unlink()
         drafts.reconcile_manual(self.root)
         recovered = drafts.read_register(self.root)["records"][0]
         self.assertEqual((recovered["id"], recovered["status"], recovered["details"]["cod_no"]),
@@ -769,7 +781,7 @@ class DraftWorkflowTests(TemporaryCertificateTest):
             drafts.complete_draft(self.root, record_id)
         self.assertEqual(register.read_bytes(), original)
         result = drafts.generate_draft(self.root, record_id=record_id, as_of=AS_OF)
-        (self.root / "Certificates" / result["filename"]).unlink()
+        self.manual_pdf(result).unlink()
         original = register.read_bytes()
         with self.assertRaisesRegex(ValueError, "PDF is missing"):
             drafts.complete_draft(self.root, record_id)
@@ -777,7 +789,7 @@ class DraftWorkflowTests(TemporaryCertificateTest):
 
     def test_completion_persistence_failure_retains_generated_record_and_pdf(self):
         result = self.generate()
-        output = self.root / "Certificates" / result["filename"]
+        output = self.manual_pdf(result)
         register = self.root / "Data" / "Custom Certificates.json"
         original_pdf, original_register = output.read_bytes(), register.read_bytes()
         with patch("certificate_drafts.write_register", side_effect=PermissionError("register blocked")):
@@ -795,13 +807,13 @@ class DraftWorkflowTests(TemporaryCertificateTest):
             with self.assertRaisesRegex(PermissionError, "register blocked"):
                 drafts.generate_draft(self.root, record_id=record_id, as_of=AS_OF)
         self.assertEqual(register.read_bytes(), original)
-        self.assertEqual(list((self.root / "Certificates").iterdir()), [])
+        self.assertEqual(list((self.root / "Certificates").rglob("*.pdf")), [])
         retried = drafts.generate_draft(self.root, record_id=record_id, as_of=AS_OF)
         self.assertEqual((retried["record_id"], retried["certificate_no"]), (record_id, "0016"))
 
     def test_register_persistence_failure_restores_previous_same_cod_pdf(self):
         first = self.generate()
-        output = self.root / "Certificates" / first["filename"]
+        output = self.manual_pdf(first)
         original_pdf = output.read_bytes()
         edited = self.details(certificate_fields={"weight_display": "8.50 KG NET"})
         drafts.save_draft(self.root, "plant1", edited, record_id=first["record_id"])
@@ -812,21 +824,21 @@ class DraftWorkflowTests(TemporaryCertificateTest):
                 drafts.generate_draft(self.root, record_id=first["record_id"], as_of=AS_OF)
         self.assertEqual(output.read_bytes(), original_pdf)
         self.assertEqual(register.read_bytes(), original_register)
-        self.assertEqual(list((self.root / "Certificates").iterdir()), [output])
+        self.assertEqual(list((self.root / "Certificates").rglob("*.pdf")), [output])
 
     def test_renamed_revision_archives_old_pdf_and_old_copy_cannot_mask_missing_latest(self):
         first = self.generate()
         folder = self.root / "Certificates"
-        old_pdf = folder / first["filename"]
+        old_pdf = self.manual_pdf(first)
         original = old_pdf.read_bytes()
         renamed = self.details(supplier="Renamed Client Ltd", location="Surat")
         regenerated = drafts.generate_draft(self.root, details=renamed,
                                            record_id=first["record_id"], as_of=AS_OF)
-        latest = folder / regenerated["filename"]
+        latest = self.manual_pdf(regenerated)
         self.assertNotEqual(latest, old_pdf)
         self.assertEqual((regenerated["record_id"], regenerated["certificate_no"]),
                          (first["record_id"], first["certificate_no"]))
-        self.assertEqual(list(folder.iterdir()), [latest])
+        self.assertEqual(list(folder.rglob("*.pdf")), [latest])
         archive = self.root / "Data" / "Archive" / "Superseded Certificates"
         archived = list(archive.glob(f"*_{first['filename']}"))
         self.assertEqual(len(archived), 1)
@@ -855,7 +867,7 @@ class DraftWorkflowTests(TemporaryCertificateTest):
     def test_renamed_revision_register_failure_restores_archived_old_pdf(self):
         first = self.generate()
         folder = self.root / "Certificates"
-        old_pdf = folder / first["filename"]
+        old_pdf = self.manual_pdf(first)
         register = self.root / "Data" / "Custom Certificates.json"
         original_pdf, original_register = old_pdf.read_bytes(), register.read_bytes()
         archive = self.root / "Data" / "Archive" / "Superseded Certificates"
@@ -865,7 +877,7 @@ class DraftWorkflowTests(TemporaryCertificateTest):
             archived = list(archive.glob("*.pdf"))
             self.assertEqual(len(archived), 0)
             self.assertEqual(old_pdf.read_bytes(), original_pdf)
-            self.assertEqual(len([p for p in folder.glob('*.pdf') if not p.name.startswith('.')]), 2)
+            self.assertEqual(len([p for p in folder.rglob('*.pdf') if not p.name.startswith('.')]), 2)
             raise PermissionError("register blocked after old PDF was archived")
 
         renamed = self.details(supplier="Renamed Client Ltd", location="Surat")
@@ -875,7 +887,7 @@ class DraftWorkflowTests(TemporaryCertificateTest):
                                       record_id=first["record_id"], as_of=AS_OF)
         self.assertEqual(register.read_bytes(), original_register)
         self.assertEqual(old_pdf.read_bytes(), original_pdf)
-        self.assertEqual(list(folder.iterdir()), [old_pdf])
+        self.assertEqual(list(folder.rglob("*.pdf")), [old_pdf])
         self.assertEqual(list(archive.glob('*.pdf')), [])
         record = drafts.read_register(self.root)["records"][0]
         self.assertEqual(record["status"], "generated_manual")
@@ -944,7 +956,7 @@ class WebGenerationTests(TemporaryCertificateTest):
                 self.assertEqual((state["created"], state["review"]), (0, 1))
                 self.assertEqual(state["rows"][0]["outcome"], "needs_review")
                 self.assertTrue(state["rows"][0]["system_alert"])
-                self.assertFalse(list((self.root / "Certificates").glob("*.pdf")))
+                self.assertFalse(list((self.root / "Certificates").rglob("*.pdf")))
 
     def test_selected_generation_warning_returns_whole_workspace_with_manual_rows(self):
         selected = ("plant1", "SELECTED")
@@ -969,7 +981,7 @@ class WebGenerationTests(TemporaryCertificateTest):
         response = web_app.generate(selected=selected)
         self.assertTrue(response["requires_confirmation"])
         self.assertEqual(response["warnings"], [warning_row])
-        self.assertEqual(response["state"]["rows"], [warning_row, other_row, manual_row])
+        self.assertEqual(response["state"]["rows"], [warning_row, dict(other_row, has_issued_certificate=True), manual_row])
         refresh.assert_called_once_with(paths)
         runner.assert_called_once_with(paths, self.root, check_only=True, progress=None, report_sink={}, selected=selected)
         self.assertEqual(list(self.root.iterdir()), [])

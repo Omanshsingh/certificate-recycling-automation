@@ -9,10 +9,11 @@ import uuid
 from zipfile import BadZipFile
 from openpyxl.utils.exceptions import InvalidFileException
 
-from certificate_core import certificate_number, number, parse_date, read_batches, status_value
+from certificate_core import certificate_number, material_items, number, parse_date, read_batches, status_value
 from certificate_templates import TEMPLATE_NAMES, layout_warnings, make_template_certificate, template_id, validate_fields, current_warnings
 from run_certificates import _highest_sequence, _safe_cod_name, certificate_filename, find_certificate, cod_identity
-from certificate_inventory import scan_inventory, cod_conflicts, reference_warnings, verify_publication, issuance_paths, record_issuance
+from certificate_inventory import (scan_inventory, cod_conflicts, reference_warnings, verify_publication,
+                                   issuance_paths, record_issuance, certificate_destination, safe_certificate_path)
 from workflow_support import load_settings, run_lock, save_json
 from issuance_safety import IssuanceTransaction, recover_issuances, valid_pdf, file_digest, latest_issuance
 
@@ -57,6 +58,23 @@ def clean_details(details):
         if len(value) > 6000:
             raise ValueError(f"The {key} field is too long.")
         result[key] = value
+    if "items" in details:
+        items = details["items"]
+        if not isinstance(items, list) or len(items) > 100:
+            raise ValueError("Add no more than 100 materials at a time.")
+        result["items"] = []
+        for index, item in enumerate(items, 1):
+            if not isinstance(item, dict):
+                raise ValueError(f"Material {index} is not a valid row.")
+            clean_item = {}
+            for key, limit in (("item", 180), ("quantity", 40), ("per_piece_weight", 40), ("weight", 40)):
+                value = str(item.get(key) if item.get(key) is not None else "").strip()
+                if len(value) > limit:
+                    raise ValueError(f"Material {index}: {key.replace('_', ' ')} is too long.")
+                clean_item[key] = value
+            result["items"].append(clean_item)
+    if kind == "siemens" and not result["certificate_fields"].get("site_location", "").strip():
+        result["certificate_fields"]["site_location"] = result["location"]
     return result
 
 
@@ -156,6 +174,8 @@ def prepare_certificate(root, plant, details, *, record_id=None, as_of=None, sou
     issued_date = parse_date(details["cod_date"]) or as_of
     if details["cod_date"] and parse_date(details["cod_date"]) is None:
         warnings.append("Certificate date is invalid; today's date will be used if you continue.")
+    if issued_date > as_of:
+        warnings.append('COD Date is in the future; check this date before creating the certificate')
     if not details["supplier"] and not details["certificate_fields"].get("company_display"):
         warnings.append("Company name is missing; the company line will be blank.")
     if kind != "siemens" and receipt_date is None:
@@ -163,9 +183,14 @@ def prepare_certificate(root, plant, details, *, record_id=None, as_of=None, sou
     if receipt_date and receipt_date > as_of:
         warnings.append("Material receipt date is in the future; verify it before sending.")
     certificate_weight = number(details["certificate_weight"])
-    inward_weight = number(details["weight"])
-    if inward_weight is None and number(details["quantity"]) is not None and number(details["per_piece_weight"]) is not None:
-        inward_weight = number(details["quantity"]) * number(details["per_piece_weight"])
+    if source_kind == "manual" and "items" not in details:
+        items, material_issues = [], []
+        inward_weight = number(details.get("weight")) or 0
+    else:
+        items, material_issues = material_items(details)
+        inward_weight = sum(item["weight"] or 0 for item in items)
+    for issue in material_issues:
+        warnings.append(f"{issue.capitalize()}; check the material list and weight before sending.")
     display_weight = certificate_weight if certificate_weight is not None else inward_weight
     if display_weight is None or display_weight <= 0:
         warnings.append("Weight is missing, invalid or not positive; check the weight shown in the preview before sending.")
@@ -178,7 +203,7 @@ def prepare_certificate(root, plant, details, *, record_id=None, as_of=None, sou
                            ("tube_serial", "X-ray tube serial number"), ("site_location", "Site location")):
             if not details["certificate_fields"].get(key, "").strip():
                 warnings.append(f"{label} is missing; enter N/A if it does not apply, or continue with a blank value.")
-    batch = dict(details, case_id=details["case_id"] or record_id or "Custom", source_id=plant,
+    batch = dict(details, case_id=details["case_id"] or record_id or "Custom", source_id=plant, items=items,
                  inward_date=receipt_date, certificate_weight=certificate_weight, total_weight=inward_weight,
                  display_weight=display_weight, _data_root=str(root))
     warnings.extend(layout_warnings(batch, cod, issued_date))
@@ -189,13 +214,19 @@ def current_record_pdf(root, record):
     """Check the current revision, not a superseded same-COD certificate."""
     filename = record.get("pdf_filename")
     if filename:
-        if not isinstance(filename, str) or Path(filename).name != filename:
+        relative = record.get('pdf_relative_path') or filename
+        if not isinstance(relative, str):
             return None
-        path = Path(root) / "Certificates" / filename
+        try:
+            path = safe_certificate_path(root, relative)
+        except ValueError:
+            return None
         receipt = latest_issuance(root, 'manual', record['plant'], record['id'])
         healthy = valid_pdf(path)
         if receipt and receipt.get('pdf_path') == path.relative_to(Path(root)).as_posix():
             healthy = healthy and file_digest(path) == receipt['pdf_sha256']
+        elif receipt:
+            healthy = False
         return path if healthy else None
     return find_certificate(Path(root) / "Certificates", dict(record["details"], source_id=record["plant"]))
 
@@ -216,6 +247,7 @@ def manual_rows(root):
     rows = []
     for record in data["records"]:
         details = record["details"]
+        materials, _ = material_items(details)
         status = _manual_status(record.get("status", "ready"))
         batch = dict(details, source_id=record["plant"])
         missing = status in {"generated_manual", "completed"} and not current_record_pdf(root, record)
@@ -223,7 +255,8 @@ def manual_rows(root):
             status = "ready"
         weight = number(details.get("certificate_weight"))
         if weight is None:
-            weight = number(details.get("weight"))
+            weight = (sum(item["weight"] or 0 for item in materials)
+                      if materials else number(details.get("weight")))
         rows.append({
             "source_kind": "manual", "record_id": record["id"], "plant": record["plant"],
             "raw_details": dict(details),
@@ -239,8 +272,7 @@ def manual_rows(root):
             "detail": f"PDF missing. Ready to recreate with COD {details.get('cod_no')}." if missing else
                       f"{TEMPLATE_NAMES.get(details.get('certificate_type'), 'Custom')} · Saved in the local certificate register.",
             "warnings": current_warnings(record.get("warnings", [])), "system_alert": missing,
-            "items": [{"item": details.get("item", ""), "quantity": number(details.get("quantity")),
-                       "per_piece_weight": number(details.get("per_piece_weight")), "weight": number(details.get("weight"))}],
+            "items": materials,
             "file": "", "reminder_due": False, "overdue": False,
         })
     return rows
@@ -289,9 +321,9 @@ def generate_draft(root, plant=None, details=None, record_id=None, confirmed=Fal
         details.update(cod_no=cod, cod_date=issued_date.isoformat())
         filename = certificate_filename(batch, int(plant[-1]), cod)
         folder = Path(root) / "Certificates"
-        folder.mkdir(parents=True, exist_ok=True)
-        destination = folder / filename
-        temporary = folder / f".{uuid.uuid4().hex}.tmp.pdf"
+        destination = certificate_destination(root, 'manual', filename)
+        relative_path = destination.relative_to(folder).as_posix()
+        temporary = Path(root) / "Data" / "Previews" / f".{uuid.uuid4().hex}.tmp.pdf"
         allowed_paths = issuance_paths(inventory, cod, 'manual', plant, record_id)
         owned = bool(allowed_paths)
         previous = current_record_pdf(root, existing) if existing else None
@@ -323,6 +355,7 @@ def generate_draft(root, plant=None, details=None, record_id=None, confirmed=Fal
                 existing = {"id": identifier, "created_at": datetime.now().isoformat()}
                 data["records"].append(existing)
             existing.update(plant=plant, details=details, status="generated_manual", pdf_filename=filename,
+                            pdf_relative_path=relative_path,
                             warnings=warnings, updated_at=datetime.now().isoformat())
             transaction.expect_source(json.dumps(data, indent=2, ensure_ascii=False, default=str).encode('utf-8'))
             write_register(root, data)
@@ -345,7 +378,8 @@ def generate_draft(root, plant=None, details=None, record_id=None, confirmed=Fal
         except (OSError, ValueError) as exc:
             warnings.append(f"PDF created, but its folder inventory could not be refreshed: {exc}. Refresh the dashboard before the next certificate.")
         return {"requires_confirmation": False, "created": 1, "record_id": existing["id"],
-                "certificate_no": cod, "filename": filename, "warnings": warnings}
+                "certificate_no": cod, "filename": filename, "relative_path": relative_path,
+                "warnings": warnings}
 
 
 def complete_draft(root, record_id, expected_revision=None):

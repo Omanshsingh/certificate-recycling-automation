@@ -1,6 +1,6 @@
 """Generate recycling certificates as PDFs from the two plant workbooks.
 
-This workflow has no email or Outlook integration. A user marks a row Ready,
+This workflow has no email or Outlook integration. Complete unselected rows become Ready;
 generates its PDF, sends it through their normal process, and marks it Completed.
 """
 from __future__ import annotations
@@ -24,13 +24,15 @@ from certificate_core import (
     number,
     parse_date,
     read_batches,
+    source_value_issues,
     status_value,
 )
 from workbook_store import WorkbookSession, stage_certificate_details
 from workflow_support import Report, load_settings, run_lock
 from app_paths import resource
 from certificate_templates import TEMPLATE_ROOT, template_id, validate_fields, layout_warnings
-from certificate_inventory import scan_inventory, cod_conflicts, reference_warnings, verify_publication, issuance_paths, record_issuance
+from certificate_inventory import (scan_inventory, cod_conflicts, reference_warnings, verify_publication,
+                                   issuance_paths, record_issuance, certificate_destination)
 from issuance_safety import IssuanceTransaction, recover_issuances, latest_issuance, valid_pdf, file_digest
 
 
@@ -59,39 +61,47 @@ def _safe_name_part(value, fallback):
     return raw or fallback
 
 
+def _human_filename_section(value, fallback):
+    """Keep names readable while removing Windows-forbidden filename characters."""
+    raw = re.sub(r"[<>:\"/\\|?*\x00-\x1f]+", " ", str(value or ""))
+    raw = re.sub(r"[\s_]+", " ", raw).strip(" .")
+    return raw or fallback
+
+
 def cod_identity(value):
     raw = str(value or "").strip()
     return str(int(raw)) if raw.isdecimal() and raw.isascii() else _safe_name_part(raw, "").casefold()
 
 
 def certificate_filename(batch, plant_number, cod=None):
-    """Return a COD-led name, e.g. 0319_Acme_Mumbai_1.pdf."""
+    """Return COD, client, city/country and plant sections separated by underscores."""
     cod = str(cod if cod is not None else batch.get("cod_no") or "").strip()
     if not cod:
         raise ValueError("Assign a COD number before naming the certificate PDF.")
     raw_company = str(batch.get("supplier") or "").strip()
     raw_company = re.sub(r"^plant[\s_-]*[12](?=$|[\s_-])[\s_-]*", "", raw_company, flags=re.I)
-    company = _safe_name_part(raw_company, "Unknown Company")
-    city = _safe_name_part(batch.get("location"), "Unknown City")
+    company = _human_filename_section(raw_company, "Unknown Company")
+    city = _human_filename_section(batch.get("location"), "Unknown City")
     cod_part = _safe_cod_name(cod)
     plant_part = f"_{int(plant_number)}"
-    company_city = f"{company}_{city}"
-    available = 240 - len(cod_part) - 1 - len(plant_part)
+    available = 240 - len(cod_part) - len(plant_part) - 2 - len(city)
     if available < 1:
         raise ValueError("This COD is too long to include the company, city, and plant number in the PDF filename.")
-    company_city = company_city[:available].rstrip(" ._") or "Client"
-    return f"{cod_part}_{company_city}{plant_part}.pdf"
+    company = company[:available].rstrip(" .") or "Client"
+    return f"{cod_part}_{company}_{city}{plant_part}.pdf"
 
 
 def _read_sources(paths, sessions, report):
     batches = []
     for index, path in enumerate(paths, 1):
         source_id = f"plant{index}"
+        if sessions[index - 1] is None:
+            continue
         try:
             source_batches = list(read_batches(BytesIO(sessions[index - 1].data)))
         except Exception as exc:
             report.add({"source_id": source_id, "source_path": str(path)}, "needs_review",
-                       f"Could not read this plant workbook: {exc}", issue_code="source_unavailable")
+                       f"{path.name} could not be read: {exc}", issue_code="source_unavailable", system_alert=True)
             continue
         report.observed_sources.append(source_id)
         for batch in source_batches:
@@ -289,15 +299,30 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
             output_folder = root / "Certificates"
             template = resource(root, "templates") / "Certificate of Recycling.png"
             with ExitStack() as stack:
-                sessions = [stack.enter_context(WorkbookSession(path, backup_dir)) for path in paths]
+                sessions = []
+                for index, path in enumerate(paths, 1):
+                    try:
+                        sessions.append(stack.enter_context(WorkbookSession(path, backup_dir)))
+                    except Exception as exc:
+                        sessions.append(None)
+                        report.add({'source_id': f'plant{index}', 'source_path': str(path)}, 'needs_review',
+                                   f'{path.name} is unavailable: {exc}', issue_code='source_unavailable', system_alert=True)
                 if expected_revision is not None:
-                    require_revision(root, expected_revision, {str(session.path.resolve()): session.data for session in sessions})
+                    require_revision(root, expected_revision, {str(session.path.resolve()): session.data for session in sessions if session is not None})
                 inventory = scan_inventory(root, persist=True)
                 report.certificate_inventory = inventory
                 batches = _read_sources(paths, sessions, report)
                 if not report.scan_complete:
-                    report.add({}, "needs_review", "Both plant files must be available so COD numbers stay in one shared sequence.",
+                    report.add({}, "needs_review", "Certificate creation is paused. Connect and check both plant files in Settings, then refresh. This prevents duplicate COD numbers.",
                                issue_code="source_unavailable", system_alert=True)
+                    for batch in batches:
+                        batch['_issuance_blocked'] = True
+                        existing = find_certificate(output_folder, batch)
+                        if existing:
+                            batch.update(pdf_filename=existing.name, pdf_relative_path=existing.relative_to(output_folder).as_posix())
+                        report.add(batch, 'source_check_incomplete',
+                                   'This company was loaded. Certificate creation is paused until both plant files can be checked.',
+                                   warnings=source_value_issues(batch, as_of))
                     return report.finish()
 
                 original_form_batch = None
@@ -319,7 +344,8 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
                     if plants is not None and batch["source_id"] not in plants:
                         continue
                     if details is None and (index == 0 or batch["source_id"] != batches[index - 1]["source_id"]):
-                        sessions[int(batch["source_id"][-1]) - 1].ensure_alert_formatting(batch["source_sheet"])
+                        sessions[int(batch["source_id"][-1]) - 1].ensure_alert_formatting(
+                            batch["source_sheet"], [row for row in batches if row["source_id"] == batch["source_id"]], as_of)
 
                 next_sequence = _highest_sequence(
                     numbering_batches, settings, output_folder,
@@ -344,10 +370,10 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
                         report.add(batch, "not_applicable", "N/A — no certificate is required.")
                         continue
                     if state == "alert":
-                        report.add(batch, "needs_review", "This row is marked Alert. Review it and choose Ready, N/A, or Blank in Excel before creating a PDF.")
+                        report.add(batch, "needs_review", "This row is marked Alert. Review it and choose Ready or N/A in Excel before creating a PDF.")
                         continue
                     if state == "unknown":
-                        report.add(batch, "needs_review", f"Unknown Certificate Issued value {batch.get('issued')!r}; review it, then choose Ready, Alert, N/A, or Blank.")
+                        report.add(batch, "needs_review", f"Unknown Certificate Issued value {batch.get('issued')!r}; review it, then choose Ready, Alert or N/A, or clear the cell.")
                         continue
                     if state in {"generated", "generated_manual", "completed"}:
                         existing_pdf = find_certificate(output_folder, batch)
@@ -371,18 +397,34 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
                             report.add(batch, "needs_review", f"The PDF is missing, but Excel could not be changed to Ready: {exc}", system_alert=True)
                             continue
                     if state == "blank":
-                        detail = "Choose Ready when the certificate should be generated, N/A to skip, or leave Blank until decided."
-                        report.add(batch, "needs_review", detail)
+                        detail = "Fill the required inward details in Excel. The empty status will change to Ready when they are complete."
+                        report.add(batch, "needs_review", detail, warnings=source_value_issues(batch, as_of))
                         continue
                     if state != "ready":
-                        report.add(batch, "needs_review", "Choose Ready, N/A, or Blank in the Certificate Issued column.")
+                        report.add(batch, "needs_review", "Choose Ready or N/A, or clear the Certificate Issued cell.")
+                        continue
+
+                    if batch.get('blocking_issues'):
+                        batch['_issuance_blocked'] = True
+                        report.add(batch, 'needs_review', ' '.join(batch['blocking_issues']),
+                                   warnings=batch['blocking_issues'], system_alert=True)
                         continue
 
                     ready_count += 1
                     source_batch = batch
+                    remembered_choice = False
+                    if details is None:
+                        receipt = latest_issuance(root, 'workbook', batch['source_id'], batch['case_id'])
+                        previous = (receipt or {}).get('after', {})
+                        if isinstance(previous, dict) and previous.get('edit_scope') == 'certificate_only':
+                            # A type chosen on the first preview is retained locally, not in Excel.
+                            # Bulk recreation must use that template and its manually entered identifiers.
+                            batch = _apply_overrides(batch, {key: previous[key] for key in
+                                ('certificate_type', 'certificate_fields') if key in previous})
+                            remembered_choice = True
                     batch = _apply_overrides(batch, overrides if selected and
                                              (batch["source_id"], str(batch["case_id"])) == selected else None)
-                    issues = list(batch.get("issues", []))
+                    issues = source_value_issues(batch, as_of)
                     try:
                         kind = template_id(batch.get("certificate_type"))
                         batch["certificate_type"] = kind
@@ -393,19 +435,12 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
                     if kind in {"sita", "siemens"}:
                         issues = [issue for issue in issues if issue != "missing Form 6 number / manifest number"]
                     if kind == "siemens":
+                        if not batch["certificate_fields"].get("site_location", "").strip():
+                            batch["certificate_fields"]["site_location"] = str(batch.get("location") or "").strip()
                         for key, label in (("model_name", "model name"), ("model_serial", "model serial number"),
                                            ("tube_serial", "X-ray tube serial number"), ("site_location", "site location")):
                             if not str(batch["certificate_fields"].get(key) or "").strip():
                                 issues.append(f"Missing {label}; enter N/A if it does not apply")
-                    if batch.get("inward_date") and batch["inward_date"] > as_of:
-                        issues.append("Inward Date is in the future; correct it before generating the certificate")
-                    for key, label in (("cod_no", "COD No"), ("cod_date", "COD Date"), ("issued", "Certificate Issued")):
-                        if key in batch.get("missing_headers", []):
-                            issues.append(f"Add the {label} column to the plant workbook")
-                    if batch.get("cod_date") not in (None, "") and parse_date(batch["cod_date"]) is None:
-                        issues.append("COD Date is not a valid date; correct it or clear it to use today")
-                    if str(batch.get("cod_no") or "").startswith("="):
-                        issues.append("COD No contains a formula; enter a fixed COD or clear the cell")
                     owned_code = manual_cod or source_batch.get('cod_no')
                     allowed_paths = issuance_paths(inventory, owned_code, 'workbook', source_batch['source_id'], source_batch['case_id'])
                     owned = bool(allowed_paths)
@@ -456,9 +491,9 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
                             cod = certificate_number(next_sequence, settings)
                             safe_cod = _safe_cod_name(cod)
                         issued_date = parse_date(batch.get("cod_date")) or as_of
-                        destination = output_folder / certificate_filename(
-                            batch, int(batch["source_id"][-1]), cod,
-                        )
+                        destination = certificate_destination(
+                            root, 'workbook', certificate_filename(batch, int(batch["source_id"][-1]), cod))
+                        batch['pdf_relative_path'] = destination.relative_to(output_folder).as_posix()
                         native_template = TEMPLATE_ROOT / f"{kind}.pdf"
                         batch["_data_root"] = str(root)
                         if native_template.is_file() and (kind != "standard" or (resource(root, "templates") / "certificate-types" / "standard.pdf").is_file()):
@@ -478,8 +513,7 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
                                        warnings=list(dict.fromkeys(issues)))
                             continue
 
-                        output_folder.mkdir(parents=True, exist_ok=True)
-                        temporary = output_folder / f".{safe_cod}.{uuid.uuid4().hex}.tmp.pdf"
+                        temporary = root / "Data" / "Previews" / f".{safe_cod}.{uuid.uuid4().hex}.tmp.pdf"
                         transaction = None
                         workbook_committed = False
                         history_pending = False
@@ -496,7 +530,8 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
                                 root, destination, temporary, session.path, session.data,
                                 source_kind='workbook', plant=batch['source_id'], key=batch['case_id'],
                                 cod=cod, issued_date=issued_date, before=original_form_batch or source_batch,
-                                after=dict(batch, cod_no=cod, cod_date=issued_date, edit_scope='update_excel' if update_excel else 'certificate_only'),
+                                after=dict(batch, cod_no=cod, cod_date=issued_date,
+                                           edit_scope='certificate_only' if remembered_choice or not update_excel else 'update_excel'),
                                 warnings=list(dict.fromkeys(issues)), override_reason=override_reason,
                                 old_paths=[root / path for path in old_paths], template_path=active_template)
                             transaction.publish()

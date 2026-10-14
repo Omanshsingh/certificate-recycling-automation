@@ -37,7 +37,7 @@ def reminder_time_from_picker(hour, minute, period):
 
 
 class App:
-    FILTERS = ("All rows", "Alerts due (day 25+)", "Ready", "Alert", "Generated", "Generated Manual", "Completed", "Blank", "N/A")
+    FILTERS = ("All rows", "Alerts due (day 25+)", "Ready", "Alert", "Generated", "Generated Manual", "Completed", "No status selected", "N/A")
 
     def __init__(self, root, base=None):
         self.root = root
@@ -375,6 +375,8 @@ class App:
 
     def _status_label(self, row):
         state = status_value(row.get("certificate_status"))
+        if state == "blank":
+            return ""
         if state in {"ready", "alert", "blank", "unknown"} and (
                 row.get("outcome") == "needs_review" or row.get("system_alert")):
             return "Alert"
@@ -385,7 +387,7 @@ class App:
             "generated_manual": "Generated Manual",
             "completed": "Completed",
             "na": "N/A",
-            "blank": "Blank",
+            "blank": "",
             "unknown": "Alert",
         }.get(state, row.get("outcome", "Alert").replace("_", " ").title())
 
@@ -399,7 +401,7 @@ class App:
             return bool(row.get("outcome") == "needs_review" or row.get("system_alert")
                         or state in {"alert", "unknown", "blank"})
         expected = {"Ready": "ready", "Generated": "generated", "Generated Manual": "generated_manual",
-                    "Completed": "completed", "Blank": "blank", "N/A": "na"}.get(selected_filter)
+                    "Completed": "completed", "No status selected": "blank", "N/A": "na"}.get(selected_filter)
         return state == expected
 
     def show_results(self):
@@ -541,6 +543,8 @@ class App:
 
 
 if __name__ == "__main__":
+    from certificate_inventory import ensure_certificate_folders
+    ensure_certificate_folders(DATA_ROOT)
     app_root = tk.Tk()
     App(app_root)
     app_root.mainloop()

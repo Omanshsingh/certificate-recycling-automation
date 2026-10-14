@@ -60,8 +60,11 @@ def reviewed_operation(root, endpoint, payload, action):
     token = review_token(endpoint, payload, revision, result.get('warnings', []))
     if payload.get('confirmed') and isinstance(payload.get('review_token'), str) and hmac.compare_digest(payload['review_token'], token):
         reason = str(payload.get('override_reason') or '').strip()
-        if not reason or len(reason) > 2000:
-            raise ValueError('Enter a short reason for accepting these warnings (up to 2,000 characters).')
-        return action(dict(payload, expected_revision=revision))
+        if len(reason) > 2000:
+            raise ValueError('The warning confirmation note must be 2,000 characters or fewer.')
+        # The reviewed token proves which details and warnings were accepted.
+        # Retain notes from older clients, without requiring the user to type one.
+        return action(dict(payload, expected_revision=revision,
+                           override_reason=reason or 'Warnings reviewed; user chose Continue anyway.'))
     result.update(review_token=token, workspace_revision=revision)
     return result

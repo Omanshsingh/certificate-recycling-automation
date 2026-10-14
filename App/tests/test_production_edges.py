@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from openpyxl import load_workbook
 from reportlab.pdfgen.canvas import Canvas
+from certificate_core import read_batches
 
 import certificate_drafts as drafts
 import issuance_safety as safety
@@ -152,7 +153,7 @@ class ProductionEdgeTests(unittest.TestCase):
         self.assertTrue((self.root / tx.data["pdf_path"]).exists())
 
     def test_form_creation_still_reports_success_when_postcommit_refresh_fails(self):
-        body = dict(plant="plant1", details=self.details(), edit_scope="update_excel")
+        body = dict(plant="plant1", details=web_app.editor_details(read_batches(self.paths[0])[0]), edit_scope="update_excel")
         with patch.object(web_app, "refresh", side_effect=OSError("Excel reopened after commit")):
             try:
                 response = web_app.create_certificate(body)
@@ -186,7 +187,7 @@ class ProductionEdgeTests(unittest.TestCase):
         finally:
             first.close()
             second.close()
-        pdfs = list((self.root / "Certificates").glob("*.pdf"))
+        pdfs = list((self.root / "Certificates").rglob("*.pdf"))
         self.assertEqual(len(pdfs), 1)
         self.assertTrue(pdfs[0].name.endswith("_2.pdf"))
 
@@ -242,7 +243,7 @@ class ProductionEdgeTests(unittest.TestCase):
         self.assertEqual(responses[0][1]["created"], 1)
 
     def test_finalsuccess_metadata_uses_pending_current_receipt_when_completion_fails(self):
-        body = dict(plant="plant1", details=self.details(), edit_scope="update_excel")
+        body = dict(plant="plant1", details=web_app.editor_details(read_batches(self.paths[0])[0]), edit_scope="update_excel")
         with patch.object(safety.IssuanceTransaction, "complete", side_effect=OSError("history disk unavailable")), \
                 patch.object(web_app, "refresh", return_value={"rows": []}):
             response = web_app.create_certificate(body)
@@ -322,6 +323,7 @@ class ProductionEdgeTests(unittest.TestCase):
         responses = []
         lock = threading.RLock()
         active = object.__new__(web_app.Handler)
+        active.path = '/api/generate'
         def active_operation():
             entered.set()
             if not release.wait(2):
@@ -363,6 +365,7 @@ class ProductionEdgeTests(unittest.TestCase):
             self.assertFalse(errors, errors)
             self.assertTrue(stopped.wait(1))
             later = object.__new__(web_app.Handler)
+            later.path = '/api/generate'
             later.send_error_json = lambda message, status=400: responses.append((status, {"error": message}))
             later._do_post = lambda: self.fail("A write started after stop")
             later.do_POST()

@@ -11,11 +11,13 @@ import traceback
 
 from app_paths import DATA_ROOT
 from workflow_support import (
+    alert_workbook_targets,
     cancel_snoozed_reminder,
+    dismiss_reminders_today,
     launch_review_app,
     load_settings,
     notify_once,
-    open_alert_workbook,
+    open_alert_workbooks,
     schedule_one_hour_reminder,
     show_centered_reminder,
 )
@@ -52,12 +54,17 @@ def main(root=None, reminder_only=False):
             raise last_error or RuntimeError("The plant check could not be completed.")
 
         def present(title, message):
+            targets = alert_workbook_targets(result, paths)
+            def review():
+                cancel_snoozed_reminder(root)
+                launch_review_app(root)
             return show_centered_reminder(
                 title, message,
                 on_snooze=lambda: schedule_one_hour_reminder(root),
-                on_dismiss=lambda: cancel_snoozed_reminder(root, force=True),
-                on_open_workbook=lambda: open_alert_workbook(result),
-                on_open_automation=lambda: launch_review_app(root),
+                on_dismiss=lambda: dismiss_reminders_today(root),
+                on_open_automation=review,
+                on_open_workbook=lambda: open_alert_workbooks(result, paths),
+                workbook_plants=[plant for plant, _ in targets],
             )
 
         displayed = notify_once(

@@ -155,13 +155,20 @@ class SafetyTests(unittest.TestCase):
         self.assertTrue(reviewed_operation(self.root, '/api/create', changed, action)['requires_confirmation'])
         self.assertFalse(calls[-1]['confirmed'])
 
-    def test_bare_confirmation_and_missing_reason_cannot_bypass_review(self):
-        action = lambda x: {'requires_confirmation': True, 'warnings':['Missing weight']}
+    def test_bare_confirmation_cannot_bypass_review_but_reviewed_acceptance_needs_no_reason(self):
+        calls = []
+        def action(values):
+            calls.append(values)
+            return {'created': 1} if values.get('confirmed') else {'requires_confirmation': True, 'warnings':['Missing weight']}
         payload = {'expected_revision':workspace_revision(self.root), 'confirmed':True}
         review = reviewed_operation(self.root, '/api/create', payload, action)
         self.assertTrue(review['requires_confirmation'])
-        with self.assertRaisesRegex(ValueError, 'reason'):
-            reviewed_operation(self.root, '/api/create', dict(payload, review_token=review['review_token']), action)
+        self.assertFalse(calls[-1]['confirmed'])
+        confirmed = dict(payload, review_token=review['review_token'])
+        self.assertEqual(reviewed_operation(self.root, '/api/create', confirmed, action)['created'], 1)
+        self.assertEqual(calls[-1]['override_reason'], 'Warnings reviewed; user chose Continue anyway.')
+        with self.assertRaisesRegex(ValueError, '2,000'):
+            reviewed_operation(self.root, '/api/create', dict(confirmed, override_reason='x' * 2001), action)
 
 
 if __name__ == '__main__':
