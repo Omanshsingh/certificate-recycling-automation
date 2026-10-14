@@ -2989,6 +2989,23 @@ function wire() {
     } catch (error) { toast(error.message, true); }
     finally { setBusy(false); }
   }));
+  document.querySelectorAll('[data-create-setting]').forEach(button => button.addEventListener('click', async () => {
+    const plant = button.dataset.createSetting;
+    const label = labelPlant(plant);
+    setBusy(true, `Create a ${label} workbook…`, 'Choose where to save the new Excel template.');
+    try {
+      const result = await api('/api/create-plant-workbook', { plant });
+      if (result.cancelled) return;
+      const input = $('#settings-form').elements.namedItem(`${plant}_path`);
+      input.value = result.path;
+      updateSettingsFiles();
+      $('#settings-status').textContent = `${label} template created. Click Save to connect it.`;
+      toast(`${label} template created. Click Save in Settings to connect it.`);
+    } catch (error) {
+      $('#settings-status').textContent = error.message;
+      toast(error.message, true);
+    } finally { setBusy(false); }
+  }));
   const closeDialog = dialog => {
     if (dialog.id === 'add-client-modal' && app.clientBusy) return;
     if (dialog.id === 'details-modal') requestDetailsClose();

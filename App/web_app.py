@@ -34,6 +34,7 @@ from workspace_review import workspace_revision, require_revision, reviewed_oper
 from backup_service import create_backup, list_backups, restore_backup
 from dashboard_review import DashboardReview
 from client_intake import intake_details, stage_new_client
+from plant_workbook_template import create_plant_workbook
 
 
 ROOT = Path(DATA_ROOT).resolve()
@@ -987,6 +988,42 @@ class Handler(BaseHTTPRequestHandler):
                 if not plant and not body.get("for_settings"):
                     raise ValueError("That workbook is not configured yet. Add its path in Settings first.")
                 self.send_json({"path": str(picked_path), "plant": plant})
+            elif parsed.path == "/api/create-plant-workbook":
+                plant = body.get("plant")
+                if plant not in {"plant1", "plant2"}:
+                    raise ValueError("Choose Plant 1 or Plant 2.")
+                plant_label = "Plant 1" if plant == "plant1" else "Plant 2"
+                import tkinter as tk
+                from tkinter import filedialog
+
+                settings = load_settings(ROOT)
+                configured_path = settings["workbook_paths"][int(plant[-1]) - 1]
+                current = Path(configured_path).expanduser() if configured_path else None
+                initial_dir = (current.parent if current and current.parent.is_dir()
+                               else ROOT / "Plant Workbooks" if (ROOT / "Plant Workbooks").is_dir()
+                               else Path.home() / "Documents")
+                if not initial_dir.is_dir():
+                    initial_dir = Path.home()
+                picker_root = tk.Tk()
+                picker_root.withdraw()
+                try:
+                    picker_root.attributes("-topmost", True)
+                    picked = filedialog.asksaveasfilename(
+                        parent=picker_root,
+                        title=f"Create a new {plant_label} workbook",
+                        initialdir=str(initial_dir),
+                        initialfile=f"{plant_label}.xlsx",
+                        defaultextension=".xlsx",
+                        filetypes=(("Excel workbook", "*.xlsx"),),
+                    )
+                finally:
+                    picker_root.destroy()
+                if not picked:
+                    self.send_json({"cancelled": True})
+                    return
+                destination = create_plant_workbook(picked, plant)
+                self.send_json({"path": str(destination), "plant": plant,
+                                "message": "New workbook created. Click Save in Settings to connect it."})
             elif parsed.path == "/api/settings":
                 settings = load_settings(ROOT)
                 paths = body.get("workbook_paths", settings["workbook_paths"])

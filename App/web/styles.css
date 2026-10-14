@@ -820,7 +820,9 @@ th:last-child { width: 30%; }
 .workbook-choice > div { display: grid; gap: 3px; min-width: 0; }
 .workbook-choice strong { font-size: 14px; }
 .workbook-choice span { color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+.workbook-choice-actions { display: flex; align-items: center; flex-wrap: wrap; justify-content: flex-end; gap: 8px; flex-shrink: 0; }
 .workbook-choice .button { flex-shrink: 0; }
+.settings-help { color: var(--muted); font-size: 13px; margin: 4px 0 0; }
 .settings-paths { font-size: 13px; color: var(--muted); }
 .settings-paths summary, .backup-section > summary { cursor: pointer; min-height: 36px; padding: 8px 0; }
 .settings-paths .field { margin-top: 12px; }

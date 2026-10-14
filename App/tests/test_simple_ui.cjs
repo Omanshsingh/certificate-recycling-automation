@@ -1041,6 +1041,15 @@ test('left navigation is removed and Settings stays visible in the main top bar'
   assert.ok(h.requests.some(request => request.endpoint === '/api/backup/list'));
 });
 
+test('Settings can create a new Plant workbook template without silently connecting it', () => {
+  const html = fs.readFileSync(path.join(__dirname,'../web/index.html'),'utf8');
+  const app = fs.readFileSync(path.join(__dirname,'../web/app.js'),'utf8');
+  assert.equal((html.match(/data-create-setting="plant[12]"/g)||[]).length,2);
+  assert.match(html,/Create a ready-to-use blank workbook/);
+  assert.match(app,/api\/create-plant-workbook/);
+  assert.match(app,/Click Save to connect it/);
+});
+
 test('Home uses one status filter bar with counts beside the company list', () => {
   const html = fs.readFileSync(path.join(__dirname,'../web/index.html'),'utf8');
   assert.match(html,/<div class="quick-views" id="status-filters" aria-label="Status filters">/);
