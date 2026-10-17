@@ -30,6 +30,14 @@ def norm(value):
     return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
 
 
+NO_CERTIFICATE_SUPPLIERS = {"reverseecommercepvtltdbookmyjunk"}
+
+
+def supplier_is_always_not_applicable(value):
+    """Known inward supplier that never requires a recycling certificate."""
+    return norm(value) in NO_CERTIFICATE_SUPPLIERS
+
+
 def parse_date(value):
     if isinstance(value, datetime):
         return value.date()
@@ -83,20 +91,24 @@ def material_items(details):
         raw_weight = text(raw.get("weight"))
         if not any((item, raw_quantity, raw_per_piece, raw_weight)):
             continue
-        quantity = number(raw_quantity)
+        numeric_quantity = number(raw_quantity)
+        # Text quantities such as "1 lot" are valid labels when the line's
+        # total weight is entered directly. Only numeric quantities can be
+        # multiplied by a per-piece weight.
+        quantity = numeric_quantity if numeric_quantity is not None else raw_quantity or None
         per_piece_weight = number(raw_per_piece)
         weight = number(raw_weight)
-        for label, raw_value, parsed in (("quantity", raw_quantity, quantity),
+        for label, raw_value, parsed in (("quantity", raw_quantity, numeric_quantity),
                                          ("per-piece weight", raw_per_piece, per_piece_weight),
                                          ("weight", raw_weight, weight)):
-            if raw_value and parsed is None:
+            if label != "quantity" and raw_value and parsed is None:
                 issues.append(f"material {index} has an invalid {label}")
             elif parsed is not None and parsed < 0:
                 issues.append(f"material {index} has a negative {label}")
         if not item:
             issues.append(f"material {index} is missing its description")
-        if not raw_weight and quantity is not None and per_piece_weight is not None:
-            weight = quantity * per_piece_weight
+        if not raw_weight and numeric_quantity is not None and per_piece_weight is not None:
+            weight = numeric_quantity * per_piece_weight
         if weight is None:
             issues.append(f"material {index} weight is missing or cannot be calculated")
         items.append({"item": item, "quantity": quantity, "per_piece_weight": per_piece_weight, "weight": weight})
@@ -117,7 +129,7 @@ def text(value):
 
 
 ALIASES = {
-    "sn": {"sn", "sno", "serialno", "serialnumber", "batchnumber", "inwardnumber", "inwardno", "inwardid"},
+    "sn": {"sn", "sno", "sr", "srno", "srnumber", "serialno", "serialnumber", "batchnumber", "inwardnumber", "inwardno", "inwardid"},
     "inward_date": {"inwarddate", "dateofmaterialreceipt", "materialreceiptdate", "receiveddate", "receiptdate"},
     "supplier": {"suppliername", "supplier", "clientname", "client", "companyname", "company", "customer", "customername"},
     "location": {"location", "city", "sitelocation", "siteaddress", "clientlocation", "clientcity"},
@@ -141,6 +153,10 @@ ALIASES = {
     "issued": {"certificateissued", "certificatestatus", "codstatus", "status"},
     "certificate_type": {"certificatetype", "codtype", "certificatetemplate"},
     "certificate_fields": {"certificatefields", "certificatedetails"},
+    "comments": {"comments", "comment", "remarks", "remark"},
+    "transporter_details": {"transportervehicledetails", "transporterdetails"},
+    "docket_vehicle_no": {"docketnovehicleno", "docketnumbervehiclenumber"},
+    "weight_slip_scale": {"weightslipweightscale", "weightslipscaleweight"},
 }
 
 
@@ -151,7 +167,8 @@ def columns(headers):
         matches = [i for i, heading in enumerate(normalized) if heading in choices]
         if len(matches) > 1:
             labels = ", ".join(get_column_letter(i + 1) for i in matches)
-            raise ValueError(f"Ambiguous duplicate headings for {key} in columns {labels}; keep one authoritative column.")
+            label = 'Serial Number' if key == 'sn' else key
+            raise ValueError(f"Ambiguous duplicate headings for {label} in columns {labels}; keep one authoritative column.")
         if matches:
             found[key] = matches[0]
     return found
@@ -205,16 +222,17 @@ def select_register(workbook):
         raise ValueError(f'More than one inward register was found: {names}. Keep one current register in this workbook; archive the others separately. No rows were combined.')
     if candidates:
         raise ValueError(f'The inward register "{candidates[0][0].title}" is hidden. Unhide the current register in Excel, then refresh.')
-    raise ValueError('No inward register found. Put Inward ID / SN, Company / Supplier and Inward Date headings within the first 20 rows, then refresh.')
+    raise ValueError('No inward register found. Put Serial Number, Company / Supplier and Inward Date headings within the first 20 rows, then refresh.')
 
 
 def source_value_issues(batch, as_of=None, certificate_type=None):
-    """One validation policy for automatic Ready, preview and final generation."""
+    """One validation policy for automatic Ready, preview and final generation.
+
+    Form 6 is requested when a certificate is created, not when an inward is
+    added. Missing values are checked by the certificate issuance workflow.
+    """
     as_of = as_of or date.today()
-    kind = certificate_type or batch.get('certificate_type')
     issues = list(batch.get('issues', []))
-    if kind in {'sita', 'siemens'}:
-        issues = [issue for issue in issues if issue != 'missing Form 6 number / manifest number']
     received = batch.get('inward_date')
     if received and received > as_of:
         issues.append('Inward Date is in the future; correct it before generating the certificate')
@@ -233,7 +251,7 @@ def source_value_issues(batch, as_of=None, certificate_type=None):
 
 
 def read_batches(path):
-    from workbook_metadata import read_details, detail_key
+    from workbook_metadata import read_details, lookup_details
     saved_details = read_details(path)
     workbook = load_workbook(path, data_only=False, read_only=False)
     try:
@@ -257,11 +275,10 @@ def read_batches(path):
             if re.match(r'^(?:reference|refno|refnumber|site|location|city|manifest|form6|certificateweight|netweight)', norm(heading)):
                 if any(text(row[index]) for row in rows[1:]):
                     header_issues.append(f'Column {get_column_letter(index + 1)} "{text(heading)}" has data but is not recognised. Rename its heading to Reference No, Location, Form 6 No or Certificate Weight as appropriate.')
-        cod_formats = {}
-        if "cod_no" in header_columns:
-            cod_column = header_columns["cod_no"] + 1
-            cod_formats = {row_number: sheet.cell(row_number, cod_column).number_format
-                           for row_number in range(header_row + 1, sheet.max_row + 1)}
+        identity_formats = {
+            key: {row_number: sheet.cell(row_number, header_columns[key] + 1).number_format
+                  for row_number in range(header_row + 1, sheet.max_row + 1)}
+            for key in ('sn', 'cod_no') if key in header_columns}
     finally:
         workbook.close()
     if not rows:
@@ -275,8 +292,8 @@ def read_batches(path):
         raise ValueError("Missing required workbook columns: " + ", ".join(missing))
 
     def read_cell_text(key, value, excel_row):
-        if key == "cod_no" and isinstance(value, (int, float)) and not isinstance(value, bool):
-            number_format = cod_formats.get(excel_row, "")
+        if key in {'sn', 'cod_no'} and isinstance(value, (int, float)) and not isinstance(value, bool):
+            number_format = identity_formats.get(key, {}).get(excel_row, "")
             if re.fullmatch(r"0+", number_format) and float(value).is_integer():
                 return f"{int(value):0{len(number_format)}d}"
         return text(value)
@@ -285,14 +302,19 @@ def read_batches(path):
     current = None
     summary_labels = {'total', 'subtotal', 'grandtotal', 'totalweight', 'totalweightkg', 'totalweightinkg'}
     for excel_row, raw in enumerate(rows[1:], header_row + 1):
-        case_id = text(raw[cols["sn"]])
+        case_id = read_cell_text('sn', raw[cols['sn']], excel_row)
         item_label = text(raw[cols['item']])
         # Notes with no certificate/material data are not new company records.
         if re.match(r'^(?:note|notes|remark|remarks)\s*:', case_id, re.I) and not any(
                 text(raw[index]) for key, index in cols.items() if key != 'sn'):
             continue
         summary_label = item_label if norm(item_label) in summary_labels else case_id if norm(case_id) in summary_labels else ''
-        if summary_label:
+        # A client can legitimately use Total as a Serial Number or material
+        # description. Company/date facts distinguish a new inward from a
+        # summary following the preceding inward's assets.
+        starts_primary = bool(case_id) and any(
+            text(raw[cols[key]]) for key in ('supplier', 'inward_date') if key in cols)
+        if summary_label and not starts_primary:
             if current is None:
                 raise ValueError(f'Row {excel_row} is a total without an inward. Place totals after their material rows.')
             raw_total = raw[cols['weight']] if 'weight' in cols else None
@@ -318,7 +340,13 @@ def read_batches(path):
                 current['blocking_issues'].append(issue)
             continue
         if case_id:
-            saved = saved_details.get(detail_key(sheet_name, case_id), {})
+            saved_issues = []
+            try:
+                saved = lookup_details(saved_details, sheet_name, case_id,
+                                       legacy_case_ids=(text(raw[cols['sn']]),))
+            except ValueError as exc:
+                saved = {}
+                saved_issues.append(str(exc))
             current = {
                 "case_id": case_id,
                 "source_row": excel_row,
@@ -334,19 +362,20 @@ def read_batches(path):
                 "certificate_fields": {} if 'certificate_fields' in cols else saved.get('certificate_fields', {}),
                 "cod_no": read_cell_text("cod_no", raw[cols["cod_no"]], excel_row) if "cod_no" in cols else "",
                 "cod_date": (excel_date(raw[cols['cod_date']], epoch, parse_date) or raw[cols['cod_date']]) if 'cod_date' in cols else None,
-                "issued": text(raw[cols["issued"]]) if "issued" in cols else "",
+                "issued": ("N/A" if supplier_is_always_not_applicable(raw[cols["supplier"]])
+                           else text(raw[cols["issued"]]) if "issued" in cols else ""),
                 "source_sheet": sheet_name,
                 "source_header_row": header_row,
                 "column_mapping": mapping,
                 "summary_rows": [],
                 'summary_records': [],
                 "import_notes": [],
-                "blocking_issues": list(header_issues),
+                "blocking_issues": [*header_issues, *saved_issues],
                 # Reference No. is optional; only certificate output columns
                 # are reported here as missing headers.
                 "missing_headers": [key for key in ("issued", "cod_no", "cod_date") if key not in cols],
                 "items": [],
-                "issues": list(header_issues),
+                "issues": [*header_issues, *saved_issues],
             }
             from certificate_templates import template_id
             try:
@@ -364,7 +393,7 @@ def read_batches(path):
             batches.append(current)
         if current is None:
             if any(text(raw[index]) for index in cols.values()):
-                raise ValueError(f"Row {excel_row} has data but no preceding SN; correct this orphan row before issuing.")
+                raise ValueError(f"Row {excel_row} has data but no preceding Serial Number; enter its Serial Number or place it under the correct inward before issuing.")
             continue
         if not case_id:
             for key in ("inward_date", "supplier", "location", "form6", "reference", "cod_no", "cod_date", "issued"):
@@ -373,13 +402,14 @@ def read_batches(path):
                 actual = raw[cols[key]]
                 expected = current[key]
                 if key in {"inward_date", "cod_date"}:
-                    same = parse_date(actual) is not None and parse_date(actual) == parse_date(expected)
+                    actual_date = excel_date(actual, epoch, parse_date)
+                    same = actual_date is not None and actual_date == excel_date(expected, epoch, parse_date)
                 else:
                     same = read_cell_text(key, actual, excel_row) == text(expected)
                 if not same:
                     if key == "cod_no":
-                        raise ValueError(f"COD No on continuation row {excel_row} differs from its batch; correct the missing SN or misplaced COD before assigning new numbers.")
-                    current["issues"].append(f"conflicting {key} on continuation row {excel_row}; check the missing SN")
+                        raise ValueError(f"COD No on continuation row {excel_row} differs from its inward; correct the missing Serial Number or misplaced COD before assigning new numbers.")
+                    current["issues"].append(f"conflicting {key} on continuation row {excel_row}; check the missing Serial Number")
         for key in ("sn", "inward_date", "supplier", "location", "form6", "reference", "issued"):
             if key in cols and text(raw[cols[key]]).startswith("="):
                 current["issues"].append(f"formula in {key} on row {excel_row}; enter a confirmed value")
@@ -408,10 +438,14 @@ def read_batches(path):
             if not has_material_values:
                 continue
             current["issues"].append(f"missing item description on row {excel_row}")
-        qty = quantity_number(raw[cols["quantity"]], number) if "quantity" in cols else None
+        raw_quantity = raw[cols["quantity"]] if "quantity" in cols else None
+        quantity_is_numeric = number(raw_quantity) is not None
+        # Text quantities such as "1 lot" are meaningful worksheet inputs,
+        # not numeric amounts to multiply. Preserve them as written.
+        qty = (number(raw_quantity) if quantity_is_numeric else text(raw_quantity) or None) if "quantity" in cols else None
         per = weight_number(raw[cols["per_piece_weight"]], number) if "per_piece_weight" in cols else None
         for key, parsed in (("quantity", qty), ("per_piece_weight", per)):
-            if key in cols and text(raw[cols[key]]) and (parsed is None or parsed < 0):
+            if key in cols and text(raw[cols[key]]) and (parsed is None or isinstance(parsed, (int, float)) and parsed < 0):
                 current["issues"].append(f"invalid or negative {key} on row {excel_row}")
         raw_weight = raw[cols["weight"]] if "weight" in cols else None
         weight = weight_number(raw_weight, number)
@@ -422,20 +456,20 @@ def read_batches(path):
             weight = formula_number(text(raw_weight), references)
             may_calculate = False
         if may_calculate:
-            weight = qty * per if qty is not None and per is not None else None
+            weight = qty * per if quantity_is_numeric and qty is not None and per is not None else None
         elif weight is None:
             current["issues"].append(f"invalid weight or unsupported weight formula on row {excel_row}; enter a confirmed weight in kg, or use same-row quantity/per-piece arithmetic, SUM or ROUND. External and other-row formulas are not read.")
         current["items"].append({"item": item, "quantity": qty, "per_piece_weight": per, "weight": weight})
 
-    case_id_counts = Counter(batch["case_id"] for batch in batches)
+    serial_rows = {}
+    for batch in batches:
+        serial_rows.setdefault(batch['case_id'].strip().casefold(), []).append(batch['source_row'])
     form6_counts = Counter(batch["form6"] for batch in batches if batch["form6"])
     for batch in batches:
         if not batch["inward_date"]:
             batch["issues"].append("missing inward date")
         if not batch["supplier"]:
             batch["issues"].append("missing supplier name")
-        if not batch["form6"]:
-            batch["issues"].append("missing Form 6 number / manifest number")
         if not batch["items"]:
             batch["issues"].append("no item rows")
         if any(item["weight"] is None for item in batch["items"]):
@@ -461,8 +495,15 @@ def read_batches(path):
             # after explicitly accepting that consequence.
             batch["display_weight"] = batch["total_weight"]
             batch["weight_source"] = "inward"
-        if case_id_counts[batch["case_id"]] > 1:
-            batch["issues"].append("SN is repeated on more than one batch in this plant workbook")
+        duplicate_rows = serial_rows[batch['case_id'].strip().casefold()]
+        if len(duplicate_rows) > 1:
+            rows_label = ', '.join(str(row) for row in duplicate_rows)
+            issue = (f'Serial Number "{batch["case_id"]}" is repeated in sheet "{sheet_name}", '
+                     f'rows {rows_label}. Open Excel and give each inward a different Serial Number, '
+                     'then save and refresh before creating a certificate.')
+            batch['duplicate_serial_number'] = True
+            batch['issues'].append(issue)
+            batch['blocking_issues'].append(issue)
         if batch["form6"] and form6_counts[batch["form6"]] > 1:
             batch["issues"].append("Form 6 number is repeated on more than one batch in this plant workbook")
     return batches

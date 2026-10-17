@@ -10,6 +10,7 @@ import time
 import traceback
 
 from app_paths import DATA_ROOT
+from workbook_store import LockBusyError
 from workflow_support import (
     alert_workbook_targets,
     cancel_snoozed_reminder,
@@ -35,6 +36,8 @@ def main(root=None, reminder_only=False):
             # it must never make a morning login show the alert early.
             return 0
         paths = settings.get("workbook_paths", ["", ""])
+        if not any(str(value).strip() for value in paths):
+            return 0
         if len(paths) != 2 or not all(paths):
             raise ValueError("Open the certificate app and save both plant workbooks in Settings.")
         from run_certificates import run
@@ -42,11 +45,12 @@ def main(root=None, reminder_only=False):
         last_error = None
         for attempt in range(3):
             try:
-                _, _, folder = run(paths, root, check_only=True, progress=lambda _: None)
-                result = json.loads((folder / "Latest Results.json").read_text(encoding="utf-8"))
+                snapshot = {}
+                run(paths, root, check_only=True, progress=lambda _: None, report_sink=snapshot)
+                result = snapshot
                 break
-            except RuntimeError as exc:
-                if "already running" not in str(exc).casefold() or attempt == 2:
+            except (LockBusyError, RuntimeError) as exc:
+                if (not isinstance(exc, LockBusyError) and "already running" not in str(exc).casefold()) or attempt == 2:
                     last_error = exc
                     break
                 time.sleep(2)

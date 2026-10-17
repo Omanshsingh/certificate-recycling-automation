@@ -52,7 +52,7 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(self.source.read_bytes(), original)
         self.assertTrue(messages)
         self.assertEqual(audit_records(self.root)[0]['state'], 'rolled_back')
-        self.assertEqual(len(list((self.root / 'Data' / 'Archive' / 'Uncommitted Certificates').glob('*.pdf'))), 1)
+        self.assertEqual(len(list((self.root / 'Data' / 'Archive' / 'Uncommitted Certificates').rglob('*.pdf'))), 1)
         self.assertEqual(recover_issuances(self.root), [])
 
     def test_interruption_after_source_commit_finishes_and_archives_old_pdf(self):

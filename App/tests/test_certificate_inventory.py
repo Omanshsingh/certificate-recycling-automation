@@ -337,16 +337,40 @@ class InventoryWorkflowTests(TemporaryInventoryTest):
         return json.loads((self.root / "Data" / "Reports" / "Latest Results.json").read_text(encoding="utf-8"))
 
     def test_manual_automatic_number_reserves_printed_cod_from_external_named_pdf(self):
-        external_pdf(self.folder / "external-document.pdf", cod="0319", reference="EXT-REF", layout=True)
+        external_pdf(self.folder / "Manually Added" / "external-document.pdf", cod="0319", reference="EXT-REF", layout=True)
         response = self.generate_manual()
         self.assertEqual((response["created"], response["certificate_no"]), (1, "0320"))
 
     def test_workbook_automatic_number_reserves_printed_cod_from_external_pdf(self):
-        external_pdf(self.folder / "external-document.pdf", cod="0319", reference="EXT-REF")
+        external_pdf(self.folder / "Manually Added" / "external-document.pdf", cod="0319", reference="EXT-REF")
         register(self.paths[0], case_id="NEW-EXCEL")
         created, review, _ = run(self.paths, self.root, as_of=AS_OF, progress=lambda _: None)
         self.assertEqual((created, review), (1, 0))
         self.assertEqual(read_batches(self.paths[0])[0]["cod_no"], "0320")
+
+    def test_manual_cod_and_date_inputs_are_ignored_and_values_are_assigned_from_history(self):
+        external_pdf(self.folder / "Manually Added" / "0319_External.pdf", cod="0319")
+        response = drafts.generate_draft(self.root, plant="plant1",
+            details=self.details(cod_no="0999", cod_date="2020-01-01"), as_of=AS_OF)
+        self.assertEqual((response["certificate_no"], drafts.read_register(self.root)["records"][0]["details"]["cod_date"]),
+                         ("0320", AS_OF.isoformat()))
+
+    def test_pdf_without_identifiable_cod_blocks_generation_with_a_clear_recovery_path(self):
+        from pypdf import PdfWriter
+        unknown = self.folder / "Manually Added" / "unknown-scan.pdf"
+        unknown.parent.mkdir(parents=True, exist_ok=True)
+        writer = PdfWriter(); writer.add_blank_page(width=300, height=400)
+        with unknown.open("wb") as stream:
+            writer.write(stream)
+        register(self.paths[0], case_id="NEW-EXCEL")
+        created, _, _ = run(self.paths, self.root, as_of=AS_OF, progress=lambda _: None)
+        self.assertEqual(created, 0)
+        row = next(row for row in self.results()["rows"] if row.get("sn") == "NEW-EXCEL")
+        self.assertTrue(row["issuance_blocked"])
+        self.assertIn("rename the PDF", row["detail"])
+        self.assertIn("outside the Certificates folder", row["detail"])
+        with self.assertRaisesRegex(ValueError, "rename the PDF"):
+            self.generate_manual()
 
     def test_manual_external_duplicate_requires_confirmation_and_never_overwrites(self):
         external = external_pdf(self.folder / "0319_Independent_Client_Ltd_Pune_1.pdf",
@@ -354,10 +378,6 @@ class InventoryWorkflowTests(TemporaryInventoryTest):
         original = external.read_bytes()
         details = self.details(cod_no="0319")
         response = drafts.generate_draft(self.root, plant="plant1", details=details, as_of=AS_OF)
-        self.assertEqual(response["created"], 0)
-        self.assertTrue(response["requires_confirmation"])
-        self.assertEqual(external.read_bytes(), original)
-        response = drafts.generate_draft(self.root, plant="plant1", details=details, confirmed=True, as_of=AS_OF)
         self.assertEqual((response["created"], response["certificate_no"]), (1, "0320"))
         self.assertEqual(external.read_bytes(), original)
         self.assertNotEqual(response["filename"], external.name)
@@ -377,7 +397,7 @@ class InventoryWorkflowTests(TemporaryInventoryTest):
         self.assertEqual(read_batches(self.paths[0])[0]["cod_no"], "0320")
         self.assertEqual(external.read_bytes(), original)
 
-    def test_create_api_upsert_cannot_adopt_foreign_pdf_with_same_typed_cod_and_filename(self):
+    def test_create_api_rejects_user_entered_cod_even_when_a_foreign_pdf_matches(self):
         external = external_pdf(self.folder / "0319_Independent_Client_Ltd_Pune_1.pdf",
                                 cod="0319", reference="EXT-REF")
         original = external.read_bytes()
@@ -391,7 +411,7 @@ class InventoryWorkflowTests(TemporaryInventoryTest):
                                'expected_revision': workspace_revision(self.root),
                                'review_token': response.get('review_token') if confirmed else None,
                                'override_reason': 'Manager approved replacement COD' if confirmed else '',
-                               "details": self.details(case_id="API-NEW", cod_no="0319", item="Servers",
+                               "details": self.details(case_id="API-NEW", cod_no="0319", form6="FORM-API-NEW", item="Servers",
                                                        quantity="2", per_piece_weight="5", weight="10")}).encode()
             handler = object.__new__(web_app.Handler)
             handler.path = "/api/create"
@@ -401,38 +421,32 @@ class InventoryWorkflowTests(TemporaryInventoryTest):
                     patch.object(handler, "send_json") as sent, \
                     patch.object(handler, "send_error_json") as errors:
                 handler.do_POST()
-            errors.assert_not_called()
-            sent.assert_called_once()
-            return sent.call_args.args[0]
+            sent.assert_not_called()
+            errors.assert_called_once()
+            return str(errors.call_args.args[0])
 
-        response = create(False)
-        self.assertTrue(response["requires_confirmation"])
-        self.assertTrue(any("certificate PDF history" in warning
-                            for row in response["warnings"] for warning in row.get("warnings", [])))
+        message = create(False)
+        self.assertIn("assigned automatically", message)
         self.assertEqual(external.read_bytes(), original)
         inventory = scan_inventory(self.root)
         self.assertEqual(issuance_paths(inventory, "0319", "workbook", "plant1", "API-NEW"), [])
-        response = create(True)
-        self.assertEqual(response["created"], 1)
-        batch = next(batch for batch in read_batches(self.paths[0]) if batch["case_id"] == "API-NEW")
-        self.assertEqual(batch["cod_no"], "0320")
+        self.assertFalse(any(batch["case_id"] == "API-NEW" for batch in read_batches(self.paths[0])))
         self.assertEqual(external.read_bytes(), original)
 
-    def test_saved_manual_cod_without_committed_pdf_does_not_own_foreign_pdf(self):
+    def test_saved_manual_draft_ignores_typed_cod_without_committed_pdf(self):
         external = external_pdf(self.folder / "0319_Independent_Client_Ltd_Pune_1.pdf",
                                 cod="0319", reference="EXT-REF")
         original = external.read_bytes()
         record_id = drafts.save_draft(self.root, "plant1", self.details(cod_no="0319"))
+        self.assertEqual(drafts.read_register(self.root)["records"][0]["details"]["cod_no"], "")
         response = drafts.generate_draft(self.root, record_id=record_id, as_of=AS_OF)
-        self.assertTrue(response["requires_confirmation"])
-        self.assertEqual(response["created"], 0)
+        self.assertEqual((response["created"], response["certificate_no"]), (1, "0320"))
         self.assertEqual(external.read_bytes(), original)
-        response = drafts.generate_draft(self.root, record_id=record_id, confirmed=True, as_of=AS_OF)
-        self.assertEqual((response["record_id"], response["certificate_no"]), (record_id, "0320"))
+        self.assertEqual(response["record_id"], record_id)
         self.assertTrue(external.is_file(), "A never-issued draft must not archive a foreign PDF found by typed COD")
         self.assertEqual(external.read_bytes(), original)
 
-    def test_reference_collision_warns_but_confirmed_manual_cod_stays_unchanged(self):
+    def test_reference_collision_warns_and_cod_stays_automatic(self):
         external = external_pdf(self.folder / "0319_External_2.pdf", cod="0319", reference="SHARED-REF")
         original = external.read_bytes()
         details = self.details(cod_no="0199", reference="SHARED-REF")
@@ -440,7 +454,7 @@ class InventoryWorkflowTests(TemporaryInventoryTest):
         self.assertTrue(response["requires_confirmation"])
         self.assertTrue(any("Reference" in warning for row in response["warnings"] for warning in row["warnings"]))
         response = drafts.generate_draft(self.root, plant="plant1", details=details, confirmed=True, as_of=AS_OF)
-        self.assertEqual(response["certificate_no"], "0199")
+        self.assertEqual(response["certificate_no"], "0320")
         self.assertEqual(drafts.read_register(self.root)["records"][0]["details"]["reference"], "SHARED-REF")
         self.assertEqual(external.read_bytes(), original)
 

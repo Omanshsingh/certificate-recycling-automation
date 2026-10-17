@@ -112,7 +112,7 @@ class CertificateWorkflowTests(AutomationTestBase):
 
         self.assertEqual(
             filename,
-            "0324_Northstar Electronics Recovery Ltd_Bengaluru, Karnataka, India_2.pdf",
+            "0324_Northstar Electronics Recovery Ltd_Bengaluru, Karnataka, India.pdf",
         )
 
     def test_bulk_generation_scoped_to_plant1_leaves_plant2_ready(self):
@@ -129,7 +129,7 @@ class CertificateWorkflowTests(AutomationTestBase):
         self.assertEqual((plant2["issued"], plant2["cod_no"]), ("Ready", ""))
         pdfs = list((self.base / "Certificates").rglob("*.pdf"))
         self.assertEqual([path.name for path in pdfs], [certificate_filename(plant1, 1)])
-        self.assertTrue(pdfs[0].name.endswith("_1.pdf"))
+        self.assertFalse(pdfs[0].name.endswith(("_1.pdf", "_2.pdf")))
         self.assertEqual({row["plant"] for row in self.results()["rows"]}, {"plant1"})
 
     def test_bulk_generation_scoped_to_plant2_leaves_plant1_ready(self):
@@ -146,7 +146,7 @@ class CertificateWorkflowTests(AutomationTestBase):
         self.assertTrue(plant2["cod_no"])
         pdfs = list((self.base / "Certificates").rglob("*.pdf"))
         self.assertEqual([path.name for path in pdfs], [certificate_filename(plant2, 2)])
-        self.assertTrue(pdfs[0].name.endswith("_2.pdf"))
+        self.assertFalse(pdfs[0].name.endswith(("_1.pdf", "_2.pdf")))
         self.assertEqual({row["plant"] for row in self.results()["rows"]}, {"plant2"})
 
     def test_bulk_generation_for_all_plants_generates_both_independently(self):
@@ -269,7 +269,7 @@ class CertificateWorkflowTests(AutomationTestBase):
         self.assertEqual((created, review), (0, 1))
         self.assertIn("unsupported weight formula", row["detail"])
         self.assertEqual((read_batches(self.plant1)[0]["cod_no"], read_batches(self.plant1)[0]["issued"]),
-                         ("", "Ready"))
+                         ("", "Alert"))
 
     def test_weight_parser_handles_indian_grouping_and_rejects_malformed_values(self):
         self.assertEqual(number("1,23,456.75"), 123456.75)
@@ -354,31 +354,35 @@ class CertificateWorkflowTests(AutomationTestBase):
         (legacy_folder / "COD_0050.pdf").write_bytes(b"existing COD filename is only a sequence marker")
         folder = self.base / "Certificates"
         folder.mkdir()
-        existing_filename = certificate_filename(read_batches(self.plant2)[1], 2)
+        initial_plant1 = {batch['case_id']: batch for batch in read_batches(self.plant1)}
+        initial_plant2 = {batch['case_id']: batch for batch in read_batches(self.plant2)}
+        existing_filename = certificate_filename(initial_plant2['P2-2'], 2)
         existing_pdf = PdfWriter()
         existing_pdf.add_blank_page(width=960, height=540)
         existing_pdf.write(folder / existing_filename)
-        completed_filename = certificate_filename(read_batches(self.plant1)[2], 1)
+        completed_filename = certificate_filename(initial_plant1['P1-3'], 1)
         existing_pdf.write(folder / completed_filename)
 
         created, review, _ = self.execute()
 
         self.assertEqual(created, 3)
         self.assertEqual(review, 1)  # The unfinished inward retains an empty status.
+        saved_plant1 = {batch['case_id']: batch for batch in read_batches(self.plant1)}
+        saved_plant2 = {batch['case_id']: batch for batch in read_batches(self.plant2)}
         output = sorted(path.name for path in folder.rglob("*.pdf"))
         expected = sorted([
             existing_filename,
             completed_filename,
-            certificate_filename(read_batches(self.plant1)[0], 1),
-            certificate_filename(read_batches(self.plant1)[1], 1),
-            certificate_filename(read_batches(self.plant2)[0], 2),
+            certificate_filename(saved_plant1['P1-1'], 1),
+            certificate_filename(saved_plant1['P1-2'], 1),
+            certificate_filename(saved_plant2['P2-1'], 2),
         ])
         self.assertEqual(output, expected)
         generated = self.base / "Certificates" / "Auto Generated"
         self.assertEqual(sorted(path.name for path in generated.glob("*.pdf")), sorted([
-            certificate_filename(read_batches(self.plant1)[0], 1),
-            certificate_filename(read_batches(self.plant1)[1], 1),
-            certificate_filename(read_batches(self.plant2)[0], 2),
+            certificate_filename(saved_plant1['P1-1'], 1),
+            certificate_filename(saved_plant1['P1-2'], 1),
+            certificate_filename(saved_plant2['P2-1'], 2),
         ]))
         self.assertTrue((legacy_folder / "COD_0050.pdf").is_file())
         rows = self.results()["rows"]
@@ -388,20 +392,22 @@ class CertificateWorkflowTests(AutomationTestBase):
         self.assertEqual(values[("plant2", "P2-1")]["certificate_no"], "0079")
         self.assertEqual(values[("plant1", "P1-2")]["certificate_date"], "2026-09-26")
         self.assertEqual(values[("plant2", "P2-1")]["certificate_status"], "generated")
-        self.assertEqual(values[("plant2", "P2-3")]["certificate_status"], "blank")
-        first_pdf = self.workbook_pdf(read_batches(self.plant1)[0], 1)
+        self.assertEqual(values[("plant2", "P2-3")]["certificate_status"], "ready")
+        first_pdf = self.workbook_pdf(saved_plant1['P1-1'], 1)
         self.assertTrue(first_pdf.is_file())
         pdf_text = "\n".join(page.extract_text() or "" for page in PdfReader(first_pdf).pages)
         self.assertIn("PLANT ONE READY LTD", pdf_text)
         self.assertIn("FORM6-2", pdf_text)
         self.assertIn("REF-2", pdf_text)
-        self.assertNotIn("email", " ".join(read_batches(self.plant1)[0].get("issues", [])).casefold())
+        self.assertNotIn("email", " ".join(saved_plant1['P1-1'].get("issues", [])).casefold())
 
         book = load_workbook(self.plant1, data_only=False)
         try:
             sheet = book["Inward Register"]
-            self.assertEqual((sheet["K2"].value, sheet["M2"].value), ("0078", "Generated"))
-            self.assertEqual((sheet["K3"].value, sheet["L3"].value.date(), sheet["M3"].value),
+            first_row = saved_plant1['P1-1']['source_row']
+            custom_row = saved_plant1['P1-2']['source_row']
+            self.assertEqual((sheet.cell(first_row, 11).value, sheet.cell(first_row, 13).value), ("0078", "Generated"))
+            self.assertEqual((sheet.cell(custom_row, 11).value, sheet.cell(custom_row, 12).value.date(), sheet.cell(custom_row, 13).value),
                              ("SPECIAL/REF-0077", date(2026, 9, 26), "Generated"))
         finally:
             book.close()
@@ -415,11 +421,12 @@ class CertificateWorkflowTests(AutomationTestBase):
         self.assertEqual(self.execute()[0], 1)
         first = self.workbook_pdf(read_batches(self.plant1)[0], 1)
         self.assertTrue(first.is_file())
+        original_pdf = first.read_bytes()
 
         book = load_workbook(self.plant1)
         sheet = book["Inward Register"]
         sheet["C2"] = "Updated Client Name Ltd"
-        sheet["K2"] = "NEW-CUSTOM-88"
+        sheet["K2"] = "USER-COD-1"
         sheet["L2"] = date(2026, 9, 28)
         sheet["M2"] = "Ready"
         book.save(self.plant1)
@@ -429,8 +436,10 @@ class CertificateWorkflowTests(AutomationTestBase):
         rows = self.results()["rows"]
         row = next(item for item in rows if item["sn"] == "EDIT-1")
         self.assertEqual((row["certificate_no"], row["certificate_date"], row["certificate_status"]),
-                         ("NEW-CUSTOM-88", "2026-09-28", "generated"))
-        self.assertTrue(first.is_file(), "The earlier COD-named PDF is retained in the same folder.")
+                         ("USER-COD-1", "2026-09-28", "generated"))
+        self.assertFalse(first.is_file(), "A superseded PDF is retired after the corrected certificate saves.")
+        archived = list((self.base / 'Data' / 'Archive' / 'Superseded Certificates').rglob('*.pdf'))
+        self.assertTrue(any(path.read_bytes() == original_pdf for path in archived))
         updated_pdf = self.workbook_pdf(read_batches(self.plant1)[0], 1)
         self.assertTrue(updated_pdf.is_file())
         text = "\n".join(page.extract_text() or "" for page in PdfReader(updated_pdf).pages)
@@ -541,16 +550,16 @@ class CertificateWorkflowTests(AutomationTestBase):
         self.assertNotIn("reference", row["detail"].casefold())
         self.assertEqual(read_batches(self.plant1)[0]["issued"], "Generated")
 
-    def test_all_source_issues_are_reported_then_force_generation_is_possible(self):
+    def test_missing_form6_blocks_generation_while_inward_stays_ready_for_entry(self):
         make_workbook(self.plant1, [{"sn": "WARN-1", "form6": "", "age": 27}])
         make_workbook(self.plant2, [{"sn": "N-A", "status": "N/A"}])
         self.assertEqual(self.execute(), (0, 1, self.base / "Data" / "Reports"))
-        self.assertEqual(self.execute(allow_warnings=True)[0], 1)
+        self.assertEqual(self.execute(allow_warnings=True)[0], 0)
         row = next(item for item in self.results()["rows"] if item["sn"] == "WARN-1")
-        self.assertTrue(row["system_alert"])
         self.assertTrue(row["warnings"])
-        self.assertIn("missing Form 6", row["detail"])
-        self.assertEqual(read_batches(self.plant1)[0]["issued"], "Generated")
+        self.assertEqual(row['outcome'], 'needs_review')
+        self.assertIn("Form 6 number", row["detail"])
+        self.assertEqual(read_batches(self.plant1)[0]["issued"], "Ready")
 
     def test_certificate_weight_column_replaces_inward_total(self):
         make_workbook(self.plant1, [{"sn": "NET-1", "weight": 10.0, "age": 2}])
@@ -583,7 +592,12 @@ class CertificateWorkflowTests(AutomationTestBase):
         self.assertEqual((batch["case_id"], batch["issued"], batch["form6"]),
                          ("FROM-FORM", "Ready", "FORM6-FORM"))
         self.assertEqual(self.execute(selected=("plant1", "FROM-FORM"))[0], 1)
-        generated = read_batches(self.plant1)[-1]
+        saved = read_batches(self.plant1)
+        generated = next(row for row in saved if row['case_id'] == 'FROM-FORM')
+        existing = next(row for row in saved if row['case_id'] == 'EXISTING')
+        self.assertEqual(existing['issued'], 'N/A')
+        self.assertEqual(existing['cod_no'], '')
+        self.assertLess(generated['inward_date'], existing['inward_date'])
         self.assertTrue(self.workbook_pdf(generated, 1).is_file())
 
     def test_selected_certificate_overrides_are_written_to_excel_and_pdf(self):
@@ -670,7 +684,7 @@ class ReminderAndExcelTests(AutomationTestBase):
             with self.subTest(source=source):
                 self.assertEqual(status_value(source), expected)
 
-    def test_excel_refresh_migrates_legacy_statuses_but_keeps_blank_and_na_distinct(self):
+    def test_excel_refresh_migrates_legacy_statuses_and_auto_alerts_incomplete_rows(self):
         make_workbook(self.plant1, [
             {"sn": "CREATED-1", "status": "Created"},
             {"sn": "SENT-1", "status": "Sent"},
@@ -686,7 +700,7 @@ class ReminderAndExcelTests(AutomationTestBase):
         try:
             sheet = book["Inward Register"]
             self.assertEqual([sheet.cell(row, 13).value for row in range(2, 9)],
-                             ["Generated", "Completed", "Alert", "Alert", "Generated Manual", None, "N/A"])
+                             ["Generated", "Completed", "Ready", "Ready", "Generated Manual", "Ready", "N/A"])
             validation = next(item for item in sheet.data_validations.dataValidation if "M2:M10000" in str(item.sqref))
             self.assertIn("Generated Manual", validation.formula1)
             self.assertNotIn("Working Draft", validation.formula1)
@@ -759,6 +773,7 @@ class ReminderAndExcelTests(AutomationTestBase):
             validations = [item for item in sheet.data_validations.dataValidation if "M2:M10000" in str(item.sqref)]
             self.assertEqual(len(validations), 1)
             self.assertIn("Ready,Alert,N/A,Generated,Generated Manual,Completed", validations[0].formula1)
+            self.assertTrue(validations[0].formula1.startswith('",Ready,Alert'))
             self.assertNotIn("Blank", validations[0].formula1)
             self.assertTrue(validations[0].allowBlank)
             matching = []
@@ -830,10 +845,10 @@ class ReminderAndExcelTests(AutomationTestBase):
             self.assertIn("INT($B2)>TODAY()", date_attention_formula)
             self.assertIn('TRIM($B2)=""', date_attention_formula)
             date_attention_dxf = book._differential_styles.styles[date_attention[0][1].dxfId]
-            self.assertEqual(date_attention_dxf.fill.fgColor.rgb, "FFFFF2CC")
-            self.assertEqual(date_attention_dxf.font.color.rgb, "FF7F6000")
+            self.assertEqual(date_attention_dxf.fill.fgColor.rgb, "FFC00000")
+            self.assertEqual(date_attention_dxf.font.color.rgb, "FFFFFFFF")
             self.assertEqual(status_colors["READY"], "FFB6D7A8")
-            self.assertEqual(status_colors["ALERT"], "FFFCE4D6")
+            self.assertEqual(status_colors["ALERT"], "FFC00000")
             self.assertEqual(status_colors["N/A"], "FFFFFFFF")
             self.assertEqual(status_colors["BLANK"], "FFFFFFFF")
             self.assertEqual(status_colors["GENERATED"], "FFFFE699")
@@ -956,7 +971,7 @@ class ReminderAndExcelTests(AutomationTestBase):
         result = {"run_id": "a", "rows": report.rows}
         notices = []
         self.assertTrue(notify_once(self.base, result, lambda *args: notices.append(args), today=AS_OF))
-        self.assertIn("1 certificate needs follow-up", notices[0][1])
+        self.assertIn("1 certificate pending", notices[0][1])
         self.assertFalse(notify_once(self.base, result, lambda *args: notices.append(args), today=AS_OF))
         self.assertTrue(notify_once(self.base, result, lambda *args: notices.append(args), today=AS_OF, repeat_pending=True))
         self.assertEqual(len(notices), 2)
@@ -992,7 +1007,8 @@ class ReminderAndExcelTests(AutomationTestBase):
                 patch.object(web_app, "open_excel_record", return_value=(self.plant2.resolve(), "Inward Register", 3)) as open_record:
             opened = web_app.open_selected_workbook_record("plant2", "SHARED")
         self.assertEqual(opened, (self.plant2.resolve(), "Inward Register", 3))
-        open_record.assert_called_once_with(self.plant2.resolve(), "Inward Register", 3, case_id='SHARED', header_row=1)
+        open_record.assert_called_once_with(self.plant2.resolve(), "Inward Register", 3,
+                                            case_id='SHARED', header_row=1, preferred_row=None)
 
     def test_reminder_reports_when_no_linked_plant_workbook_is_available(self):
         with self.assertRaisesRegex(FileNotFoundError, "could not be found"):

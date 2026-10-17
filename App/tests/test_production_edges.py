@@ -189,7 +189,7 @@ class ProductionEdgeTests(unittest.TestCase):
             second.close()
         pdfs = list((self.root / "Certificates").rglob("*.pdf"))
         self.assertEqual(len(pdfs), 1)
-        self.assertTrue(pdfs[0].name.endswith("_2.pdf"))
+        self.assertFalse(pdfs[0].name.endswith(("_1.pdf", "_2.pdf")))
 
     def test_bulk_generate_endpoint_forwards_plant_scope(self):
         body = {"plants": ["plant2"], "expected_revision": "revision-1"}

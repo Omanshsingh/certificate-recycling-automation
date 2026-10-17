@@ -18,7 +18,15 @@ import uuid
 
 from app_paths import resource
 from certificate_core import ALIASES, certificate_reminder_due, parse_date, read_batches, status_value
-from workbook_store import exclusive_file
+from workbook_store import LockBusyError, exclusive_file
+
+
+def operation_error_message(error):
+    """Keep resource failures and exceptions without text useful to the operator."""
+    if isinstance(error, MemoryError):
+        return ('Not enough available memory to finish. Close unused apps, '
+                'then refresh and try again.')
+    return str(error).strip() or 'The operation could not finish. Refresh and try again.'
 
 
 def load_settings(root):
@@ -91,8 +99,16 @@ def run_lock(root):
             pass
     except FileExistsError:
         pass
-    with exclusive_file(lock):
+    context = exclusive_file(lock, wait_timeout=0)
+    try:
+        context.__enter__()
+    except LockBusyError as exc:
+        raise LockBusyError('Another certificate or backup operation is running. '
+                            'Wait for it to finish, then try again.') from exc
+    try:
         yield
+    finally:
+        context.__exit__(None, None, None)
 
 
 class Report:
@@ -108,6 +124,7 @@ class Report:
         self.scan_complete = False
         self.rows = []
         self.created = 0
+        self.maintenance_notes = []
 
     def add(self, batch, outcome, detail, issue_code=None, system_alert=False, warnings=None, **_legacy):
         is_system = not str(batch.get('case_id') or '').strip()
@@ -115,7 +132,9 @@ class Report:
             cod = str(batch.get("cod_no") or "").strip()
             recovery = (f"Keep COD {cod} when recreating it." if cod else
                         "A new COD will be assigned when you create it.")
-            detail = f"PDF missing from Certificates: Excel was changed to Ready. {recovery} {detail}"
+            status_note = ('Ready to recreate; Excel status update is pending.'
+                           if batch.get('_workbook_read_only') or batch.get('_preflight_read_only') else 'Excel was changed to Ready.')
+            detail = f"PDF missing from Certificates: {status_note} {recovery} {detail}"
             system_alert = True
         raw_date = batch.get('raw_inward_date', batch.get("inward_date"))
         if batch.get('inward_date') is not None:
@@ -141,6 +160,8 @@ class Report:
         }.get(quality)
         date_needs_attention = bool(not is_system and date_warning and status not in {"na", "completed"})
         row_warnings = list(warnings or [])
+        if batch.get('_workbook_read_only'):
+            row_warnings.append('Excel is open or in use. Showing its saved contents; save and close it before the app writes changes.')
         if date_needs_attention and date_warning not in row_warnings:
             row_warnings.append(date_warning)
         row = {
@@ -164,6 +185,9 @@ class Report:
             'column_mapping': dict(batch.get('column_mapping', {})),
             'import_notes': list(batch.get('import_notes', [])),
             'issuance_blocked': bool(batch.get('_issuance_blocked') or batch.get('blocking_issues')),
+            'duplicate_serial_number': bool(batch.get('duplicate_serial_number')),
+            'record_identity_conflict': batch.get('record_identity_conflict', ''),
+            'workbook_read_only': bool(batch.get('_workbook_read_only')),
             "outcome": outcome,
             "detail": detail,
             "certificate_no": str(batch.get("cod_no", "") or ""),
@@ -200,12 +224,17 @@ class Report:
             "output": str(self.output),
             "certificate_folder": str(self.root / "Certificates"),
             "rows": self.rows,
+            "maintenance_notes": self.maintenance_notes,
         }
         if hasattr(self, 'certificate_inventory'):
             result['certificate_inventory'] = self.certificate_inventory
+        if hasattr(self, 'numbering'):
+            result['numbering'] = self.numbering
         if hasattr(self, 'result_sink') and self.result_sink is not None:
             self.result_sink.clear()
             self.result_sink.update(result)
+        if not self.publish_latest:
+            return self.created, needs_review, self.output
         lines = [
             f"Mode: {self.mode}",
             f"Completed: {result['completed_at']}",
@@ -215,13 +244,23 @@ class Report:
             "",
         ]
         lines.extend(
-            f"{row['plant']} | SN {row['sn']} | {row['supplier']} | {row['outcome']}: {row['detail']}"
+            f"{row['plant']} | Serial Number {row['sn']} | {row['supplier']} | {row['outcome']}: {row['detail']}"
             for row in self.rows
         )
         json_path = self.output / "Latest Results.json"
         text_path = self.output / "Latest Results.txt"
-        save_json(json_path, result)
-        text_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        try:
+            save_json(json_path, result)
+            text_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except OSError as exc:
+            if self.created <= 0:
+                raise
+            # PDFs/source commits are already durable. A report-cache failure
+            # must not turn them into a failed save or invite duplicate work.
+            message = f'Certificates saved, but the work list report could not be written: {exc}. Refresh the app before creating more.'
+            result['setup_warning'] = message
+            if hasattr(self, 'result_sink') and self.result_sink is not None:
+                self.result_sink['setup_warning'] = message
         return self.created, needs_review, self.output
 
 
@@ -249,23 +288,44 @@ def open_alert_workbooks(result, workbook_paths):
     targets = alert_workbook_targets(result, workbook_paths)
     if not targets:
         raise FileNotFoundError('No plant Excel file is linked to these alerts.')
-    for plant, path in targets:
-        if not path.is_file():
-            raise FileNotFoundError(f"Plant {plant[-1]} Excel file could not be found:\n{path}")
     opener = getattr(os, 'startfile', None)
     if opener is None:
         raise RuntimeError('Opening Excel files is available on Windows.')
     opened = set()
-    for _, path in targets:
+    missing = []
+    for plant, path in targets:
+        if not path.is_file():
+            missing.append(f'Plant {plant[-1]}')
+            continue
         if path not in opened:
             opener(str(path))
             opened.add(path)
+    if missing:
+        prefix = 'Available Excel files opened. ' if opened else ''
+        raise FileNotFoundError(prefix + ', '.join(missing) + ' could not be found. Check its path in Settings.')
     return [path for _, path in targets]
 
 
-def open_excel_record(workbook, sheet_name, row_number, *, case_id=None, header_row=None):
+def open_excel_workbook(workbook):
+    """Open a workbook for manual repair without reading or changing its cells."""
+    path = Path(workbook).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f'The plant workbook could not be found: {path}')
+    opener = getattr(os, 'startfile', None)
+    if opener is None:
+        raise RuntimeError('Opening Excel files is available on Windows.')
+    opener(str(path))
+    return path
+
+
+def open_excel_record(workbook, sheet_name, row_number, *, case_id=None, header_row=None,
+                      allow_duplicate_repair=False, preferred_row=None):
     """Find the client's live ID and select its whole section without saving Excel."""
     path = Path(workbook).expanduser().resolve()
+    if allow_duplicate_repair:
+        # A repeated number cannot identify one inward reliably. Allow the
+        # operator to repair the workbook without claiming a row was selected.
+        return open_excel_workbook(path), str(sheet_name), None
     try:
         row_number = int(row_number)
     except (TypeError, ValueError) as exc:
@@ -283,6 +343,12 @@ def open_excel_record(workbook, sheet_name, row_number, *, case_id=None, header_
     case_id = str(case_id).strip()
     if not case_id or not isinstance(header_row, int) or not 1 <= header_row < 1048576:
         raise ValueError('The selected Excel client is not available. Refresh and select it again.')
+    try:
+        preferred_row = int(preferred_row) if preferred_row is not None else None
+    except (TypeError, ValueError) as exc:
+        raise ValueError('The selected Excel row is no longer available. Refresh and select it again.') from exc
+    if preferred_row is not None and preferred_row <= header_row:
+        raise ValueError('The selected Excel row is no longer available. Refresh and select it again.')
     powershell = shutil.which("powershell.exe")
     if not powershell:
         raise OSError("Excel could not be opened at the selected row. Ask IT to check this computer's Excel setup.")
@@ -295,6 +361,7 @@ def open_excel_record(workbook, sheet_name, row_number, *, case_id=None, header_
         f"$clientId=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encode(case_id)}')); "
         f"$aliases=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encode(aliases)}')) | ConvertFrom-Json; "
         f"$headerRow={header_row}; "
+        f"$preferredRow={preferred_row or 0}; "
         "try {$excel=[Runtime.InteropServices.Marshal]::GetActiveObject('Excel.Application')} "
         "catch {$excel=New-Object -ComObject Excel.Application}; "
         "$excel.Visible=$true; $book=$null; "
@@ -310,15 +377,24 @@ def open_excel_record(workbook, sheet_name, row_number, *, case_id=None, header_
         "if($property.Value -contains $heading){$found+= $col}}; "
         "if($found.Count -gt 1){throw 'Duplicate Excel headings were found. Save the workbook and refresh.'}; "
         "if($found.Count -eq 1){$mapping[$property.Name]=$found[0]}}; "
-        "if(-not $mapping.ContainsKey('sn')){throw 'The client ID heading moved. Save the workbook and refresh.'}; "
+        "if(-not $mapping.ContainsKey('sn')){throw 'The Serial Number heading moved. Save the workbook and refresh.'}; "
         "$lastRow=$sheet.UsedRange.Row+$sheet.UsedRange.Rows.Count-1; "
         "if($lastRow -le $headerRow){throw 'This client is no longer in the workbook.'}; "
         "$values=$sheet.Range($sheet.Cells.Item($headerRow+1,1),$sheet.Cells.Item($lastRow,$lastColumn)).Value2; "
         "$matches=@(); for($index=1;$index -le $lastRow-$headerRow;$index++){ "
         "$value=([string]$values[$index,$mapping['sn']]).Trim(); "
-        "if([string]::Equals($value,$clientId,[StringComparison]::Ordinal)){$matches+=$index}}; "
-        "if($matches.Count -ne 1){throw 'This client ID is missing or repeated in the open Excel workbook. Save and refresh before trying again.'}; "
-        "$firstIndex=$matches[0]; $rowNumber=$headerRow+$firstIndex; "
+        "$serialCell=$sheet.Cells.Item($headerRow+$index,$mapping['sn']); "
+        "$serialFormat=[string]$serialCell.NumberFormat; $serialRaw=$values[$index,$mapping['sn']]; "
+        "if($serialRaw -is [double] -and $serialFormat -match '^0+$' -and [Math]::Truncate($serialRaw) -eq $serialRaw){ "
+        "$value=$serialRaw.ToString('0',[Globalization.CultureInfo]::InvariantCulture); "
+        "if($value.StartsWith('-')){$value='-'+$value.Substring(1).PadLeft([Math]::Max(0,$serialFormat.Length-1),'0')} "
+        "else{$value=$value.PadLeft($serialFormat.Length,'0')}}; "
+        "if([string]::Equals($value,$clientId,[StringComparison]::OrdinalIgnoreCase)){$matches+=$index}}; "
+        "if($preferredRow -gt $headerRow){$preferredIndex=$preferredRow-$headerRow; "
+        "if($matches -notcontains $preferredIndex){throw 'The selected client moved in Excel. Refresh the work list and try again.'}; "
+        "$firstIndex=$preferredIndex} elseif($matches.Count -eq 1){$firstIndex=$matches[0]} "
+        "else{throw 'This Serial Number appears more than once. Open a specific list entry or correct the Serial Number in Excel.'}; "
+        "$rowNumber=$headerRow+$firstIndex; "
         "$limit=$lastRow-$headerRow; for($index=$firstIndex+1;$index -le $limit;$index++){ "
         "if(([string]$values[$index,$mapping['sn']]).Trim()){$limit=$index-1;break}}; "
         "$idCell=$sheet.Cells.Item($rowNumber,$mapping['sn']); "
@@ -384,10 +460,13 @@ def open_alert_workbook(result, selected_row=None):
     if not workbook.is_file():
         raise FileNotFoundError(f"The plant workbook could not be found:\n{workbook}")
     matches = [batch for batch in read_batches(workbook)
-               if str(batch.get("case_id")) == str(row.get("sn"))
+               if str(batch.get("case_id")).strip().casefold() == str(row.get("sn")).strip().casefold()
                and (not row.get("sheet") or batch.get("source_sheet") == row.get("sheet"))]
-    if len(matches) != 1:
+    if not matches:
         raise ValueError("The selected client row changed in Excel. Refresh both plant workbooks and try again.")
+    if len(matches) > 1:
+        open_excel_workbook(workbook)
+        return workbook
     open_excel_record(workbook, matches[0]["source_sheet"], matches[0]["source_row"],
                       case_id=matches[0]['case_id'], header_row=matches[0].get('source_header_row',1))
     return workbook
@@ -398,7 +477,7 @@ def _notice_text(rows):
     urgent = [row for row in rows if row.get("system_alert") and not row.get("reminder_due")]
     parts = []
     if due:
-        parts.append(f"{len(due)} certificate{'s need' if len(due) != 1 else ' needs'} follow-up.")
+        parts.append(f"{len(due)} certificate{'s' if len(due) != 1 else ''} pending.")
     if urgent:
         parts.append(f"{len(urgent)} record{'s have' if len(urgent) != 1 else ' has'} details to check.")
     return "\n".join(parts + ["", "Choose Review now to see the list and what to do next."])
@@ -430,6 +509,14 @@ def notify_once(root, result, notifier, today=None, enabled=True, repeat_pending
         notifier("Certificates needing attention", _notice_text(rows))
         # Record the alert only after it was successfully shown. If the desktop
         # notification fails, a later scheduled/sign-in check must retry it.
+        # The modal's Dismiss callback may have just saved dismissal state.
+        # Preserve it instead of writing the snapshot from before the dialog.
+        try:
+            latest = json.loads(state_path.read_text(encoding='utf-8'))
+            if isinstance(latest, dict):
+                state = latest
+        except (OSError, ValueError):
+            pass
         state.update(last_day=today.isoformat(), last_time=reminder_time, signature=signature)
         save_json(state_path, state)
         return True
@@ -464,7 +551,6 @@ def launch_review_app(root):
 
 def dismiss_reminders_today(root, today=None):
     """Hide today's reminders without marking any certificate completed."""
-    cancel_snoozed_reminder(root)
     path = Path(root) / 'Data' / 'reminder-state.json'
     try:
         state = json.loads(path.read_text(encoding='utf-8'))
@@ -476,6 +562,12 @@ def dismiss_reminders_today(root, today=None):
     # Choosing a new reminder time is an explicit request to resume reminders.
     state['dismissed_time'] = load_settings(root)['reminder_time']
     save_json(path, state)
+    # Persist dismissal even if Windows cannot remove a scheduled snooze.
+    # That task also consults this state, so it will stay quiet for today.
+    try:
+        cancel_snoozed_reminder(root, force=True)
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        pass
 
 
 def show_centered_reminder(title, message, parent=None, *, on_snooze=None,

@@ -1,28 +1,32 @@
 const $ = (selector, parent = document) => parent.querySelector(selector);
 const app = { state: { rows: [] }, settings: {}, filtered: [], templates: [], templatesLoaded: false,
   editor: null, materialRows: [], page: 1, savedFilesPage: 1, workspaceView: 'records', previewRevision: 0, detailsBusy: false, pendingConfirmation: null, toastTimer: null };
-const templateNames = { standard: 'Standard', sita: 'Sita International', siemens: 'Siemens Medical' };
+const templateNames = { standard: 'Standard', sita: 'Sita International', siemens: 'Siemens Medical', destruction: 'Secured Data Destruction' };
 const commonTemplateKeys = new Set(['supplier', 'location', 'inward_date', 'certificate_weight', 'form6', 'reference', 'cod_no', 'cod_date']);
 const revisionEndpoints = new Set(['/api/create', '/api/generate', '/api/manual/save', '/api/manual/generate', '/api/manual/complete', '/api/complete', '/api/backup/restore', '/api/clients/add']);
 const workingDraftKey = 'ecoreco.certificate.working-draft.v1';
-const fieldLabels = { plant: 'Plant', source_kind: 'Use details from', certificate_type: 'Certificate type', case_id: 'Client ID / SN', supplier: 'Company name', location: 'City', inward_date: 'Received date', certificate_weight: 'Certificate Weight (kg)', item: 'Item description', items: 'Materials and weights', quantity: 'Quantity', per_piece_weight: 'Per piece weight (kg)', weight: 'Inward weight (kg)', form6: 'Form 6 number', reference: 'Reference number', cod_no: 'Certificate number', cod_date: 'Certificate date' };
+const fieldLabels = { plant: 'Plant', source_kind: 'Use details from', certificate_type: 'Certificate type', case_id: 'Serial Number', supplier: 'Company name', location: 'City', inward_date: 'Received date', certificate_weight: 'Certificate Weight (kg)', item: 'Item description', items: 'Materials and weights', quantity: 'Quantity', per_piece_weight: 'Per piece weight (kg)', weight: 'Inward weight (kg)', form6: 'Form 6 number', reference: 'Reference number', cod_no: 'Certificate number', cod_date: 'Certificate date', starting_cod:'Starting COD number' };
 function isManual(row) { return row.source_kind === 'manual'; }
 
 function excelTarget(entry) {
   const source = entry.managed_owner || entry;
   const sn = String(source.key ?? source.sn ?? '').trim();
   return source.source_kind === 'workbook' && ['plant1','plant2'].includes(source.plant) && sn
-    ? {plant:source.plant, sn} : null;
+    ? {plant:source.plant, sn,
+       sheet:source.source_sheet ?? source.sheet,
+       row:source.source_row ?? source.row} : null;
 }
 
-async function openClientInExcel(plant, sn) {
+async function openClientInExcel(plant, sn, sheet, row) {
   if (app.openingExcel) return;
   app.openingExcel = true;
   setBusy(true, `Opening ${labelPlant(plant)} Excel…`, 'Finding and selecting this client’s rows.');
   try {
-    const response = await api('/api/open-workbook', {plant, sn});
+    const response = await api('/api/open-workbook', {plant, sn, sheet, row});
+    if (response.row_selected === false) throw new Error(response.warning || 'Excel opened, but this row was not selected. Refresh and try again.');
     if (!response.selected) throw new Error('Excel could not confirm the selected client. Refresh and try again.');
-    toast(`${labelPlant(plant)} Excel opened with this client’s rows selected.`);
+    if (response.warning) toast('Excel opened. Check the Serial Number, then save and refresh.');
+    else toast(`${labelPlant(plant)} Excel opened with this client’s rows selected.`);
   } catch (error) { toast(error.message, true); }
   finally { app.openingExcel = false; setBusy(false); }
 }
@@ -31,10 +35,10 @@ function excelOpenButton(target, supplier, className = 'button button-quiet') {
   const button = element('button', className, 'Open in Excel'); button.type = 'button';
   button.title = `Open ${labelPlant(target.plant)} Excel and select this client`;
   button.setAttribute('aria-label', `Open ${labelPlant(target.plant)} Excel for ${supplier || 'this client'}`);
-  button.addEventListener('click', () => openClientInExcel(target.plant, target.sn));
+  button.addEventListener('click', () => openClientInExcel(target.plant, target.sn, target.sheet, target.row));
   return button;
 }
-function templateId(row) { return row.last_certificate_details?.certificate_type || row.certificate_type || 'standard'; }
+function templateId(row) { return (!recordIdentityIssue(row) && row.last_certificate_details?.certificate_type) || row.certificate_type || 'standard'; }
 function templateLabel(row) {
   return app.templates.find(template => template.id === templateId(row))?.name || templateNames[templateId(row)] || 'Standard';
 }
@@ -64,20 +68,28 @@ function element(tag, className, value) {
 
 const materialFields = [
   ['item', 'Material or asset', 'text', 'e.g. Recycled computer equipment'],
-  ['weight', 'Weight (kg)', 'text', 'Enter total weight in kg'],
+  ['weight', 'Weight (KG)', 'text', 'Enter this material’s weight in kg'],
   ['quantity', 'Quantity', 'text', 'Optional'],
-  ['per_piece_weight', 'Weight per piece (kg)', 'text', 'Optional'],
+  ['per_piece_weight', 'Per Pcs Weight in (KG)', 'text', 'Optional'],
+];
+const clientMaterialFields = [
+  ['item', 'Material or asset', 'text', 'e.g. Recycled computer equipment'],
+  ['quantity', 'Quantity in Pcs', 'text', 'e.g. 2 or 1 lot'],
+  ['per_piece_weight', 'Per Pcs Weight in (KG)', 'text', 'Optional'],
+  ['weight', 'Weight (KG)', 'text', 'Auto-calculated or enter this material’s weight'],
 ];
 
 function materialInputName(index, key) { return index === 0 ? key : `material_${index}_${key}`; }
 
 function clientMaterialValues() {
   return (app.clientMaterialRows || []).map(inputs => Object.fromEntries(
-    Object.entries(inputs).map(([key, input]) => [key, input.value || ''])));
+    Object.entries(inputs).map(([key, input]) => [key,
+      key === 'weight' && input.dataset.autoCalculated === 'true' ? '' : input.value || ''])));
 }
 
 function renderClientMaterials(items = [{}]) {
   const container = $('#client-material-rows');
+  $('#add-client-error').hidden = true;
   const source = items.length ? items : [{}];
   app.clientMaterialRows = [];
   container.replaceChildren();
@@ -97,21 +109,113 @@ function renderClientMaterials(items = [{}]) {
     row.append(heading);
     const grid = element('div', 'client-material-grid');
     const inputs = {};
-    for (const [key, label, type, placeholder] of materialFields) {
-      const field = element('label', 'field'); field.append(element('span', '', label));
+    const addField = ([key, label, type, placeholder], className = '') => {
+      const field = element('label', `field ${className}`.trim()); field.append(element('span', '', label));
       const input = element('input'); input.type = type; input.value = item[key] ?? '';
       input.maxLength = key === 'item' ? 500 : 100;
-      input.inputMode = key === 'item' ? 'text' : 'decimal'; input.placeholder = placeholder;
+      input.inputMode = key === 'item' || key === 'quantity' ? 'text' : 'decimal'; input.placeholder = placeholder;
       input.setAttribute('aria-label', `Material ${index + 1}: ${label}`);
-      field.append(input); grid.append(field); inputs[key] = input;
-    }
+      field.append(input); inputs[key] = input; return field;
+    };
+    grid.append(addField(clientMaterialFields[0], 'client-material-name'), addField(clientMaterialFields[3]));
+    const calculation = element('div', 'material-calculation client-material-calculation');
+    calculation.append(element('strong', 'client-material-calc-title', 'Calculate weight'));
+    const equation = element('div', 'client-material-equation');
+    equation.append(addField(clientMaterialFields[1]), element('span', 'client-material-operator', '×'),
+      addField(clientMaterialFields[2]));
+    calculation.append(equation);
+    grid.append(calculation);
+    const hint = element('small', 'client-material-hint');
+    hint.hidden = true;
+    grid.append(hint); Object.defineProperty(inputs, 'hint', {value:hint});
+    const updateCalculatedWeight = (recalculate = true) => {
+      const parse = value => {
+        const raw = String(value ?? '').trim();
+        if (!raw) return null;
+        const grouping = '(?:[0-9]+|[0-9]{1,3}(?:,[0-9]{3})+|[0-9]{1,2}(?:,[0-9]{2})+,[0-9]{3})';
+        if (!new RegExp(`^[+]?(?:${grouping}(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$`).test(raw)) return null;
+        const number = Number(raw.replaceAll(',', ''));
+        return Number.isFinite(number) && number >= 0 ? number : null;
+      };
+      const quantity = parse(inputs.quantity.value), perPiece = parse(inputs.per_piece_weight.value);
+      if (quantity !== null && perPiece !== null) {
+        if (recalculate || !String(inputs.weight.value ?? '').trim()) {
+          inputs.weight.value = String(Number((quantity * perPiece).toFixed(6)));
+          inputs.weight.dataset.autoCalculated = 'true';
+        }
+        hint.textContent = '';
+        hint.hidden = true;
+      } else {
+        if (inputs.weight.dataset.autoCalculated === 'true') inputs.weight.value = '';
+        delete inputs.weight.dataset.autoCalculated;
+        hint.textContent = String(inputs.quantity.value).trim() && parse(inputs.quantity.value) === null
+          ? 'Enter weight directly.' : '';
+        hint.hidden = !hint.textContent;
+      }
+      updateClientMaterialWeightTotal();
+    };
+    for (const key of ['quantity', 'per_piece_weight']) inputs[key].addEventListener('input', updateCalculatedWeight);
+    inputs.weight.addEventListener('input', () => {
+      delete inputs.weight.dataset.autoCalculated;
+      updateClientMaterialWeightTotal();
+    });
+    inputs.item.addEventListener('input', updateClientMaterialWeightTotal);
+    updateCalculatedWeight(false);
     row.append(grid); container.append(row); app.clientMaterialRows.push(inputs);
   });
   $('#add-client-material').disabled = source.length >= 100;
+  updateClientMaterialWeightTotal();
+  if (app.clientPendingAttempt && !app.clientBusy) validateClientSerialNumber();
+}
+
+function updateClientMaterialWeightTotal() {
+  const summary = $('#client-material-weight-total');
+  if (!summary) return;
+  const result = materialWeightTotal(clientMaterialValues());
+  summary.hidden = result.state === 'empty';
+  summary.textContent = result.state === 'complete' ? `Total weight: ${readableNumber(result.total)} kg`
+    : result.state === 'invalid' ? 'Check the weights.'
+      : result.state === 'incomplete' ? 'Enter each asset’s weight.' : '';
+}
+
+function duplicateSerialNumber(plant, value) {
+  const serial = String(value ?? '').trim().toLowerCase();
+  if (!serial) return null;
+  return app.state.rows.find(row => !isManual(row) && row.plant === plant
+    && String(row.sn ?? row.case_id ?? '').trim().toLowerCase() === serial) || null;
+}
+
+function clientEntryPayload(form = $('#add-client-form')) {
+  const values = Object.fromEntries(new FormData(form).entries());
+  const details = Object.fromEntries(['sn','supplier','location','inward_date','form6','reference',
+    'comments','transporter_details','docket_vehicle_no','weight_slip_scale']
+    .map(key => [key, String(values[key] ?? '').trim()]));
+  details.items = clientMaterialValues().map(item => Object.fromEntries(
+    ['item','quantity','per_piece_weight','weight'].map(key => [key, String(item[key] ?? '').trim()])));
+  return {plant:String(values.plant ?? '').trim(), details};
+}
+
+function validateClientSerialNumber() {
+  const form = $('#add-client-form'), input = form.elements.namedItem('sn');
+  const attempt = app.clientPendingAttempt;
+  // The row may be our committed add whose response was lost. Only the exact
+  // same attempted request may reach the server's idempotency check again.
+  const retry = attempt && attempt.requestId === app.clientRequestId
+    && attempt.signature === JSON.stringify(clientEntryPayload(form));
+  const duplicate = !retry && duplicateSerialNumber(form.elements.namedItem('plant').value, input.value);
+  const message = duplicate ? `Already used${duplicate.supplier ? ` by ${duplicate.supplier}` : ''}. Use another number or leave blank.` : '';
+  input.setCustomValidity(message);
+  input.setAttribute('aria-invalid', String(Boolean(duplicate)));
+  const hint = $('#client-serial-number-hint');
+  hint.textContent = message;
+  hint.hidden = !message;
+  hint.classList.toggle('field-error', Boolean(duplicate));
+  return !duplicate;
 }
 
 function openAddClient() {
-  if (app.loadingWorkspace || app.clientBusy || app.generationBusy) return;
+  if (app.loadingWorkspace || app.clientBusy || app.generationBusy || app.backupBusy
+      || app.completionBusy || app.settingsBusy || app.stopping) return;
   const form = $('#add-client-form');
   if (!app.clientEntryInitialized) {
     form.reset();
@@ -124,39 +228,35 @@ function openAddClient() {
   app.clientRevision = app.workspaceRevision ?? app.state.workspace_revision ?? '';
   app.clientRequestId ||= Array.from({length:32}, () => Math.floor(Math.random() * 16).toString(16)).join('');
   $('#add-client-error').hidden = true;
-  updateClientType();
+  validateClientSerialNumber();
   $('#add-client-modal').showModal();
   form.elements.namedItem('supplier').focus();
 }
 
-function updateClientType() {
-  const form = $('#add-client-form');
-  form.elements.namedItem('form6').closest('.field').hidden = form.elements.namedItem('certificate_type').value !== 'standard';
-}
-
 async function saveClient() {
   const form = $('#add-client-form');
-  if (app.clientBusy || !form.reportValidity()) return;
-  const values = Object.fromEntries(new FormData(form).entries());
-  const details = Object.fromEntries(['supplier','location','inward_date','form6','reference','certificate_type']
-    .map(key => [key, String(values[key] || '').trim()]));
-  details.items = clientMaterialValues();
+  if (app.clientBusy) return;
+  const serialValid = validateClientSerialNumber();
+  if (!serialValid) { form.elements.namedItem('sn').focus(); return; }
+  if (!form.reportValidity()) return;
+  const payload = clientEntryPayload(form);
   app.clientBusy = true;
   $('#add-client-error').hidden = true;
   const controls = [...form.querySelectorAll('button, input, select')];
   controls.forEach(control => { control.disabled = true; });
   $('#save-client').disabled = true; $('#save-client').textContent = 'Adding to Excel…';
   try {
-    const response = await api('/api/clients/add', {plant:values.plant, details, request_id:app.clientRequestId, expected_revision:app.clientRevision});
+    app.clientPendingAttempt = {requestId:app.clientRequestId, signature:JSON.stringify(payload)};
+    const response = await api('/api/clients/add', {...payload, request_id:app.clientRequestId, expected_revision:app.clientRevision});
     if (!response.client_added || !response.client) throw new Error('The client could not be confirmed. Check Excel before adding it again.');
-    app.clientEntryInitialized = false; app.clientRevision = null; app.clientRequestId = null;
+    app.clientEntryInitialized = false; app.clientRevision = null; app.clientRequestId = null; app.clientPendingAttempt = null;
     $('#add-client-modal').close();
     $('#status-filter').value = 'all'; $('#template-filter').value = 'all';
     $('#plant-filter').value = response.client.plant; $('#search').value = String(response.client.sn);
     setWorkspaceView('records'); setState(response.state);
     toast(`${response.client.supplier} added to ${labelPlant(response.client.plant)}. ${response.client.status === 'ready' ? 'Ready to create a certificate.' : 'Fill the remaining details in Excel when ready.'}`);
   } catch (error) {
-    $('#add-client-error').textContent = error.message;
+    $('#add-client-error').textContent = noticeText(error.message);
     $('#add-client-error').hidden = false;
   } finally {
     app.clientBusy = false;
@@ -187,9 +287,19 @@ function materialWeightTotal(items = materialValues()) {
     const weight = numeric(item.weight);
     const quantity = numeric(item.quantity);
     const perPiece = numeric(item.per_piece_weight);
-    if ([weight, quantity, perPiece].some(value => Number.isNaN(value) || (value != null && value < 0))) return { state: 'invalid', total: null };
-    const lineWeight = weight != null ? weight
-      : quantity != null && perPiece != null ? quantity * perPiece : null;
+    if (Number.isNaN(weight) || (weight != null && weight < 0)) return { state: 'invalid', total: null };
+    if ((quantity != null && !Number.isNaN(quantity) && quantity < 0)
+        || (perPiece != null && !Number.isNaN(perPiece) && perPiece < 0)) {
+      return { state: 'invalid', total: null };
+    }
+    // A provided line weight is authoritative. In particular, a text quantity
+    // such as "1 Lot" cannot be multiplied and must not invalidate that weight.
+    if (weight != null) { total += weight; continue; }
+    if (Number.isNaN(perPiece)) {
+      return { state: 'invalid', total: null };
+    }
+    if (Number.isNaN(quantity)) return { state: 'incomplete', total: null };
+    const lineWeight = quantity != null && perPiece != null ? quantity * perPiece : null;
     if (lineWeight == null) return { state: 'incomplete', total: null };
     total += lineWeight;
   }
@@ -200,12 +310,12 @@ function updateMaterialWeightTotal(items = materialValues()) {
   const summary = $('#material-weight-total');
   if (!summary) return;
   const result = materialWeightTotal(items);
-  summary.textContent = result.state === 'complete' ? `Total inward weight: ${readableNumber(result.total)} kg`
-    : result.state === 'invalid' ? 'Check the material weights to calculate the total.'
-      : result.state === 'incomplete' ? 'Enter a weight for each material, or quantity and weight per piece.'
-        : 'The total inward weight will appear here as you enter materials.';
+  summary.hidden = result.state === 'empty';
+  summary.textContent = result.state === 'complete' ? `Total weight: ${readableNumber(result.total)} kg`
+    : result.state === 'invalid' ? 'Check the weights.'
+      : result.state === 'incomplete' ? 'Enter each asset’s weight.' : '';
   const active = items.filter(item => Object.values(item || {}).some(value => String(value ?? '').trim())).length;
-  $('#material-options-title').textContent = `Assets & weights${active ? ` · ${active} item${active === 1 ? '' : 's'}` : ''}${result.state === 'complete' ? ` · ${readableNumber(result.total)} kg` : ''}`;
+  $('#material-options-title').textContent = `Assets & weights${active ? ` · ${active} item${active === 1 ? '' : 's'}` : ''}`;
 }
 
 function materialValuesFromFormValues(values = {}) {
@@ -264,7 +374,7 @@ function renderMaterialRows(items = [{}]) {
       const input = element('input');
       input.name = materialInputName(index, key);
       input.type = type;
-      input.maxLength = key === 'item' ? 180 : 40;
+      input.maxLength = key === 'item' ? 500 : 100;
       input.inputMode = key === 'item' ? 'text' : 'decimal';
       input.placeholder = placeholder;
       input.value = item?.[key] == null ? '' : String(item[key]);
@@ -297,12 +407,13 @@ function stateOf(row) {
 }
 function hasWarnings(row) {
   return (Array.isArray(row.warnings) && row.warnings.length > 0)
+    && row.warnings.some(warning => !isRoutineNotice(warning))
     || (stateOf(row) === 'ready' && row.outcome === 'needs_review')
     || Boolean(row.system_alert);
 }
 function needsAttention(row) {
   const state = stateOf(row);
-  return ['alert', 'blank', 'unknown'].includes(state)
+  return Boolean(row.destruction_pending) || ['alert', 'blank', 'unknown'].includes(state)
     || (state === 'ready' && hasWarnings(row))
     || Boolean(row.system_alert) || Boolean(row.reminder_due);
 }
@@ -335,6 +446,20 @@ function readableNumber(value) {
 function warningInfo(value) {
   const text = String(value || '').trim();
   const info = (title, message, check = '') => ({title, message, check, original: text});
+  const serial = text.match(/Serial Number\s+["“]?(.+?)["”]?\s+(?:is repeated|appears more than once|is already used)/i);
+  if (/Serial Number.*(?:is repeated|appears more than once)/i.test(text)) {
+    const rows = text.match(/rows?\s+(\d+(?:(?:\s*,\s*|\s+and\s+)\d+)*)/i)?.[1]?.split(/\s*(?:,|and)\s*/);
+    return {...info(`Serial Number${serial ? ` ${serial[1]}` : ''} is repeated.`,
+      rows ? `Excel rows ${rows.join(' and ')}.` : '', 'Change the repeated number in Excel, then refresh.'), compact:true};
+  }
+  if (/Serial Number.*(?:already used|already exists)/i.test(text)) return {...info(
+    `Serial Number${serial ? ` ${serial[1]}` : ''} is already used.`, '', 'Use another number or leave it blank.'), compact:true};
+  if (/Serial Number.*(?:linked to|different certificate history)/i.test(text)) return {...info(
+    'Check this Serial Number.', '', 'Check its Serial Number and COD in Excel, then refresh.'), compact:true};
+  if (/files changed since|Excel changed since|reviewed.*changed/i.test(text)) return {...info(
+    'Excel has changed.', '', 'Refresh and review the latest details.'), compact:true};
+  if (/Windows error (?:32|33)|workbook.*(?:in use|busy)|Windows still reports .* in use/i.test(text)) return {...info(
+    'The Excel file is in use.', '', 'Close Excel or wait a moment, then retry.'), compact:true};
   let sourceMatch = text.match(/^(.+?\.xls[mx]) is unavailable: (.+)$/i);
   if (sourceMatch && /(?:close.*Excel|Windows error (?:32|33)|already locked)/i.test(sourceMatch[2])) return info(
     `Close ${sourceMatch[1]} in Excel`, 'Excel is using this file, so the app cannot check it yet.', 'Save and close the file in Excel, then click Refresh.');
@@ -372,7 +497,7 @@ function warningInfo(value) {
   if (/^invalid inward date/i.test(text)) return info('Received date needs fixing', 'The received date is not valid.', 'Check the date in Excel.');
   if (/^(inward date is in the future|Material receipt date is in the future)/i.test(text)) return info('Received date is in the future', 'The received date is later than today.', 'Check the date before continuing.');
   if (/^(missing or invalid inward date|Material receipt date is missing or invalid;)/i.test(text)) return info('Received date missing or invalid', 'It will be blank on the PDF.', 'Check the received date before creating.');
-  if (/^(missing Form 6 number \/ manifest number|Form 6 \/ manifest number is missing;)/i.test(text)) return info('Form 6 number missing', 'It will be blank on the PDF.', 'Add the Form 6 number, or confirm that a blank value is acceptable.');
+  if (/^(missing Form 6 number \/ manifest number|Form 6 \/ manifest number is missing;|Form 6 number is required to create the certificate\.)/i.test(text)) return info('Form 6 number missing', 'Enter it when creating the certificate.', 'Open the certificate details and add the Form 6 number.');
   if (/^total weight must be a positive number$/i.test(text)) return info('Weight missing or zero', 'The weight must be greater than zero.', 'Check the weight before sending the PDF.');
   if (/^Weight is missing, invalid or not positive;/i.test(text)) return info('Weight needs checking', 'The source weight is missing, zero or invalid.', 'Check the weight shown in the preview before continuing.');
   if (/^one or more item weights cannot be calculated$/i.test(text)) return info('Material weight missing', 'Some material weights could not be added up.', 'Check the material weights and certificate total.');
@@ -388,7 +513,7 @@ function warningInfo(value) {
   if (match) return info('Certificate weight needs fixing', `The certificate weight on Excel row ${match[1]} is invalid. The material total will be used instead.`, 'Check the printed weight in the preview.');
   match = text.match(/^conflicting certificate\/net weight on continuation row (\d+)$/i);
   if (match) return info('Certificate weights do not match', `Excel row ${match[1]} has a different certificate weight for this inward.`, 'Use the same certificate weight throughout this inward.');
-  if (/^SN is repeated on more than one batch in this plant workbook$/i.test(text)) return info('Inward ID is repeated', 'More than one inward has the same ID in this plant’s Excel file.', 'Check which inward is correct. Each inward needs its own ID.');
+  if (/^(?:SN|Serial Number) is repeated on more than one batch in this plant workbook$/i.test(text)) return info('Serial Number is repeated', 'More than one inward has the same Serial Number in this plant’s Excel file.', 'Open Excel and give each inward a unique Serial Number.');
   if (/^Form 6 number is repeated on more than one batch in this plant workbook$/i.test(text)) return info('Form 6 number is repeated', 'More than one inward uses this Form 6 number.', 'Check whether these inwards should share the same Form 6.');
   match = text.match(/^material (\d+) (?:has an? (invalid|negative) (.+?)|is missing its description|weight is missing or cannot be calculated)(?:;.*)?$/i);
   if (match) return info(`Material ${match[1]} needs checking`, match[2] ? `The ${match[3]} is ${match[2]}.`
@@ -400,7 +525,7 @@ function warningInfo(value) {
   if (match) return info(`Plant ${match[1]} Excel file is not connected`, 'The app could not check that plant for used COD numbers.', 'Connect the file in Settings, or check the COD yourself before sending.');
   match = text.match(/^Plant ([12]) workbook could not be checked for existing CODs:/i);
   if (match) return info(`Plant ${match[1]} COD numbers could not be checked`, 'The app could not read that plant’s Excel file.', 'Check the file and COD before sending.');
-  if (/its COD could not be checked\. Confirm the next COD manually before continuing\.$/i.test(text)) return info('A saved PDF could not be checked', 'The app could not read its COD number.', 'Open that PDF and check its COD before continuing.');
+  if (/couldn't find a COD in .*rename the PDF so the COD comes first/i.test(text)) return info('A saved PDF needs its COD in the filename', 'The app could not identify a COD in this PDF, so it cannot safely choose the next number.', 'Open the PDF, read its COD, put that number at the start of the filename, then click Refresh. Move unrelated PDFs outside Certificates.');
   match = text.match(/^(?:Missing (.+?); enter N\/A if it does not apply|(.+?) is missing; enter N\/A if it does not apply, or continue with a blank value\.)$/i);
   if (match) return info(`${match[1] || match[2]} missing`, 'This value will be blank if you continue.', 'Enter the value, or N/A if it does not apply.');
   match = text.match(/^(.+?) is long for its space; the PDF may use small text or clip it\./i);
@@ -426,28 +551,63 @@ function simpleWarning(value) {
   return warning.original ? [warning.title, warning.message, warning.check].filter(Boolean).join('. ').replace(/\.{2}/g, '.') : warning.message;
 }
 
+function isRoutineNotice(value) {
+  return /^Excel is open or in use\. Showing its saved contents/i.test(String(value || '').trim());
+}
+
+function noticeText(value) {
+  const warning = warningInfo(value);
+  if (warning.compact) return [warning.title, warning.message, warning.check].filter(Boolean).join(' ');
+  return simpleWarning(value);
+}
+
+function showDetailsError(message) {
+  const node = $('#details-error');
+  node.textContent = noticeText(message);
+  node.hidden = false;
+  const form = $('#details-form');
+  const existingWorkbook = form.elements.namedItem('source_kind').value === 'workbook' && app.editor?.sourceSn != null;
+  const plant = existingWorkbook ? app.editor.sourcePlant : form.elements.namedItem('plant').value;
+  const sn = existingWorkbook ? app.editor.sourceSn : form.elements.namedItem('case_id').value;
+  if (['plant1', 'plant2'].includes(plant) && sn && /Serial Number|Excel|workbook/i.test(String(message))) {
+    node.append(excelOpenButton({plant, sn:String(sn)}, '', 'button button-quiet'));
+  }
+}
+
 function warningCard(value) {
   const warning = warningInfo(value);
   const card = element('li', 'issue-card');
-  card.append(element('strong', 'issue-title', warning.title), element('p', 'issue-message', warning.message));
+  card.append(element('strong', 'issue-title', warning.title));
+  if (warning.message) card.append(element('p', 'issue-message', warning.message));
   if (warning.file) card.append(element('p', 'issue-file', `Certificate: ${warning.file}`));
   if (warning.check) {
     const check = element('p', 'issue-check');
-    check.append(element('strong', '', 'What to do: '), element('span', '', warning.check)); card.append(check);
+    check.append(element('span', '', warning.check)); card.append(check);
   }
-  if (warning.original) {
+  if (warning.original && !warning.compact) {
     const details = element('details', 'issue-details');
-    details.append(element('summary', '', 'Original details'), element('p', '', warning.original)); card.append(details);
+    details.append(element('summary', '', 'Details'), element('p', '', warning.original)); card.append(details);
   }
   return card;
 }
 
 function renderWarningList(list, warnings) {
   list.classList.add('issue-list');
-  list.replaceChildren(...warnings.map(warningCard));
+  const unique = new Map();
+  for (const value of warnings) {
+    if (isRoutineNotice(value)) continue;
+    const warning = warningInfo(value);
+    const key = [warning.title, warning.message, warning.check].join('|');
+    if (!unique.has(key)) unique.set(key, value);
+  }
+  list.replaceChildren(...[...unique.values()].map(warningCard));
 }
 
 function nextStep(row) {
+  if (recordIdentityIssue(row)) return recordIdentityIssue(row);
+  if (row.destruction_pending) return row.pdf_filename
+    ? 'Send the data destruction PDF, then mark this request Completed. Payment may depend on it.'
+    : 'Data destruction requested. Complete the device details and create the PDF; payment may depend on it.';
   switch (stateOf(row)) {
     case 'generated': case 'generated_manual': return 'Your PDF is saved. Send it, then mark it Completed.';
     case 'completed': return 'This certificate is marked Completed.';
@@ -479,7 +639,7 @@ function dismissToast() {
 
 function toast(message, isError = false) {
   const node = $('#toast');
-  $('#toast-message').textContent = message;
+  $('#toast-message').textContent = isError ? noticeText(message) : message;
   $('#dismiss-toast').hidden = !isError;
   node.classList.toggle('error', isError);
   node.classList.add('visible');
@@ -494,8 +654,8 @@ function setBusy(on, title = 'Checking workbooks…', description = 'This usuall
   $('#busy-title').textContent = title;
   $('#busy-description').textContent = description;
   for (const control of document.querySelectorAll('button, input, select, textarea')) {
-    if (control.closest('dialog[open]') && !on) continue;
-    control.toggleAttribute('aria-busy', on);
+    if (on) control.setAttribute('aria-busy', 'true');
+    else control.removeAttribute('aria-busy');
   }
 }
 
@@ -542,8 +702,9 @@ function updateSettingsFiles() {
   for (const plant of ['plant1', 'plant2']) {
     const path = form.elements.namedItem(`${plant}_path`).value.trim();
     const label = $(`#${plant}-file-name`);
-    label.textContent = path.split(/[\\/]/).pop() || 'Choose an Excel file';
+    label.textContent = path.split(/[\\/]/).pop() || 'Not connected';
     label.title = path;
+    $(`#${plant}-disconnect`).hidden = !path;
   }
 }
 
@@ -556,7 +717,8 @@ function updateReminderControls() {
   // Keep its value in the payload so turning the reminder back on retains the time.
 }
 
-function setState(state) {
+function setState(state, {preserveSettings = true} = {}) {
+  const pending = preserveSettings && $('#settings-modal').open ? settingsValues() : null;
   app.state = state || { rows: [] };
   if (typeof app.state.workspace_revision === 'string') app.workspaceRevision = app.state.workspace_revision;
   app.state.rows ||= [];
@@ -566,6 +728,14 @@ function setState(state) {
   app.page = 1;
   app.expanded = null;
   updateSettingsDisplay();
+  if (pending) {
+    const form = $('#settings-form');
+    form.elements.namedItem('plant1_path').value = pending.workbook_paths[0];
+    form.elements.namedItem('plant2_path').value = pending.workbook_paths[1];
+    form.elements.namedItem('reminders_enabled').checked = pending.reminders_enabled;
+    form.elements.namedItem('reminder_time').value = pending.reminder_time;
+    updateSettingsFiles(); updateReminderControls();
+  }
   render();
   renderFolderInventory();
 }
@@ -778,10 +948,14 @@ function renderFolderInventory() {
 }
 
 function summarize() {
+  const destructionPending = app.state.rows.filter(row => row.destruction_pending).length;
+  $('#destruction-pending').hidden = !destructionPending;
+  $('#destruction-pending').textContent = `${destructionPending} data destruction request${destructionPending === 1 ? '' : 's'} awaiting completion. Payment may depend on these. Show requests`;
   const rows = app.state.rows.filter(row => matches(row, true));
   const ready = rows.filter(row => stateOf(row) === 'ready' && !hasWarnings(row)).length;
   const selectedPlant = $('#plant-filter').value;
   const workbookReady = app.state.rows.filter(row => !isManual(row) && stateOf(row) === 'ready'
+    && !row.issuance_blocked && !recordIdentityIssue(row)
     && (selectedPlant === 'all' || row.plant === selectedPlant)).length;
   const attention = rows.filter(needsAttention).length;
   const generated = rows.filter(row => stateOf(row) === 'generated').length;
@@ -807,36 +981,81 @@ function bulkGenerationPayload() {
   return { plants: selectedPlant === 'all' ? ['plant1', 'plant2'] : [selectedPlant] };
 }
 
+function updateBulkCodHint() {
+  const input = $('#bulk-start-cod');
+  input.setCustomValidity('');
+  const value = input.value.trim();
+  if (!/^[0-9]{1,12}$/.test(value) || Number(value) < 1) {
+    $('#bulk-cod-hint').textContent = 'No previous COD found. Enter the number to start from.';
+    return;
+  }
+  const {prefix = '', width = 4} = app.state.numbering || {};
+  const cod = sequence => prefix + String(sequence).padStart(width, '0');
+  $('#bulk-cod-hint').textContent = `First COD: ${cod(Number(value))}. Next: ${cod(Number(value) + 1)}.`;
+}
+
 function openBulkGeneration() {
-  if (app.generationBusy || app.detailsBusy) return;
+  if (app.loadingWorkspace || app.generationBusy || app.detailsBusy || app.backupBusy
+      || app.completionBusy || app.clientBusy || app.settingsBusy || app.stopping) return;
   const payload = bulkGenerationPayload();
   const count = app.state.rows.filter(row => !isManual(row) && stateOf(row) === 'ready'
+    && !row.issuance_blocked && !recordIdentityIssue(row)
     && payload.plants.includes(row.plant)).length;
   if (!count) { toast('No Ready Excel rows in this plant.'); return; }
   app.bulkSelection = { ...payload, expected_revision: app.workspaceRevision ?? app.state.workspace_revision ?? '' };
+  const numbering = app.state.numbering;
+  const knownCod = app.state.rows.some(row => String(row.certificate_no || '').trim())
+    || (app.state.certificate_inventory?.entries || []).some(entry => entry.cods?.length);
+  const needsStart = numbering ? numbering.needs_start : !knownCod;
+  app.bulkSelectionNeedsStart = needsStart;
+  const startInput = $('#bulk-start-cod');
+  startInput.value = '';
+  startInput.placeholder = numbering?.next_cod?.replace(numbering?.prefix || '', '') || 'e.g. 0302';
+  startInput.required = needsStart;
+  startInput.setCustomValidity('');
+  $('#bulk-start-field').hidden = !needsStart;
+  $('#bulk-cod-hint').textContent = 'No previous COD found. Enter the number to start from.';
+  $('#bulk-next-cod').hidden = needsStart;
+  $('#bulk-next-cod').textContent = numbering?.next_cod
+    ? `Next COD: ${numbering.next_cod}. Numbers continue automatically.` : 'COD numbers continue automatically.';
   const plants = payload.plants.map(labelPlant).join(' and ');
   $('#bulk-description').textContent = `${count} certificate${count === 1 ? '' : 's'} from ${plants}.`;
   const warned = app.state.rows.filter(row => !isManual(row) && stateOf(row) === 'ready'
+    && !row.issuance_blocked && !recordIdentityIssue(row)
     && payload.plants.includes(row.plant) && hasWarnings(row)).length;
   $('#bulk-description').textContent += warned ? ` ${warned} need${warned === 1 ? 's' : ''} warning review.` : '';
   $('#generate-count').textContent = `(${count})`;
   $('#bulk-generation-modal').showModal();
+  if (needsStart) startInput.focus();
 }
 
 async function startBulkGeneration() {
   const payload = app.bulkSelection;
   if (!payload || app.generationBusy) return;
+  if (app.bulkSelectionNeedsStart) {
+    const input = $('#bulk-start-cod');
+    const value = input.value.trim();
+    if (!/^[0-9]{1,12}$/.test(value) || Number(value) < 1) {
+      input.setCustomValidity('Enter the starting COD number (1 or higher).');
+      input.reportValidity();
+      input.focus();
+      return;
+    }
+    input.setCustomValidity('');
+    payload.starting_cod = value;
+  }
   $('#bulk-generation-modal').close();
   app.bulkSelection = null;
   await submitGeneration(payload);
 }
 
 function compareRows(a, b) {
-  const rank = row => row.overdue ? 0 : (stateOf(row) === 'ready' && hasWarnings(row)) ? 1
-    : stateOf(row) === 'ready' ? 2 : ['generated', 'generated_manual'].includes(stateOf(row)) ? 3
-      : stateOf(row) === 'blank' || stateOf(row) === 'unknown' ? 4
-        : stateOf(row) === 'completed' ? 5 : 6;
-  return rank(a) - rank(b) || String(a.supplier || '').localeCompare(String(b.supplier || ''));
+  // ISO dates sort chronologically; unknown dates follow dated inwards.
+  const received = row => normalizeDate(row.inward_date) || '9999-99-99';
+  return received(a).localeCompare(received(b))
+    || String(a.plant || '').localeCompare(String(b.plant || ''))
+    || String(a.sn ?? a.case_id ?? '').localeCompare(String(b.sn ?? b.case_id ?? ''), undefined, {numeric:true})
+    || String(a.supplier || '').localeCompare(String(b.supplier || ''));
 }
 
 function matches(row, ignoreStatus = false) {
@@ -875,8 +1094,7 @@ function makeClientCell(row, index) {
   if (issues.length && $('#status-filter').value !== 'needs_attention' && !['generated', 'generated_manual', 'completed'].includes(stateOf(row))) {
     const warning = warningInfo(issues[0]);
     const message = warning.original ? warning.title : warning.message;
-    const remaining = issues.length - 1;
-    const note = element('small', 'row-alert-note', `${message.length > 130 ? message.slice(0, 127) + '…' : message}${remaining > 0 ? ` · ${remaining} more issue${remaining === 1 ? '' : 's'}` : ''}`);
+    const note = element('small', 'row-alert-note', message.length > 130 ? message.slice(0, 127) + '…' : message);
     note.title = issues.map(simpleWarning).join(' · '); copy.append(note);
   }
   wrap.append(copy);
@@ -886,6 +1104,7 @@ function makeClientCell(row, index) {
 
 function attentionReason(row) {
   const state = stateOf(row);
+  if (recordIdentityIssue(row)) return recordIdentityIssue(row);
   if (Number.isFinite(row.age_days) && row.age_days < 0) return 'Received date is in the future. Check the date.';
   if (row.issuance_blocked) return 'Details need fixing before this certificate can be created.';
   if (hasWarnings(row) && !['generated', 'generated_manual', 'completed'].includes(state)) {
@@ -896,7 +1115,7 @@ function attentionReason(row) {
     ? 'PDF ready. Send it, then mark Completed.' : 'Saved PDF is missing. Review the certificate.';
   if (state === 'blank') return 'Fill the missing inward details in Excel.';
   if (row.reminder_due || row.overdue) return Number.isFinite(row.age_days) && row.age_days >= 0
-    ? `Certificate pending · received ${row.age_days} days ago.` : 'Certificate pending. Follow-up is due.';
+    ? `Certificate pending · received ${row.age_days} days ago.` : 'Certificate pending.';
   return 'Check the certificate details and Excel status.';
 }
 
@@ -908,9 +1127,16 @@ function makeStatus(row) {
     status.title = 'No status selected';
   }
   td.append(status);
+  if (row.destruction_pending) td.append(element('small', 'row-alert-note', 'Data destruction pending'));
+  if (!isManual(row)) {
+    const linked = app.state.rows.filter(other => other.destruction_source?.plant === row.plant
+      && String(other.destruction_source.case_id) === String(row.sn));
+    if (linked.length) td.append(element('small', linked.some(other => other.destruction_pending) ? 'row-alert-note' : 'age-note',
+      linked.some(other => other.destruction_pending) ? 'Data destruction requested · Pending' : 'Data destruction completed'));
+  }
   if ($('#status-filter').value === 'needs_attention') td.append(element('small', 'age-note attention-reason', attentionReason(row)));
   else if (Number.isFinite(row.age_days) && row.age_days < 0 && needsAttention(row)) td.append(element('small', 'age-note', 'Received date is in the future'));
-  else if (row.reminder_due) td.append(element('small', 'age-note', `${row.age_days ?? '25+'} days since received · follow-up due`));
+  else if (row.reminder_due) td.append(element('small', 'age-note', `${row.age_days ?? '25+'} days since received · Pending`));
   else if (row.overdue) td.append(element('small', 'age-note', 'Over 30 days since received'));
   return td;
 }
@@ -923,10 +1149,18 @@ function actionButton(title, action, rowIndex, primary = false) {
   return button;
 }
 
+function recordIdentityIssue(row) {
+  if (row?.duplicate_serial_number) return noticeText((row.warnings || []).find(value => /Serial Number.*(?:repeated|more than once)/i.test(value))
+    || `Serial Number ${row.sn || ''} is repeated.`);
+  if (row?.record_identity_conflict) return typeof row.record_identity_conflict === 'string'
+    ? noticeText(row.record_identity_conflict) : 'Check the Serial Number and COD in Excel, then refresh.';
+  return '';
+}
+
 function makeActions(row, index) {
   const td = element('td');
   const wrap = element('div', 'row-actions');
-  if (row.issuance_blocked && !['generated', 'generated_manual', 'completed'].includes(stateOf(row))) {
+  if (recordIdentityIssue(row) || (row.issuance_blocked && !['generated', 'generated_manual', 'completed'].includes(stateOf(row)))) {
     wrap.append(actionButton('View details', 'details', index));
   }
   else if (stateOf(row) === 'ready' || (isManual(row) && ['blank', 'draft'].includes(stateOf(row)))) {
@@ -948,14 +1182,15 @@ function makeActions(row, index) {
   else {
     wrap.append(actionButton('Review details', 'edit-details', index, true));
   }
-  if (row.has_issued_certificate || ['generated', 'generated_manual', 'completed'].includes(stateOf(row))) {
+  if (!recordIdentityIssue(row) && (row.has_issued_certificate || ['generated', 'generated_manual', 'completed'].includes(stateOf(row)))) {
     if (!wrap.children.length || ![...wrap.children].some(button => button.dataset.action === 'edit-details')) {
       wrap.append(actionButton('Edit certificate', 'edit-details', index));
     }
   }
   if (isManual(row)) wrap.append(actionButton('Copy as new', 'copy', index));
   else if (['plant1','plant2'].includes(row.plant) && String(row.sn ?? '').trim()) {
-    wrap.append(excelOpenButton({plant:row.plant,sn:String(row.sn)}, row.supplier, 'row-action'));
+    if (!recordIdentityIssue(row)) wrap.append(actionButton('Data destruction', 'destruction', index));
+    wrap.append(excelOpenButton({plant:row.plant,sn:String(row.sn),sheet:row.sheet,row:row.row}, row.supplier, 'row-action'));
   }
   td.append(wrap);
   return td;
@@ -968,7 +1203,7 @@ function makeDetailRow(row, index) {
   const content = element('div', 'detail-content');
   content.append(element('p', 'next-step', nextStep(row)));
   const facts = element('dl', 'certificate-facts');
-  for (const [label, value] of [['Certificate Weight', row.display_weight != null ? `${readableNumber(row.display_weight)} kg` : 'Not entered'], ['Form 6', row.form6 || 'Not entered'], ['Reference', row.reference || 'Not entered (optional)'], ['Excel row ID', row.sn || 'Manual certificate']]) {
+  for (const [label, value] of [['Certificate Weight', row.display_weight != null ? `${readableNumber(row.display_weight)} kg` : 'Not entered'], ['Form 6', row.form6 || 'Not entered'], ['Reference', row.reference || 'Not entered (optional)'], ['Serial Number', row.sn || 'Manual certificate']]) {
     const fact = element('div'); fact.append(element('dt', '', label), element('dd', '', value)); facts.append(fact);
   }
   content.append(facts);
@@ -992,7 +1227,7 @@ function makeDetailRow(row, index) {
   const actions = element('div', 'row-actions');
   actions.style.justifyContent = 'flex-start';
   actions.style.marginTop = '7px';
-  actions.append(actionButton('Edit details', 'edit-details', index));
+  actions.append(actionButton(recordIdentityIssue(row) ? 'View details' : 'Edit details', recordIdentityIssue(row) ? 'details' : 'edit-details', index));
   if (!isManual(row)) actions.append(actionButton('Open plant workbook', 'open-workbook', index));
   else actions.append(actionButton('Copy as new', 'copy', index));
   content.append(actions);
@@ -1019,7 +1254,7 @@ function render() {
   const view = $('#status-filter').value === 'needs_attention' ? 'attention' : 'queue';
   $('#page-title').textContent = app.workspaceView === 'files' ? 'Saved certificates' : view === 'attention' ? 'Needs attention' : 'Your certificates';
   $('#page-description').textContent = view === 'attention'
-    ? 'Check missing details and certificates due for follow-up.'
+    ? 'Check missing details and pending certificates.'
     : 'Find a company, check its certificate, and create the PDF.';
   if (app.workspaceView === 'files') $('#page-description').textContent = 'Find a PDF and open it. Files added manually appear here too.';
   $('#queue-title').textContent = ({all:'All companies', ready:'Ready', needs_attention:'Needs attention',
@@ -1079,9 +1314,14 @@ function render() {
 }
 
 function renderWorkbookIssues() {
+  const notes = $('#workbook-maintenance-note');
+  const plants = [...new Set((app.state.maintenance_notes || []).map(note => labelPlant(note.plant)))];
+  notes.hidden = plants.length === 0;
+  notes.textContent = plants.length
+    ? `${plants.join(' and ')}: Excel row order was kept. Sort dates in Excel if needed; certificates can still be created.` : '';
   const messages = (app.state.workbook_issues || []).map(row => row.detail || '').filter(Boolean);
   if (app.state.setup_warning) messages.push(app.state.setup_warning);
-  if (app.state.scan_complete === false && !messages.length) messages.push('Both Excel files could not be checked. Choose the correct plant files in Settings, then refresh.');
+  if (app.state.scan_complete === false && !app.state.workbooks_disconnected && !messages.length) messages.push('Both Excel files could not be checked. Choose the correct plant files in Settings, then refresh.');
   const unique = [...new Set(messages)];
   $('#workbook-issues').hidden = unique.length === 0;
   renderWarningList($('#workbook-issue-list'), unique);
@@ -1111,7 +1351,8 @@ async function refreshState() {
   try {
     const response = await api('/api/check', {});
     setState(response.state);
-    if (response.state?.scan_complete === false || response.state?.setup_warning) toast('Some Excel files could not be checked. See the workbook message above the company list.', true);
+    if (response.state?.workbooks_disconnected) toast('No Excel files connected.');
+    else if (response.state?.scan_complete === false || response.state?.setup_warning) toast('Some Excel files could not be checked. See the workbook message above the company list.', true);
     else toast('Workbooks refreshed.');
   } catch (error) { toast(error.message, true); }
   finally { setBusy(false); }
@@ -1164,7 +1405,7 @@ async function syncWorkbookChanges() {
 
 function rowWarningSummary(row) {
   const detail = String(row.detail || '').trim();
-  if (Array.isArray(row.warnings) && row.warnings.length) return row.warnings;
+  if (Array.isArray(row.warnings) && row.warnings.length) return [...new Set(row.warnings.filter(value => !isRoutineNotice(value)))];
   if (row.outcome === 'needs_review' && stateOf(row) === 'ready') return [detail || 'Review this row before issuing.'];
   if (row.system_alert && detail && stateOf(row) !== 'generated') return [detail];
   return [];
@@ -1204,7 +1445,8 @@ function returnFromWarnings() {
 }
 
 async function submitGeneration(payload, confirmed = false, endpoint = '/api/generate', fromDetails = false) {
-  if (app.generationBusy) return;
+  if (app.generationBusy || app.detailsBusy || app.backupBusy || app.completionBusy
+      || app.clientBusy || app.settingsBusy || app.stopping) return;
   app.generationBusy = true;
   payload = { ...payload, expected_revision: payload.expected_revision ?? app.workspaceRevision ?? app.state.workspace_revision ?? '' };
   if (fromDetails) setDetailsBusy(true);
@@ -1227,8 +1469,8 @@ async function submitGeneration(payload, confirmed = false, endpoint = '/api/gen
       showGenerationSuccess(response);
     } else toast('No certificates were generated. Check the selected rows.');
   } catch (error) {
-    if (fromDetails) { $('#details-error').textContent = error.message; $('#details-error').hidden = false; }
-    toast(error.message, true);
+    if (fromDetails) showDetailsError(error.message);
+    else toast(error.message, true);
   }
   finally { app.generationBusy = false; if (fromDetails) setDetailsBusy(false); setBusy(false); }
 }
@@ -1300,6 +1542,46 @@ async function pickAnnexure() {
   finally { setDetailsBusy(false); setBusy(false); schedulePreview(); }
 }
 
+function deviceReceiptEditor(raw, key) {
+  const section = element('section', 'device-receipts');
+  section.append(element('h3', '', 'Devices received'), element('p', 'form-hint', 'Enter only the devices covered by this destruction certificate.'));
+  const storage = element('textarea'); storage.hidden = true; storage.dataset.certificateField = key;
+  let rows = [];
+  try { const parsed = JSON.parse(raw || '[]'); if (Array.isArray(parsed)) rows = parsed; } catch { /* Keep incomplete entries editable. */ }
+  if (!rows.length) rows = [{date:'', count:''}];
+  const list = element('div', 'device-receipt-list');
+  const total = element('p', 'form-hint');
+  const add = element('button', 'button button-quiet', '+ Add receipt'); add.type = 'button';
+  function sync(changed = false) {
+    storage.value = JSON.stringify(rows);
+    const count = rows.reduce((sum, row) => sum + (/^[0-9]+$/.test(String(row.count)) ? Number(row.count) : 0), 0);
+    total.textContent = `Total devices: ${count}`;
+    add.disabled = rows.length >= 100;
+    if (changed) storage.dispatchEvent(new Event('input', {bubbles:true}));
+  }
+  function renderRows() {
+    list.replaceChildren();
+    rows.forEach((row, index) => {
+      const line = element('div', 'device-receipt-row');
+      for (const [name, title, type] of [['date','Date received','date'], ['count','Number of devices','number']]) {
+        const label = element('label', 'field'); label.append(element('span', '', title));
+        const input = element('input'); input.type = type; input.value = row[name] || '';
+        if (name === 'count') { input.min = '1'; input.max = '1000000000'; input.step = '1'; }
+        input.setAttribute('aria-label', `${title}, receipt ${index + 1}`);
+        input.addEventListener('input', () => { row[name] = input.value; sync(true); });
+        label.append(input); line.append(label);
+      }
+      const remove = element('button', 'text-button', 'Remove'); remove.type = 'button';
+      remove.setAttribute('aria-label', `Remove receipt ${index + 1}`);
+      remove.addEventListener('click', () => { rows.splice(index, 1); renderRows(); sync(true); });
+      line.append(remove); list.append(line);
+    });
+  }
+  add.addEventListener('click', () => { if (rows.length < 100) { rows.push({date:'', count:''}); renderRows(); sync(true); } });
+  renderRows(); sync(); section.append(storage, list, total, add);
+  return section;
+}
+
 function renderTemplateEditor() {
   const form = $('#details-form');
   const id = form.elements.namedItem('certificate_type').value;
@@ -1312,7 +1594,13 @@ function renderTemplateEditor() {
   const container = $('#template-editor');
   container.replaceChildren();
   app.editor.template = id;
-  $('#form6-hint').textContent = id === 'standard' ? 'Expected' : 'Optional';
+  const typeSelect = form.elements.namedItem('certificate_type');
+  const destructionOption = Array.from(typeSelect.options || []).find(option => option.value === 'destruction');
+  if (destructionOption) destructionOption.disabled = Boolean(app.editor.sourceSn != null && form.elements.namedItem('source_kind').value === 'workbook');
+  typeSelect.disabled = Boolean(app.editor.existing && (app.editor.destructionSource || id === 'destruction'));
+  const form6Required = app.editor?.firstGeneration
+    || (app.editor && form.elements.namedItem('source_kind').value === 'workbook' && !app.editor.existing);
+  $('#form6-hint').textContent = form6Required ? 'Required for certificate' : (id === 'standard' ? 'Expected' : 'Optional');
   const values = app.editor.fields[id] ||= {};
   if (spec && ['sita', 'siemens'].includes(id) && !Object.hasOwn(values, 'company_display')) {
     values.company_display = spec?.default_company || '';
@@ -1333,6 +1621,10 @@ function renderTemplateEditor() {
     let headingAdded = false;
     for (const field of spec?.fields || []) {
       if (field.group !== group) continue;
+      if (field.type === 'receipts') {
+        container.append(deviceReceiptEditor(values[field.key] || '', field.key));
+        continue;
+      }
       if (['weight_display', 'company_display'].includes(field.key)) continue;
       if (group === 'wording' && field.key !== 'company_display') continue;
       if (group === 'details' && commonTemplateKeys.has(field.key)) {
@@ -1369,25 +1661,38 @@ function renderTemplateEditor() {
 
 function updateSourceControls() {
   const form = $('#details-form');
-  const manual = form.elements.namedItem('source_kind').value === 'manual';
   const kind = form.elements.namedItem('certificate_type').value;
+  if (kind === 'destruction') form.elements.namedItem('source_kind').value = 'manual';
+  const manual = form.elements.namedItem('source_kind').value === 'manual';
   const certificateWeight = form.elements.namedItem('certificate_weight');
   const useCertificateWeight = form.elements.namedItem('use_certificate_weight');
   const existingWorkbook = app.editor?.existing && app.editor?.sourceSn != null && !manual;
+  const manualRecord = manual && app.editor?.recordId
+    ? app.state.rows.find(row => isManual(row) && row.record_id === app.editor.recordId) : null;
+  const existingIssuedManual = manual && app.editor?.existing && app.editor?.recordId
+    && (app.editor.issuedCertificate || manualRecord?.has_issued_certificate
+      || ['generated', 'generated_manual', 'completed'].includes(stateOf(manualRecord || {})));
   $('#edit-scope-field').hidden = true;
   if (!manual && !existingWorkbook) form.elements.namedItem('edit_scope').value = 'update_excel';
   form.elements.namedItem('case_id').readOnly = Boolean(existingWorkbook);
-  form.elements.namedItem('plant').disabled = Boolean(existingWorkbook);
+  form.elements.namedItem('plant').disabled = Boolean(existingWorkbook || existingIssuedManual);
+  form.elements.namedItem('plant').title = existingIssuedManual
+    ? 'Plant is fixed for an issued certificate. Copy into a new certificate to use another plant.' : '';
+  if (existingIssuedManual && (manualRecord?.plant || app.editor.sourcePlant)) {
+    form.elements.namedItem('plant').value = manualRecord?.plant || app.editor.sourcePlant;
+    app.editor.issuedCertificate = true;
+  }
   if (existingWorkbook) {
     form.elements.namedItem('case_id').value = app.editor.sourceSn;
     form.elements.namedItem('plant').value = app.editor.sourcePlant;
   }
-  form.elements.namedItem('source_kind').disabled = Boolean(existingWorkbook);
+  form.elements.namedItem('source_kind').disabled = Boolean(existingWorkbook || kind === 'destruction');
   $('#record-options').hidden = Boolean(existingWorkbook);
   $('#edit-scope-hint').textContent = existingWorkbook
     ? 'Excel still records the certificate number, date and Generated status. Cancel does not save changes.'
     : 'A new Excel row is saved only when the PDF is created successfully.';
   form.elements.namedItem('case_id').required = !manual;
+  form.elements.namedItem('form6').required = !manual && (!app.editor?.existing || Boolean(app.editor?.firstGeneration));
   $('#case-required').hidden = manual;
   $('#case-optional').hidden = !manual;
   $('#pick-workbook').hidden = manual || Boolean(existingWorkbook);
@@ -1401,7 +1706,7 @@ function updateSourceControls() {
   certificateWeight.closest('.field').hidden = false;
   form.elements.namedItem('case_id').closest('.field').hidden = manual;
   form.elements.namedItem('inward_date').closest('.field').hidden = manual && kind === 'siemens';
-  form.elements.namedItem('form6').closest('.field').hidden = kind !== 'standard';
+  form.elements.namedItem('form6').closest('.field').hidden = manual && kind !== 'standard';
   form.elements.namedItem('reference').closest('.field').hidden = manual && kind === 'siemens';
   certificateWeight.closest('.field').querySelector('span').textContent = certificateWeight.required
     ? 'Certificate Weight (kg) · Required' : 'Certificate Weight (kg)';
@@ -1409,18 +1714,26 @@ function updateSourceControls() {
   $('#edit-items-hint').hidden = manual || app.editor.firstGeneration || !app.editor.itemHint;
   $('#details-description').textContent = manual
     ? 'Enter the company details below. You do not need an Excel row.'
+    : app.editor?.firstGeneration && !form.elements.namedItem('form6').value.trim()
+      ? 'Enter the Form 6 number now. It will be saved with the certificate.'
     : existingWorkbook ? 'These details came from Excel. Change only what you need, then check the preview.'
     : 'Enter the company details. The app will save a new Excel row with the PDF.';
   $('#save-details').textContent = 'Create PDF';
   $('#weight-options').open = manual || Boolean(useCertificateWeight?.checked);
+  $('#weight-options').hidden = kind === 'destruction';
+  if (kind === 'destruction') {
+    form.elements.namedItem('inward_date').closest('.field').hidden = true;
+    form.elements.namedItem('form6').required = false;
+    form.elements.namedItem('form6').closest('.field').hidden = true;
+  }
   $('#weight-options-title').textContent = 'Certificate Weight';
   $('#certificate-weight-hint').textContent = manual ? 'Enter the total weight to print on this certificate.'
     : 'Enter the weight to print. Clear it to use the Excel weight or material total.';
   $('#case-id-hint').textContent = existingWorkbook ? 'This identifies the original Excel record, so it cannot be changed here.'
-    : 'Filled in automatically when your Excel IDs are numeric. You can change it.';
+    : 'Filled in automatically when your Excel Serial Numbers are numeric. You can change it.';
   suggestWorkbookId();
   updatePrintedWeight();
-  setEditorMode(true);
+  setEditorMode(app.editor?.editingDetails ?? true);
 }
 
 function nextWorkbookId(plant) {
@@ -1439,14 +1752,15 @@ function suggestWorkbookId() {
   const suggestion = nextWorkbookId(form.elements.namedItem('plant').value);
   if (!input.value || input.value === app.editor.suggestedCaseId) input.value = suggestion;
   app.editor.suggestedCaseId = suggestion;
-  $('#case-id-hint').textContent = suggestion ? 'Next ID filled in. You can change it. Excel is checked again before saving.'
-    : 'Enter the ID for this new Excel record. Existing records are never replaced.';
+  $('#case-id-hint').textContent = suggestion ? 'Next Serial Number filled in. You can change it. Excel is checked again before saving.'
+    : 'Enter a unique Serial Number for this new Excel record.';
 }
 
 function printedWeight() {
   const form = $('#details-form');
   const value = name => form.elements.namedItem(name)?.value || '';
-  const override = value('source_kind') === 'manual' || Boolean(form.elements.namedItem('use_certificate_weight')?.checked);
+  const override = value('source_kind') === 'manual'
+    ? Boolean(value('certificate_weight').trim()) : Boolean(form.elements.namedItem('use_certificate_weight')?.checked);
   const total = materialWeightTotal();
   const excelWeight = app.editor?.excelCertificateWeight ?? '';
   const hasExcelWeight = String(excelWeight).trim() !== '';
@@ -1468,7 +1782,7 @@ function applyCertificateWeight(value) {
 }
 
 function usesSummaryEditor() {
-  return Boolean(app.editor?.existing && !app.editor.firstGeneration);
+  return Boolean(app.editor?.existing && !app.editor.firstGeneration && app.editor.template !== 'destruction');
 }
 
 function summaryEditorVisible() {
@@ -1543,7 +1857,7 @@ function renderInlineMaterials(container) {
     for (const [key, label] of materialFields) {
       const field = element('label', `field inline-material-${key}`); field.append(element('span', '', label));
       const input = element('input'); input.type = 'text'; input.inputMode = key === 'item' ? 'text' : 'decimal';
-      input.maxLength = key === 'item' ? 180 : 40; input.value = item[key];
+      input.maxLength = key === 'item' ? 500 : 100; input.value = item[key];
       input.setAttribute('aria-label', `${label} for material ${index + 1}`);
       const update = event => {
         event.stopPropagation?.(); app.materialRows[index].inputs[key].value = input.value;
@@ -1570,6 +1884,7 @@ function renderInlineMaterials(container) {
 
 function startInlineEdit(key, label) {
   if (!usesSummaryEditor() || app.detailsBusy) return;
+  if (key === 'cod_no' || (key === 'cod_date' && !app.editor?.issuedCertificate)) return;
   if (!['materials', ...Object.values(summaryFields)].includes(key) && !key.startsWith('certificate_fields.')) return;
   if (key !== 'materials' && !inlineSource(key)) return;
   finishInlineEdit();
@@ -1631,6 +1946,30 @@ function updatePrintedWeight() {
   }
 }
 
+function updateSingleCodControls() {
+  if (!app.editor) return;
+  const form = $('#details-form');
+  const input = form.elements.namedItem('starting_cod');
+  const numbering = app.editor.numbering || app.state.numbering;
+  const knownCod = app.state.rows.some(row => String(row.certificate_no || '').trim())
+    || (app.state.certificate_inventory?.entries || []).some(entry => entry.cods?.length);
+  const fixed = form.elements.namedItem('cod_no').value.trim() || app.editor.issuedCertificate;
+  const needsStart = !fixed && (numbering ? numbering.needs_start : !knownCod);
+  app.editor.needsStartingCod = Boolean(needsStart);
+  $('#single-start-cod-section').hidden = !needsStart;
+  input.required = Boolean(needsStart);
+  input.disabled = !needsStart;
+  input.setCustomValidity('');
+  const value = input.value.trim();
+  const valid = /^[0-9]{1,12}$/.test(value) && Number(value) >= 1;
+  if (needsStart && value && !valid) input.setCustomValidity('Enter a starting COD number (1 or higher).');
+  const format = number => (numbering?.prefix || '') + String(number).padStart(numbering?.width || 4, '0');
+  $('#single-start-cod-hint').textContent = valid
+    ? `First COD: ${format(Number(value))}. Next: ${format(Number(value) + 1)}.`
+    : 'No previous COD found. Enter the number to start from.';
+  if (needsStart && !value && !app.previewLoading) $('#preview-status').textContent = 'Enter the starting COD number to preview.';
+}
+
 function renderEditorSummary() {
   if (!app.editor?.baseline) return;
   // Keep the active input mounted while automatic previews and draft summaries
@@ -1644,12 +1983,12 @@ function renderEditorSummary() {
   const facts = $('#editor-facts'); facts.replaceChildren();
   const weightText = preview?.printed_details?.certificate_weight || (String(weight).trim() !== '' ? `${readableNumber(weight)} kg` : '');
   const rows = [['Company', value('supplier') || 'Company name missing'],
-    ['COD number (preview)', preview?.certificate_no || value('cod_no') || 'Assigned automatically'],
+    ['COD number (preview)', preview?.certificate_no || value('cod_no') || (app.editor.needsStartingCod ? 'Enter the starting COD above' : 'Assigned automatically')],
     ['COD date', codDate ? dateLabel(codDate) : 'Set automatically'],
     ['Reference number', value('reference') || 'Not entered']];
   if (value('certificate_type') === 'standard') rows.push(['Form 6', value('form6') || 'Not entered']);
   rows.push(['City', value('location') || 'Not entered'], ['Received', dateLabel(value('inward_date'))],
-    ['Plant', labelPlant(value('plant'))], ['Inward ID / SN', value('case_id') || 'Not entered'],
+    ['Plant', labelPlant(value('plant'))], ['Serial Number', value('case_id') || 'Not entered'],
     ['Certificate Weight', weightText ? `${weightText} · ${source}` : 'Weight missing in Excel']);
   const companyOnPdf = preview?.printed_details?.company_display;
   const expectedCompany = [value('supplier'), value('location').trim()].filter(Boolean).join(', ').toUpperCase();
@@ -1678,7 +2017,7 @@ function renderEditorSummary() {
   const materials = $('#editor-materials'); materials.replaceChildren();
   const sourceNote = $('#editor-source-note');
   const notes = app.editor.importNotes || [];
-  sourceNote.hidden = !app.editor.sourceSheet;
+  sourceNote.hidden = true;
   sourceNote.textContent = app.editor.sourceSheet
     ? [`Excel: ${app.editor.sourceSheet} · headings on row ${app.editor.headerRow || 1}.`, ...notes].join(' ') : '';
   sourceNote.title = Object.entries(app.editor.columnMapping || {}).map(([key, column]) => `${fieldLabels[key] || key}: ${column.column} (${column.heading})`).join('\n');
@@ -1707,28 +2046,30 @@ function setEditorMode(editing = false) {
   if (app.editor) app.editor.editingDetails = Boolean(editing);
   const summaryVisible = summaryEditorVisible();
   const form = $('#details-form');
+  updateSingleCodControls();
   $('#editor-fields').hidden = false;
   $('#editor-summary').hidden = !summaryVisible;
   $('#editor-summary').setAttribute('aria-label', first ? 'Details from Excel' : 'Certificate details');
   $('#excel-detail-fields').hidden = summaryVisible;
   $('#template-editor').hidden = summaryVisible;
   $('#edit-items-hint').hidden = summaryVisible || !app.editor?.itemHint;
-  $('#editor-summary-note').textContent = first
-    ? 'Edit details for this PDF only. Your Excel inward will stay unchanged. The COD number is reserved when you generate.'
-    : form.elements.namedItem('source_kind').value === 'manual'
-      ? 'Changes are saved when you save the certificate.'
-      : 'When saving, choose whether to update Excel too.';
+  $('#editor-summary-note').textContent = first && editing
+    ? (!form.elements.namedItem('form6').value.trim()
+      ? 'The Form 6 number will be saved to Excel with the certificate.'
+      : 'Changes apply to this PDF.')
+    : '';
+  $('#editor-summary-note').hidden = !$('#editor-summary-note').textContent;
   $('#change-details').hidden = true;
   $('#finish-editing').hidden = true;
   $('#edit-pdf-details').hidden = !(first || usesSummaryEditor());
   $('#edit-pdf-details').textContent = editing ? 'Done editing' : '✎ Edit PDF details';
   $('#edit-pdf-details').setAttribute('aria-pressed', String(Boolean(editing)));
   $('#editor-mode-title').textContent = first ? (editing ? 'Edit PDF details' : 'Check details from Excel') : app.editor?.existing ? 'Edit certificate' : 'Certificate details';
-  $('#details-description').textContent = first
-    ? editing ? 'Change what prints on this PDF. Excel will stay unchanged.' : 'Choose a type, check the preview and generate.'
-    : summaryVisible ? 'Check the preview, then use Edit PDF details if something needs correcting.' : 'Make changes here. The preview updates automatically as you type.';
+  $('#details-description').textContent = 'Check the preview, then save.';
   for (const name of ['supplier', 'location', 'inward_date', 'form6', 'reference', 'cod_no', 'cod_date']) {
-    form.elements.namedItem(name).readOnly = first && (!editing || ['cod_no', 'cod_date'].includes(name));
+    form.elements.namedItem(name).readOnly = name === 'cod_no'
+      || (name === 'cod_date' && !app.editor?.issuedCertificate)
+      || (first && !editing && ['supplier', 'location', 'inward_date', 'form6', 'reference'].includes(name));
   }
   if (first) form.elements.namedItem('case_id').readOnly = true;
   if (editing && form.elements.namedItem('source_kind').value === 'workbook'
@@ -1736,11 +2077,21 @@ function setEditorMode(editing = false) {
     form.elements.namedItem('certificate_weight').value = printedWeight().weight;
   }
   $('#save-details').textContent = first ? 'Generate certificate' : app.editor?.existing ? 'Save corrected certificate' : 'Create PDF';
+  if (app.editor?.template === 'destruction') {
+    $('#save-details').textContent = app.editor.issuedCertificate ? 'Save corrected certificate' : 'Create data destruction PDF';
+    $('#details-description').textContent = app.editor.destructionSource
+      ? `Additional certificate for ${labelPlant(app.editor.destructionSource.plant)} inward ${app.editor.destructionSource.case_id}. Check the actual destruction details and both preview pages.`
+      : 'Enter the company and actual destruction details, then check both preview pages. An inward entry is optional.';
+  }
   renderEditorSummary();
 }
 
 function validateEditor() {
   const form = $('#details-form');
+  const start = form.elements.namedItem('starting_cod');
+  if (start.required && !start.checkValidity()) {
+    start.reportValidity(); start.focus(); return false;
+  }
   if (form.checkValidity()) return true;
   setEditorMode(true);
   if (usesSummaryEditor()) {
@@ -1772,6 +2123,11 @@ function updateDetailsButtons() {
   for (const id of ['save-details', 'save-draft', 'preview-details', 'pick-annexure', 'remove-annexure', 'keep-working-draft']) $(`#${id}`).disabled = unavailable;
   $('#preview-details').disabled = unavailable || Boolean(app.previewLoading);
   if ($('#details-form').elements.namedItem('source_kind').value === 'workbook' && app.editor?.issuanceBlocked) $('#save-details').disabled = true;
+  if (app.editor?.identityIssue) {
+    $('#preview-details').disabled = true;
+    showDetailsError(app.editor.identityIssue);
+    $('#preview-status').textContent = 'Preview unavailable';
+  }
 }
 
 function setDetailsBusy(on) {
@@ -1781,6 +2137,7 @@ function setDetailsBusy(on) {
 }
 
 function invalidatePreview() {
+  $('#preview-detail-images').replaceChildren();
   clearTimeout(app.previewTimer);
   app.previewRevision++;
   if (app.editor) app.editor.previewFacts = null;
@@ -1798,7 +2155,7 @@ function invalidatePreview() {
   $('#preview-warnings').hidden = true;
   $('#preview-warnings-title').hidden = true;
   $('#preview-warnings').replaceChildren();
-  $('#preview-status').textContent = 'The preview updates automatically after you finish typing.';
+  $('#preview-status').textContent = 'Preview updates automatically.';
   $('#preview-details').textContent = 'Update preview';
   if (app.editor?.baseline && $('#details-modal').open) {
     updatePrintedWeight();
@@ -1809,30 +2166,32 @@ function invalidatePreview() {
       $('#working-draft-status').textContent = 'No unsaved field changes. Excel is unchanged.';
     }
   }
+  if (app.editor?.identityIssue) updateDetailsButtons();
 }
 
 function schedulePreview() {
   clearTimeout(app.previewTimer);
   const editor = app.editor;
-  if (!editor || !$('#details-modal').open || !app.templatesLoaded) return;
+  if (!editor || editor.identityIssue || !$('#details-modal').open || !app.templatesLoaded) return;
   app.previewTimer = setTimeout(async () => {
     if (app.editor !== editor || !$('#details-modal').open || app.detailsBusy || app.generationBusy || app.pendingConfirmation) return;
     if (app.previewLoading) { schedulePreview(); return; }
     const form = $('#details-form');
     if (!form.checkValidity() || !form.elements.namedItem('supplier').value.trim()) return;
     const {weight} = printedWeight();
-    if (!String(weight).trim()) return;
+    if (editor.template !== 'destruction' && !String(weight).trim()) return;
     await previewDetails(); // Read-only: never allocates COD or writes an Excel row.
   }, 1000);
 }
 
 async function openDetails(row = null, copyAsNew = false, skipRecovery = false, startEditing = false) {
-  if (app.loadingWorkspace) return;
+  if (app.loadingWorkspace || app.generationBusy || app.backupBusy || app.completionBusy
+      || app.clientBusy || app.settingsBusy || app.stopping) return;
   if ($('#details-modal').open || app.detailsBusy) return;
   if (!skipRecovery && offerDraftRecovery(row, copyAsNew, true, startEditing)) return;
   const sourceRow = row;
   const issued = row && (row.has_issued_certificate || ['generated', 'generated_manual', 'completed'].includes(stateOf(row)));
-  if (row?.last_certificate_details && !copyAsNew) {
+  if (row?.last_certificate_details && !copyAsNew && !recordIdentityIssue(row)) {
     row = { ...row, ...row.last_certificate_details };
   }
   const form = $('#details-form');
@@ -1843,13 +2202,17 @@ async function openDetails(row = null, copyAsNew = false, skipRecovery = false, 
   for (const disclosure of form.querySelectorAll('details')) disclosure.open = false;
   const id = templateId(row || {});
   app.editor = { existing: Boolean(row) && !copyAsNew, recordId: copyAsNew ? null : row?.record_id || null, template: id,
-    editingDetails: Boolean(startEditing || !row || copyAsNew), pdfEditUsed: false,
+    destructionSource: copyAsNew ? null : row?.destruction_source || row?.raw_details?.destruction_source || null,
+    editingDetails: Boolean(startEditing || !row || copyAsNew || (row && !isManual(row) && !issued && !row.form6)),
+    pdfEditUsed: Boolean(startEditing && row && !isManual(row) && !copyAsNew && !issued),
     firstGeneration: Boolean(row && !isManual(row) && !copyAsNew && !issued), sourceLocation: sourceRow?.location || '',
-    issuanceBlocked: Boolean((!issued && sourceRow?.issuance_blocked) || app.state.scan_complete === false),
+    issuanceBlocked: Boolean(recordIdentityIssue(sourceRow) || (!issued && sourceRow?.issuance_blocked) || app.state.scan_complete === false),
+    identityIssue: copyAsNew ? '' : recordIdentityIssue(sourceRow),
     sourceSheet: sourceRow?.sheet || '', headerRow: sourceRow?.source_header_row || 1,
     importNotes: sourceRow?.import_notes || [], columnMapping: sourceRow?.column_mapping || {},
     sourceSn: row && !isManual(row) && !copyAsNew ? String(row.sn) : null, sourcePlant: row?.plant || null,
     excelCertificateWeight: !copyAsNew && !isManual(row || {}) ? sourceRow?.certificate_weight ?? '' : '',
+    issuedCertificate: !copyAsNew && Boolean(issued),
     fields: { [id]: { ...(row?.certificate_fields || {}) } }, annexures: {}, annexureId: row?.certificate_fields?._annexure || null,
     touched: new Set(), sourceExplicit: false, rawNumeric: {}, rawDetails: isManual(row || {}) ? { ...(row.raw_details || {}) } : {}, workspaceRevision: app.workspaceRevision ?? app.state.workspace_revision ?? '' };
   form.elements.namedItem('certificate_type').value = id;
@@ -1901,9 +2264,9 @@ async function openDetails(row = null, copyAsNew = false, skipRecovery = false, 
   } else {
     const selectedPlant = app.workspaceView === 'files' ? $('#saved-plant-filter').value : $('#plant-filter').value;
     if (['plant1', 'plant2'].includes(selectedPlant)) form.elements.namedItem('plant').value = selectedPlant;
-    const localDate = new Date();
-    localDate.setMinutes(localDate.getMinutes() - localDate.getTimezoneOffset());
-    form.elements.namedItem('inward_date').value = localDate.toISOString().slice(0, 10);
+    // Leave the receipt date empty so the user enters the actual date; never
+    // silently substitute today's date for the material receipt date.
+    form.elements.namedItem('inward_date').value = '';
   }
   const inwardTotal = items.length && items.every(item => item.weight != null && Number.isFinite(Number(item.weight)))
     ? items.reduce((sum, item) => sum + Number(item.weight), 0) : null;
@@ -1916,11 +2279,13 @@ async function openDetails(row = null, copyAsNew = false, skipRecovery = false, 
   app.editor.excelBaseline = sourceRow && !isManual(sourceRow) ? workbookRowPayload(sourceRow) : null;
   renderChangeSummary();
   $('#working-draft-status').textContent = app.editor.firstGeneration
-    ? 'Certificate choices are saved on this computer. Excel details stay unchanged.'
+    ? (!form.elements.namedItem('form6').value.trim()
+      ? 'The Form 6 number will be saved to Excel when you create the certificate.'
+      : 'Certificate choices are saved on this computer. Excel details stay unchanged.')
     : 'Edits are saved on this computer. Choose whether to update Excel when saving corrections.';
   $('#details-error').hidden = true;
   $('#details-modal').showModal();
-  setEditorMode(startEditing || !row || copyAsNew);
+  setEditorMode(app.editor.editingDetails);
   $('#record-options').open = !row || copyAsNew;
   const editor = app.editor;
   const initialPreviewRevision = app.previewRevision;
@@ -1930,7 +2295,9 @@ async function openDetails(row = null, copyAsNew = false, skipRecovery = false, 
     captureTemplateFields(); renderTemplateEditor();
     if (!changed) editor.baseline = detailsBody(form);
     renderChangeSummary();
-    if (!templatesReady) {
+    if (editor.identityIssue) {
+      updateDetailsButtons();
+    } else if (!templatesReady) {
       $('#details-error').textContent = 'Certificate templates could not be loaded. Close and reopen this certificate to try again.';
       $('#details-error').hidden = false;
     } else if (row && !copyAsNew && !changed && app.previewRevision === initialPreviewRevision
@@ -1941,7 +2308,14 @@ async function openDetails(row = null, copyAsNew = false, skipRecovery = false, 
 
 function comparisonFields(payload) {
   const fields = { plant: payload.plant, source_kind: payload.source_kind, ...(payload.details || {}) };
-  const numeric = value => String(value ?? '').trim() !== '' && Number.isFinite(Number(value)) ? String(Number(value)) : String(value ?? '');
+  if (payload.starting_cod != null) fields.starting_cod = payload.starting_cod;
+  const numeric = value => {
+    const raw = String(value ?? '').trim();
+    const grouping = '(?:[0-9]+|[0-9]{1,3}(?:,[0-9]{3})+|[0-9]{1,2}(?:,[0-9]{2})+,[0-9]{3})';
+    const valid = new RegExp(`^[+-]?(?:${grouping}(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$`).test(raw);
+    const number = valid ? Number(raw.replaceAll(',', '')) : NaN;
+    return Number.isFinite(number) ? String(number) : raw;
+  };
   for (const key of ['quantity', 'per_piece_weight', 'weight', 'certificate_weight']) {
     if (Object.hasOwn(fields, key)) fields[key] = numeric(fields[key]);
   }
@@ -1960,6 +2334,12 @@ function fieldDifferences(before, after) {
 }
 
 function changeDisplay(key, value) {
+  if (key === 'certificate_fields.device_receipts') {
+    try {
+      return JSON.parse(value || '[]').filter(row => row.date || row.count)
+        .map(row => `${dateLabel(row.date)}: ${row.count || 'count missing'} devices`).join('; ') || '(no device receipts)';
+    } catch { return 'Device receipts need checking'; }
+  }
   if (key !== 'items') return value || '(blank)';
   try {
     const items = JSON.parse(value);
@@ -2010,6 +2390,10 @@ function renderChangeSummary() {
 function readWorkingDraft() {
   try {
     const saved = JSON.parse(localStorage.getItem(workingDraftKey) || 'null');
+    if (app.state.history_reset && saved?.historyReset !== app.state.history_reset) {
+      localStorage.removeItem(workingDraftKey);
+      return null;
+    }
     return saved?.version === 1 && saved.values && saved.editor?.fields && saved.editor?.baseline && Array.isArray(saved.editor.touched) ? saved : null;
   } catch { return null; }
 }
@@ -2026,13 +2410,14 @@ function saveWorkingDraft() {
   const values = Object.fromEntries(new FormData(form).entries());
   values.plant = form.elements.namedItem('plant').value;
   values.source_kind = form.elements.namedItem('source_kind').value;
+  values.certificate_type = form.elements.namedItem('certificate_type').value;
   values.use_certificate_weight = Boolean(form.elements.namedItem('use_certificate_weight')?.checked);
   // Disabled override controls are omitted by FormData, but their local edit
   // must survive recovery. This is not sent to Excel unless explicitly ticked.
   values.certificate_weight = form.elements.namedItem('certificate_weight')?.value || '';
   try {
     const {inlineEdit, summaryHosts, previewFacts, ...savedEditor} = app.editor;
-    localStorage.setItem(workingDraftKey, JSON.stringify({ version: 1, savedAt: new Date().toISOString(), values,
+    localStorage.setItem(workingDraftKey, JSON.stringify({ version: 1, historyReset:app.state.history_reset || '', savedAt: new Date().toISOString(), values,
       editor: { ...savedEditor, touched: [...app.editor.touched] } }));
     app.editor.workingDraftSaved = true;
     $('#working-draft-status').textContent = app.editor.firstGeneration
@@ -2072,9 +2457,16 @@ async function restoreWorkingDraft() {
       && row.plant === app.editor.sourcePlant && String(row.sn) === String(app.editor.sourceSn));
     app.editor.pdfEditUsed = Boolean(saved.editor.pdfEditUsed);
     if (sourceRow) {
-      app.editor.firstGeneration = !(sourceRow.has_issued_certificate || ['generated', 'generated_manual', 'completed'].includes(stateOf(sourceRow)));
+      app.editor.issuedCertificate = Boolean(sourceRow.has_issued_certificate || ['generated', 'generated_manual', 'completed'].includes(stateOf(sourceRow)));
+      app.editor.firstGeneration = !app.editor.issuedCertificate;
       app.editor.sourceLocation = sourceRow.location || '';
+      app.editor.identityIssue = recordIdentityIssue(sourceRow);
     }
+    const workbookDraft = saved.values.source_kind === 'workbook';
+    const missingSource = workbookDraft && app.editor.sourceSn != null && !sourceRow;
+    if (missingSource) app.editor.identityIssue = 'This inward could not be found. Refresh Excel and reopen the record.';
+    app.editor.issuanceBlocked = Boolean(workbookDraft && (missingSource || app.state.scan_complete === false
+      || app.editor.identityIssue || (app.editor.firstGeneration && sourceRow?.issuance_blocked)));
     if (app.editor.excelCertificateWeight == null) {
       app.editor.excelCertificateWeight = app.state.rows.find(row => !isManual(row)
         && row.plant === app.editor.sourcePlant && String(row.sn) === String(app.editor.sourceSn))?.certificate_weight ?? '';
@@ -2111,6 +2503,7 @@ async function restoreWorkingDraft() {
     $('#details-error').hidden = true;
     $('#draft-recovery-modal').close(); $('#details-modal').showModal();
     setEditorMode(true);
+    updateDetailsButtons();
     schedulePreview();
     app.draftRecovery = null;
   } finally { app.restoringDraft = false; }
@@ -2146,10 +2539,13 @@ function certificateUrl(certificate) {
   const relativePath = String(certificate.relative_path || certificate.pdf_relative_path || filename).replaceAll('\\', '/');
   const parts = relativePath.split('/');
   if (!relativePath || parts.some(part => !part || part === '.' || part === '..' || part.includes(':') || /[\x00-\x1f]/.test(part))
-      || !/\.pdf$/i.test(relativePath) || parts.length > 2
-      || (parts.length === 2 && !['Auto Generated', 'Created in App', 'Manually Added'].includes(parts[0]))
+      || !/\.pdf$/i.test(relativePath)
       || (filename && parts.at(-1) !== filename)) return null;
-  const expectedPath = `/api/certificates/${parts.map(encodeURIComponent).join('/')}`;
+  // Match the server's quote(..., safe='/') encoding, including characters
+  // encodeURIComponent normally leaves literal in readable company names.
+  const encodePart = part => encodeURIComponent(part).replace(/[!'()*]/g,
+    character => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
+  const expectedPath = `/api/certificates/${parts.map(encodePart).join('/')}`;
   const url = new URL(certificate.pdf_url || expectedPath, window.location.href);
   return url.origin === window.location.origin && url.pathname === expectedPath && !url.search && !url.hash ? url.href : null;
 }
@@ -2209,7 +2605,7 @@ function detailsBody(form) {
     || Boolean(form.elements.namedItem('use_certificate_weight')?.checked);
   const details = {};
   for (const [key, value] of data.entries()) {
-    if (key === 'plant' || key === 'source_kind' || key === 'edit_scope' || key === 'use_certificate_weight') continue;
+    if (key === 'plant' || key === 'source_kind' || key === 'edit_scope' || key === 'use_certificate_weight' || key === 'starting_cod') continue;
     details[key] = String(value).trim();
   }
   const extraMaterials = new Map();
@@ -2243,6 +2639,9 @@ function detailsBody(form) {
   }
   captureTemplateFields();
   details.certificate_fields = { ...app.editor.fields[app.editor.template] };
+  // Disabled selectors remain authoritative and do not appear in FormData.
+  details.certificate_type = form.elements.namedItem('certificate_type').value;
+  if (app.editor.template === 'destruction' && app.editor.destructionSource) details.destruction_source = app.editor.destructionSource;
   // Old certificates may contain a printed-name override. An explicit edit
   // to the company (or Standard location) must use the main fields instead.
   if (app.editor.touched.has('supplier') || (app.editor.template === 'standard' && app.editor.touched.has('location'))) {
@@ -2253,6 +2652,8 @@ function detailsBody(form) {
     if (field.group === 'details' && commonTemplateKeys.has(field.key)) delete details.certificate_fields[field.key];
   }
   return { plant: data.get('plant') || form.elements.namedItem('plant').value, details, source_kind: source,
+    ...(app.editor.needsStartingCod && form.elements.namedItem('starting_cod').value.trim()
+      ? {starting_cod:form.elements.namedItem('starting_cod').value.trim()} : {}),
     ...(app.editor?.firstGeneration && app.editor.pdfEditUsed ? {pdf_only_edits:true} : {}),
     ...(source === 'workbook' && app.editor.sourceSn == null ? {create_new:true} : {}),
     use_certificate_weight: source === 'workbook' && Boolean(form.elements.namedItem('use_certificate_weight')?.checked),
@@ -2265,14 +2666,13 @@ function detailsBody(form) {
 async function saveDetails(event) {
   event.preventDefault();
   if (app.detailsBusy || !app.templatesLoaded) return;
+  if (app.editor?.identityIssue) { updateDetailsButtons(); return; }
   finishInlineEdit();
   if (!validateEditor()) return;
   const payload = detailsBody(event.currentTarget);
-  if (payload.create_new && app.state.rows.some(row => !isManual(row) && row.plant === payload.plant
-      && String(row.sn ?? row.case_id).trim() === payload.details.case_id)) {
+  if (payload.create_new && duplicateSerialNumber(payload.plant, payload.details.case_id)) {
     setEditorMode(true); $('#record-options').open = true;
-    $('#details-error').textContent = 'This Excel ID already exists. Choose that company from the list to edit it, or enter a different ID for the new certificate.';
-    $('#details-error').hidden = false;
+    showDetailsError('This Serial Number already exists in this plant.');
     event.currentTarget.elements.namedItem('case_id').focus(); return;
   }
   if (payload.source_kind === 'workbook' && app.editor.existing && !app.editor.firstGeneration
@@ -2320,7 +2720,14 @@ async function saveExcelChoice(updateExcel) {
 
 async function saveDraft() {
   const form = $('#details-form');
-  if (app.detailsBusy || !app.templatesLoaded || form.elements.namedItem('source_kind').value !== 'manual' || !form.reportValidity()) return;
+  if (app.detailsBusy || !app.templatesLoaded || form.elements.namedItem('source_kind').value !== 'manual') return;
+  // A draft does not issue or reserve a certificate number.
+  const start = form.elements.namedItem('starting_cod');
+  const wasDisabled = start.disabled;
+  let valid;
+  try { start.disabled = true; valid = form.reportValidity(); }
+  finally { start.disabled = wasDisabled; }
+  if (!valid) return;
   const payload = detailsBody(form);
   setDetailsBusy(true);
   setBusy(true, 'Saving your draft…', 'Saving the details in your local register.');
@@ -2337,6 +2744,11 @@ async function saveDraft() {
 
 async function previewDetails() {
   const form = $('#details-form');
+  if (app.editor?.needsStartingCod && !form.elements.namedItem('starting_cod').value.trim()) {
+    $('#preview-status').textContent = 'Enter the starting COD number to preview.';
+    return;
+  }
+  if (app.editor?.identityIssue) { updateDetailsButtons(); return; }
   if (app.detailsBusy || app.previewLoading || !app.templatesLoaded || !validateEditor()) return;
   const payload = detailsBody(form);
   invalidatePreview();
@@ -2351,6 +2763,8 @@ async function previewDetails() {
     const url = new URL(response.preview_url, window.location.href);
     if (url.origin !== window.location.origin || !['http:', 'https:'].includes(url.protocol)) throw new Error('The PDF preview address is not available in this workspace.');
     app.editor.previewFacts = {certificate_no: response.certificate_no, certificate_date: response.certificate_date, printed_details: response.printed_details};
+    if (response.numbering) app.editor.numbering = response.numbering;
+    updateSingleCodControls();
     renderEditorSummary();
     $('#preview-link').href = url.href;
     $('#preview-document').hidden = false;
@@ -2364,20 +2778,27 @@ async function previewDetails() {
     $('#preview-image').hidden = !imageUrl;
     $('#preview-image-note').hidden = Boolean(imageUrl);
     if (imageUrl) $('#preview-image').src = imageUrl;
-    $('#preview-status').textContent = imageUrl
-      ? 'Preview is up to date. Check the company and weight before creating.'
-      : 'PDF preview ready. Open the full PDF to check every page; the first-page image is unavailable.';
-    $('#preview-number').textContent = `Certificate number: ${response.certificate_no || 'Not available'}${response.certificate_date ? ` · COD date: ${dateLabel(response.certificate_date)}` : ''} (preview only; not reserved).`;
+    const detailPages = $('#preview-detail-images'); detailPages.replaceChildren();
+    for (const [index, source] of (response.preview_detail_images || []).entries()) {
+      try {
+        const candidate = new URL(source, window.location.href);
+        if (candidate.origin !== window.location.origin || !/^\/previews\/[a-f0-9]{32}\.png$/.test(candidate.pathname) || candidate.search || candidate.hash) continue;
+        const page = element('img'); page.src = candidate.href;
+        page.alt = `Device receipt details, page ${index + 2}`; detailPages.append(page);
+      } catch { /* The full PDF remains available. */ }
+    }
+    $('#preview-status').textContent = imageUrl ? 'Preview ready' : 'PDF ready. Open the full preview.';
+    $('#preview-number').textContent = `COD ${response.certificate_no || 'Not available'}${response.certificate_date ? ` · ${dateLabel(response.certificate_date)}` : ''}`;
     $('#preview-number').hidden = false;
-    const warnings = Array.isArray(response.warnings) ? response.warnings : [];
+    const warnings = Array.isArray(response.warnings) ? response.warnings.filter(value => !isRoutineNotice(value)) : [];
     renderWarningList($('#preview-warnings'), warnings);
     $('#preview-warnings').hidden = warnings.length === 0;
     $('#preview-warnings-title').hidden = warnings.length === 0;
-    $('#preview-warnings-title').textContent = `${warnings.length} ${warnings.length === 1 ? 'thing' : 'things'} to check before creating`;
+    $('#preview-warnings-title').textContent = 'Check before creating';
   } catch (error) {
     if (revision === app.previewRevision && $('#details-modal').open) {
-      $('#preview-status').textContent = error.message;
-      toast(error.message, true);
+      $('#preview-status').textContent = 'Preview unavailable';
+      showDetailsError(error.message);
     }
   } finally {
     app.previewLoading = false;
@@ -2434,6 +2855,20 @@ async function handleAction(button) {
   const row = app.state.rows[Number(button.dataset.index)];
   if (!row) return;
   const action = button.dataset.action;
+  if (action === 'destruction') {
+    if (app.detailsBusy) return;
+    setDetailsBusy(true);
+    try {
+      const response = await api('/api/destruction/request', {plant: row.plant, sn: row.sn, expected_revision: app.workspaceRevision});
+      if (response.state) setState(response.state);
+      const request = app.state.rows.find(entry => entry.record_id === response.record_id);
+      setDetailsBusy(false);
+      if (request) await openDetails(request, false, false, true);
+      else toast('Request saved. Refresh to open it.', true);
+    } catch (error) { toast(error.message, true); }
+    finally { setDetailsBusy(false); }
+    return;
+  }
   if (action === 'copy') { openDetails(row, true); return; }
   if (action === 'details') { openDetails(row); return; }
   if (action === 'edit-details') { openDetails(row, false, false, true); return; }
@@ -2458,11 +2893,13 @@ async function handleAction(button) {
     return;
   }
   if (action === 'open-workbook' && !isManual(row)) {
-    await openClientInExcel(row.plant, row.sn);
+    await openClientInExcel(row.plant, row.sn, row.sheet, row.row);
   }
 }
 
 function openSettings() {
+  if (app.generationBusy || app.backupBusy || app.completionBusy || app.clientBusy
+      || app.settingsBusy || app.detailsBusy || app.stopping) return;
   updateSettingsDisplay();
   app.settingsBaseline = JSON.stringify(settingsValues());
   for (const disclosure of $('#settings-form').querySelectorAll('details')) disclosure.open = false;
@@ -2522,6 +2959,38 @@ async function backupAction(kind) {
   }
 }
 
+async function clearOldHistory() {
+  if (app.backupBusy || app.generationBusy || app.detailsBusy || app.settingsBusy
+      || app.clientBusy || app.completionBusy || app.stopping || $('#details-modal').open) return;
+  app.backupBusy = true;
+  $('#clear-old-history').disabled = true;
+  const status = $('#history-cleanup-status');
+  try {
+    setBusy(true, 'Checking old history…');
+    const endpoint = '/api/history/clear';
+    const preview = await api(endpoint, {expected_revision:app.workspaceRevision ?? app.state.workspace_revision ?? ''});
+    setBusy(false);
+    const counts = preview.cleanup;
+    if (!preview.requires_confirmation || !counts) throw new Error('Refresh the app before clearing old history.');
+    const approved = await confirmAction({title:'Clear old history?',
+      message:`Remove ${counts.history_removed} old certificate records, ${counts.pdf_links_removed} deleted-PDF links and ${counts.local_records_removed} old local records? Current Excel files, PDFs and their active records stay. A recovery copy is kept.`,
+      confirmLabel:'Clear old history'});
+    if (!approved) return;
+    setBusy(true, 'Clearing old history…');
+    const result = await api(endpoint, {confirmed:true, review_token:preview.review_token,
+      expected_revision:preview.workspace_revision});
+    if (!result.cleared) throw new Error('The history changed. Review it again before clearing.');
+    clearWorkingDraft();
+    if (result.state) setState(result.state);
+    $('#history-list').replaceChildren();
+    $('#history-detail').replaceChildren();
+    status.textContent = result.message;
+    status.title = result.recovery_folder || '';
+    toast(result.message);
+  } catch (error) { status.textContent = error.message; toast(error.message, true); }
+  finally { app.backupBusy = false; $('#clear-old-history').disabled = false; setBusy(false); }
+}
+
 function backupOptionLabel(backup) {
   const timestamp = backup.created_at || backup.created;
   const date = timestamp ? new Date(timestamp) : null;
@@ -2576,7 +3045,9 @@ async function restoreBackup() {
       const current = await api('/api/check', {}); app.settings = current.settings || app.settings; setState(current.state);
     }
     $('#backup-restore-modal').close();
-    updateSettingsDisplay(); await loadBackupStatus();
+    updateSettingsDisplay();
+    app.settingsBaseline = JSON.stringify(settingsValues());
+    await loadBackupStatus();
     $('#backup-status').textContent = [response.message || 'Backup restored. A recovery snapshot of the previous data was saved.', ...(response.restored?.warnings || [])].join(' ');
   } catch (error) { $('#backup-restore-status').textContent = error.message; }
   finally { app.backupBusy = false; $('#confirm-backup-restore').disabled = false; setBusy(false); }
@@ -2725,7 +3196,7 @@ async function reconnectDashboard() {
   try {
     const response = await api('/api/check', {});
     const pendingSettings = $('#settings-modal').open ? settingsValues() : null;
-    app.settings = response.settings || app.settings; setState(response.state);
+    app.settings = response.settings || app.settings; setState(response.state, {preserveSettings:false});
     if (pendingSettings) {
       // A lost response may already have saved Settings. Keep those committed
       // values as the baseline, without erasing the operator's pending inputs.
@@ -2773,7 +3244,14 @@ function wire() {
   });
   $('#add-client-button').addEventListener('click', openAddClient);
   $('#add-client-form').addEventListener('submit', event => { event.preventDefault(); saveClient(); });
-  $('#add-client-form').addEventListener('change', event => { if (event.target.name === 'certificate_type') updateClientType(); });
+  $('#add-client-form').addEventListener('input', event => {
+    $('#add-client-error').hidden = true;
+    if (event.target.name === 'sn' || app.clientPendingAttempt) validateClientSerialNumber();
+  });
+  $('#add-client-form').addEventListener('change', event => {
+    $('#add-client-error').hidden = true;
+    if (event.target.name === 'plant' || app.clientPendingAttempt) validateClientSerialNumber();
+  });
   $('#add-client-material').addEventListener('click', () => {
     if (!app.clientBusy && (app.clientMaterialRows || []).length < 100) renderClientMaterials([...clientMaterialValues(), {}]);
   });
@@ -2818,13 +3296,14 @@ function wire() {
   });
   $('#saved-file-open').addEventListener('click', () => openCertificateLocally($('#saved-file-open').dataset.relativePath));
   $('#create-backup').addEventListener('click', () => backupAction('create'));
+  $('#clear-old-history').addEventListener('click', clearOldHistory);
   $('#pick-backup-destination').addEventListener('click', () => backupAction('pick-destination'));
   $('#restore-backup').addEventListener('click', openBackupRestore);
   $('#confirm-backup-restore').addEventListener('click', restoreBackup);
   $('#reload-history').addEventListener('click', loadHistory);
   $('#history-section').addEventListener('toggle', () => { if ($('#history-section').open) loadHistory(); });
   window.addEventListener('beforeunload', event => {
-    if (!editorDirty() && !app.generationBusy && !app.backupBusy && !app.completionBusy) return;
+    if (!editorDirty() && !app.generationBusy && !app.backupBusy && !app.completionBusy && !app.clientBusy && !app.settingsBusy && !app.detailsBusy) return;
     if (editorDirty()) saveWorkingDraft();
     event.preventDefault(); event.returnValue = '';
   });
@@ -2839,7 +3318,13 @@ function wire() {
   $('#past-number-search').addEventListener('input', renderPastNumbers);
   $('#refresh-button').addEventListener('click', refreshState);
   $('#new-button').addEventListener('click', () => openDetails());
+  $('#destruction-pending').addEventListener('click', () => {
+    $('#plant-filter').value = 'all'; $('#search').value = '';
+    $('#template-filter').value = 'destruction'; $('#status-filter').value = 'needs_attention';
+    app.page = 1; render();
+  });
   $('#open-bulk').addEventListener('click', openBulkGeneration);
+  $('#bulk-start-cod').addEventListener('input', updateBulkCodHint);
   $('#generate-all').addEventListener('click', startBulkGeneration);
   $('#bulk-generation-modal').addEventListener('close', () => { if (!$('#bulk-generation-modal').open) app.bulkSelection = null; });
   $('#clear-filters').addEventListener('click', () => {
@@ -2916,6 +3401,7 @@ function wire() {
   });
   $('#details-form').addEventListener('input', event => {
     if (event.target.name) app.editor?.touched.add(event.target.name);
+    if (event.target.name === 'starting_cod') updateSingleCodControls();
     if (event.target.name === 'certificate_weight') applyCertificateWeight(event.target.value);
     updateMaterialWeightTotal();
     invalidatePreview();
@@ -2941,9 +3427,38 @@ function wire() {
         }
       }
       renderTemplateEditor();
+      // A deliberate type change exposes that template's editable fields,
+      // including the Siemens identifiers needed before creation.
+      if (app.editor.firstGeneration) app.editor.pdfEditUsed = true;
+      setEditorMode(true);
       updateSourceControls();
     } else if (event.target.name === 'source_kind') {
       app.editor.sourceExplicit = true;
+      if (app.editor.recordId && app.editor.sourceSn == null) {
+        if (event.target.value === 'workbook' && !app.editor.manualSourceIdentifiers) {
+          app.editor.manualSourceIdentifiers = {
+            plant:form.elements.namedItem('plant').value,
+            cod_no:form.elements.namedItem('cod_no').value,
+            cod_date:form.elements.namedItem('cod_date').value,
+            issuedCertificate:app.editor.issuedCertificate,
+            rawDate:app.editor.rawDetails?.cod_date,
+          };
+          form.elements.namedItem('cod_no').value = '';
+          form.elements.namedItem('cod_date').value = '';
+          if (app.editor.rawDetails) delete app.editor.rawDetails.cod_date;
+          app.editor.issuedCertificate = false;
+        } else if (event.target.value === 'manual' && app.editor.manualSourceIdentifiers) {
+          const saved = app.editor.manualSourceIdentifiers;
+          for (const key of ['plant', 'cod_no', 'cod_date']) form.elements.namedItem(key).value = saved[key];
+          app.editor.issuedCertificate = saved.issuedCertificate;
+          if (saved.rawDate !== undefined) (app.editor.rawDetails ||= {}).cod_date = saved.rawDate;
+          delete app.editor.manualSourceIdentifiers;
+        }
+      }
+      if (event.target.value === 'workbook' && form.elements.namedItem('certificate_weight').value.trim()) {
+        form.elements.namedItem('use_certificate_weight').checked = true;
+        app.editor.touched.add('use_certificate_weight');
+      }
       updateSourceControls();
     } else if (event.target.name === 'plant') {
       suggestWorkbookId();
@@ -2988,6 +3503,12 @@ function wire() {
       updateSettingsFiles();
     } catch (error) { toast(error.message, true); }
     finally { setBusy(false); }
+  }));
+  document.querySelectorAll('[data-disconnect-setting]').forEach(button => button.addEventListener('click', () => {
+    if (app.settingsBusy || app.backupBusy) return;
+    $('#settings-form').elements.namedItem(button.dataset.disconnectSetting).value = '';
+    updateSettingsFiles();
+    $('#settings-status').textContent = 'Click Save to apply the disconnection.';
   }));
   document.querySelectorAll('[data-create-setting]').forEach(button => button.addEventListener('click', async () => {
     const plant = button.dataset.createSetting;

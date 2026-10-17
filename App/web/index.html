@@ -33,11 +33,13 @@
 
       <nav class="workspace-tabs" aria-label="Certificate workspace"><button type="button" id="view-records" aria-pressed="true" aria-controls="records-workspace">Companies</button><button type="button" id="view-files" aria-pressed="false" aria-controls="folder-inventory">Saved certificates <span id="saved-total">0</span></button><button type="button" class="text-button workspace-help" id="open-help" aria-haspopup="dialog">How to use</button></nav>
       <section id="records-workspace" aria-label="Companies and certificates">
+      <p class="form-hint" id="workbook-maintenance-note" role="status" hidden></p>
       <section class="workbook-issues" id="workbook-issues" aria-label="Excel files need attention" hidden>
         <div class="workbook-issues-heading"><h2>Excel files need attention</h2><button type="button" class="button button-quiet" id="workbook-issue-settings">Open Settings</button></div>
         <p>Companies we could read are shown below. Creating certificates from Excel is paused until both files have been checked.</p>
         <ul id="workbook-issue-list"></ul>
       </section>
+      <button type="button" class="destruction-pending" id="destruction-pending" hidden></button>
       <section class="queue-panel">
         <div class="queue-heading">
           <div><h2 id="queue-title">All companies</h2><p id="queue-subtitle">Choose a company to check its certificate.</p></div>
@@ -62,7 +64,7 @@
         </div>
         <input type="hidden" id="status-filter" value="all">
         <div class="extra-filters" id="more-filters"><h3 class="filter-section-title">More filters</h3><div class="filter-fields">
-          <label class="field"><span>Certificate type</span><select id="template-filter" aria-label="Certificate type"><option value="all">All types</option><option value="standard">Standard</option><option value="sita">Sita International</option><option value="siemens">Siemens Medical</option></select></label>
+          <label class="field"><span>Certificate type</span><select id="template-filter" aria-label="Certificate type"><option value="all">All types</option><option value="standard">Standard</option><option value="sita">Sita International</option><option value="siemens">Siemens Medical</option><option value="destruction">Secured Data Destruction</option></select></label>
           <button type="button" class="text-button" id="clear-filters">Clear filters</button>
         </div></div>
         <div class="table-wrap">
@@ -90,12 +92,16 @@
     </main>
   </div>
 
-  <dialog class="modal" id="help-modal" aria-labelledby="help-title"><div class="modal-header"><div><h2 id="help-title">Three simple steps</h2><p>You usually do not need to change any settings.</p></div><button type="button" class="icon-button" data-close="help-modal" aria-label="Close help">×</button></div><ol class="quick-help"><li><strong>Find the company.</strong> Search its name or certificate number. Choose the plant if needed.</li><li><strong>Check the preview.</strong> Details come from Excel. Choose the certificate type on this page; Excel details stay locked for first generation.</li><li><strong>Create PDF.</strong> The app chooses the COD, saves the PDF and updates the correct record.</li></ol><p class="dialog-note">Company not in Excel? Choose New certificate. Saved certificates opens certificates already in your folder. After generating, Edit certificate opens corrections directly. Choose whether to update Excel when saving. After sending a PDF yourself, mark it Completed.</p><div class="modal-footer"><button type="button" class="button button-primary" data-close="help-modal">Got it</button></div></dialog>
+  <dialog class="modal" id="help-modal" aria-labelledby="help-title"><div class="modal-header"><div><h2 id="help-title">Three simple steps</h2><p>You usually do not need to change any settings.</p></div><button type="button" class="icon-button" data-close="help-modal" aria-label="Close help">×</button></div><ol class="quick-help"><li><strong>Find the company.</strong> Search its name or certificate number. Choose the plant if needed.</li><li><strong>Check the preview.</strong> Details come from Excel. Choose the certificate type on this page; Excel details stay locked for first generation.</li><li><strong>Create PDF.</strong> The app chooses the COD, saves the PDF and updates the correct record.</li></ol><p class="dialog-note">Company not in Excel? Choose New certificate. Saved certificates opens certificates already in your folder. After generating, Edit certificate opens corrections directly. Choose whether to update Excel when saving. For a requested data destruction certificate, use Data destruction beside the inward. For clients without an inward, choose New certificate and Secured Data Destruction. After sending a PDF yourself, mark it Completed.</p><div class="modal-footer"><button type="button" class="button button-primary" data-close="help-modal">Got it</button></div></dialog>
 
   <dialog class="modal" id="connection-modal" aria-labelledby="connection-title"><div class="modal-header"><div><h2 id="connection-title">Connection lost</h2><p>Your edits and saved files are kept. The app is not responding.</p></div></div><p class="dialog-note">Check the connection, or reopen Prepare Certificates. Before repeating a creation, check Saved certificates: the PDF may already have been saved.</p><div class="modal-footer"><div><button type="button" class="button button-quiet" data-close="connection-modal">Return to my edits</button><button type="button" class="button button-primary" id="dialog-reconnect">Check connection</button></div></div></dialog>
 
   <dialog class="modal" id="bulk-generation-modal" aria-labelledby="bulk-title">
     <div class="modal-header"><div><h2 id="bulk-title">Create several certificates</h2><p id="bulk-description"></p></div><button type="button" class="icon-button" data-close="bulk-generation-modal" aria-label="Close">×</button></div>
+    <div class="settings-fields" id="bulk-numbering">
+      <label class="field" id="bulk-start-field" hidden><span>Starting COD number</span><input id="bulk-start-cod" type="text" inputmode="numeric" pattern="[0-9]{1,12}" maxlength="12" autocomplete="off" aria-describedby="bulk-cod-hint"><small id="bulk-cod-hint">No previous COD found. Enter the number to start from.</small></label>
+      <p class="dialog-note" id="bulk-next-cod" hidden></p>
+    </div>
     <ul class="batch-rules"><li>Creates all Ready Excel rows in the selected plant, not just search results.</li><li>Empty statuses and N/A rows are skipped.</li><li>You will review any warnings before creation.</li></ul><details class="dialog-extras"><summary>Which filters apply?</summary><p>Only the plant selection applies. Search, status and certificate-type filters do not narrow this batch. Ready rows with warnings are included, but require your confirmation.</p></details>
     <div class="modal-footer"><div><button type="button" class="button button-quiet" data-close="bulk-generation-modal">Cancel</button><button type="button" class="button button-primary" id="generate-all">Create Ready PDFs <span id="generate-count"></span></button></div></div>
   </dialog>
@@ -121,7 +127,10 @@
       <section class="editor-fields" id="editor-fields" aria-label="Edit certificate details">
       <div class="editor-fields-heading"><h3 class="editor-step" id="editor-mode-title">Check the certificate</h3><button type="button" class="button button-quiet" id="edit-pdf-details" aria-pressed="false">✎ Edit PDF details</button><button type="button" id="finish-editing" hidden>Check preview</button><button type="button" id="change-details" hidden>Change details</button></div>
       <div class="form-grid">
-        <label class="field"><span>Certificate type</span><select name="certificate_type"><option value="standard">Standard</option><option value="sita">Sita International</option><option value="siemens">Siemens Medical</option></select></label>
+        <label class="field"><span>Certificate type</span><select name="certificate_type"><option value="standard">Standard</option><option value="sita">Sita International</option><option value="siemens">Siemens Medical</option><option value="destruction">Secured Data Destruction</option></select></label>
+      </div>
+      <div class="form-grid" id="single-start-cod-section" hidden>
+        <label class="field"><span>Starting COD number</span><input name="starting_cod" id="single-start-cod" type="text" inputmode="numeric" pattern="[0-9]{1,12}" maxlength="12" placeholder="e.g. 0302" autocomplete="off" aria-describedby="single-start-cod-hint"><small id="single-start-cod-hint">No previous COD found. Enter the number to start from.</small></label>
       </div>
       <section class="editor-summary" id="editor-summary" aria-label="Details from Excel" hidden>
         <dl class="editor-facts" id="editor-facts"></dl>
@@ -134,10 +143,10 @@
         <section class="form-disclosure" id="record-options"><h3>Where details are saved</h3><div class="form-grid">
         <label class="field field-half"><span>Save details in</span><select name="source_kind"><option value="workbook">Plant Excel</option><option value="manual">This app only (no Excel row)</option></select></label>
         <label class="field field-half"><span id="details-plant-label">Plant workbook <b>*</b></span><div class="field-inline"><select name="plant" required><option value="plant1">Plant 1</option><option value="plant2">Plant 2</option></select><button type="button" class="browse-button" id="pick-workbook">Choose in Explorer</button></div></label>
-        <label class="field field-half"><span>Excel row ID / SN <b id="case-required">*</b><small id="case-optional" hidden>Optional</small></span><input name="case_id" required maxlength="80" placeholder="e.g. 4018"><small id="case-id-hint"></small></label>
+        <label class="field field-half"><span>Serial Number <b id="case-required">*</b><small id="case-optional" hidden>Optional</small></span><input name="case_id" required maxlength="100" placeholder="e.g. 4018"><small id="case-id-hint"></small></label>
         </div></section>
-        <label class="field"><span>Company name</span><input name="supplier" maxlength="180" placeholder="Company name"></label>
-        <label class="field field-half"><span>City</span><input name="location" maxlength="100" placeholder="City"></label>
+        <label class="field"><span>Company name</span><input name="supplier" maxlength="500" placeholder="Company name"></label>
+        <label class="field field-half"><span>City</span><input name="location" maxlength="500" placeholder="City"></label>
         <label class="field field-half"><span>Date material was received</span><input name="inward_date" type="date"></label>
         <div id="edit-scope-field" hidden><input type="hidden" name="edit_scope" value="certificate_only"><small id="edit-scope-hint"></small></div>
         <section class="weight-section" id="weight-options"><h3 id="weight-options-title">Certificate Weight</h3><p id="current-weight" class="current-weight" hidden></p>
@@ -146,16 +155,15 @@
         </section>
         <section class="form-disclosure material-editor" id="material-options" aria-label="Assets and weights">
         <h3 class="material-section-title" id="material-options-title">Assets &amp; weights</h3>
-        <p>Add one line for each material or asset. Enter its total weight, or enter quantity and weight per piece to calculate it.</p>
         <div id="material-rows" class="material-list"></div>
-        <p class="material-weight-total" id="material-weight-total" role="status" aria-live="polite">The total inward weight will appear here as you enter materials.</p>
+        <p class="material-weight-total" id="material-weight-total" role="status" aria-live="polite" hidden></p>
         <button type="button" class="button button-quiet add-material" id="add-material">+ Add another material</button>
         </section>
         <label class="field field-half"><span>Form 6 No. <small id="form6-hint">Expected</small></span><input name="form6" maxlength="100" placeholder="Manifest number"></label>
         <label class="field field-half"><span>Reference No. <small>Optional</small></span><input name="reference" maxlength="100" placeholder="Reference number"></label>
-        <section class="form-disclosure"><h3>Certificate number and date</h3><p>A number is chosen automatically. Corrections keep the issued number and date.</p><div class="form-grid">
-        <label class="field field-half"><span>Certificate number (COD) <small>Optional</small></span><input name="cod_no" maxlength="100" placeholder="Choose automatically"></label>
-        <label class="field field-half"><span>Certificate date <small>Optional</small></span><input name="cod_date" type="date"></label>
+        <section class="form-disclosure"><h3>Certificate number and date</h3><div class="form-grid">
+        <label class="field field-half"><span>Certificate number (COD)</span><input name="cod_no" maxlength="100" placeholder="Assigned automatically" readonly></label>
+        <label class="field field-half"><span>Certificate date</span><input name="cod_date" type="date" readonly></label>
         </div></section>
       </div>
       <p class="form-hint" id="edit-items-hint" hidden></p>
@@ -171,6 +179,7 @@
         <ul class="preview-warnings" id="preview-warnings" aria-label="Things to check before creating" hidden></ul>
         <div id="preview-document" hidden>
           <img id="preview-image" alt="First page of the certificate showing the company, certificate details and printed weight" hidden>
+          <div id="preview-detail-images"></div>
           <p class="form-hint" id="preview-image-note" hidden>First-page image is unavailable. Open the full PDF to check the certificate and any attached list.</p>
           <div class="preview-full-actions"><button type="button" class="text-button" id="preview-full-pdf" aria-controls="preview-frame" aria-expanded="false">Enlarge preview</button><a class="text-button" id="preview-link" target="_blank" rel="noopener">Open full preview in browser ↗</a></div>
           <iframe id="preview-frame" title="Full certificate PDF including attached list" hidden></iframe>
@@ -200,9 +209,14 @@
 
   <dialog class="modal settings-modal" id="settings-modal">
     <form id="settings-form" method="dialog" novalidate>
-      <div class="modal-header"><div><div class="eyebrow">WORKSPACE</div><h2>Settings</h2><p>Choose the two plant workbooks and set your reminder time.</p></div><button type="button" class="icon-button" data-close="settings-modal" aria-label="Close">×</button></div>
+      <div class="modal-header"><div><div class="eyebrow">WORKSPACE</div><h2>Settings</h2><p>Manage Excel connections and reminders.</p></div><button type="button" class="icon-button" data-close="settings-modal" aria-label="Close">×</button></div>
       <div class="settings-fields">
-        <section class="workbook-choices" aria-label="Plant Excel files"><h3>Plant Excel files</h3><p class="settings-help">Create a ready-to-use blank workbook, or connect an existing one. Existing workbooks are not changed by this option.</p><div class="workbook-choice"><div><strong>Plant 1</strong><span id="plant1-file-name"></span></div><div class="workbook-choice-actions"><button type="button" class="button button-quiet" data-pick-setting="plant1_path">Choose file</button><button type="button" class="button button-quiet" data-create-setting="plant1">Create template</button></div></div><div class="workbook-choice"><div><strong>Plant 2</strong><span id="plant2-file-name"></span></div><div class="workbook-choice-actions"><button type="button" class="button button-quiet" data-pick-setting="plant2_path">Choose file</button><button type="button" class="button button-quiet" data-create-setting="plant2">Create template</button></div></div><details class="settings-paths" id="settings-paths"><summary>Edit file paths</summary><label class="field"><span>Plant 1 file path</span><input name="plant1_path" required></label><label class="field"><span>Plant 2 file path</span><input name="plant2_path" required></label></details></section>
+        <section class="workbook-choices" aria-label="Plant Excel files">
+          <h3>Plant Excel files</h3><p class="settings-help">Connect Excel files when needed. Disconnecting keeps the files.</p>
+          <div class="workbook-choice"><div><strong>Plant 1</strong><span id="plant1-file-name"></span></div><div class="workbook-choice-actions"><button type="button" class="button button-quiet" data-pick-setting="plant1_path">Choose file</button><button type="button" class="button button-quiet" data-create-setting="plant1">Create template</button><button type="button" class="button button-quiet" id="plant1-disconnect" data-disconnect-setting="plant1_path" hidden>Disconnect</button></div></div>
+          <div class="workbook-choice"><div><strong>Plant 2</strong><span id="plant2-file-name"></span></div><div class="workbook-choice-actions"><button type="button" class="button button-quiet" data-pick-setting="plant2_path">Choose file</button><button type="button" class="button button-quiet" data-create-setting="plant2">Create template</button><button type="button" class="button button-quiet" id="plant2-disconnect" data-disconnect-setting="plant2_path" hidden>Disconnect</button></div></div>
+          <details class="settings-paths" id="settings-paths"><summary>Edit file paths</summary><label class="field"><span>Plant 1 file path</span><input name="plant1_path"></label><label class="field"><span>Plant 2 file path</span><input name="plant2_path"></label></details>
+        </section>
         <label class="reminder-box"><div><strong>Daily certificate reminder</strong><small>Starts 25 days after receipt. Stops at Completed or N/A.</small></div><input name="reminders_enabled" aria-label="Daily certificate reminder" type="checkbox"></label>
         <label class="field reminder-time"><span>Reminder time</span><input name="reminder_time" type="time" required></label>
         <details class="settings-paths"><summary>Reminder options</summary><p>If the Windows reminder is not appearing, save these settings and set it up again.</p><button type="button" class="button button-quiet" id="repair-reminder">Save &amp; repair reminder</button></details>
@@ -215,6 +229,7 @@
           <details><summary>Backup health details</summary><pre id="backup-health">No health details available.</pre></details>
         </details>
         <details class="history-section" id="history-section"><summary>Recent certificate activity</summary><p>The latest 50 creation records, including edited fields and accepted warnings.</p><button type="button" class="button button-quiet" id="reload-history">Refresh activity</button><p id="history-status" role="status"></p><ul class="history-list" id="history-list"></ul></details>
+        <section class="history-cleanup"><h3>Clear old history</h3><p>Remove old app records and deleted-PDF links. Current Excel files, PDFs and their active records stay.</p><button type="button" class="button button-danger" id="clear-old-history">Clear old history</button><p id="history-cleanup-status" role="status" aria-live="polite"></p></section>
       </div>
       <div class="modal-footer"><span class="required-note" id="settings-status" role="status"></span><div><button type="button" class="button button-quiet" data-close="settings-modal">Cancel</button><button type="submit" class="button button-primary" id="save-settings">Save</button></div></div>
     </form>
@@ -250,22 +265,26 @@
 
   <dialog class="modal add-client-modal" id="add-client-modal" aria-labelledby="add-client-title">
     <form id="add-client-form">
-      <div class="modal-header"><div><h2 id="add-client-title">Add client to Excel</h2><p>The layout, weight formulas and status dropdown are set up for you.</p></div><button type="button" class="icon-button" data-close="add-client-modal" aria-label="Close">×</button></div>
+      <div class="modal-header"><div><h2 id="add-client-title">Add client to Excel</h2></div><button type="button" class="icon-button" data-close="add-client-modal" aria-label="Close">×</button></div>
       <div class="client-entry-fields">
         <section class="client-entry-basics" aria-label="Client details">
         <div class="form-grid">
           <label class="field field-half"><span>Plant</span><select name="plant"><option value="plant1">Plant 1</option><option value="plant2">Plant 2</option></select></label>
-          <label class="field field-half"><span>Certificate type</span><select name="certificate_type"><option value="standard">Standard COD</option><option value="sita">Sita International</option><option value="siemens">Siemens Medical</option></select></label>
+          <label class="field field-half"><span>Serial Number <small>Optional</small></span><input name="sn" maxlength="100" autocomplete="off" placeholder="Automatic if blank" aria-describedby="client-serial-number-hint"><small id="client-serial-number-hint" aria-live="polite" hidden></small></label>
           <label class="field"><span>Company name *</span><input name="supplier" required maxlength="500" autocomplete="organization" placeholder="Enter the company name"></label>
           <label class="field field-half"><span>City / site <small>Optional</small></span><input name="location" maxlength="500" placeholder="Enter the location"></label>
           <label class="field field-half"><span>Date material was received <small>Optional</small></span><input name="inward_date" type="date"></label>
-          <label class="field field-half"><span>Form 6 number <small>Optional</small></span><input name="form6" maxlength="100"></label>
-          <label class="field field-half"><span>Reference number <small>Optional</small></span><input name="reference" maxlength="100"></label>
+          <label class="field field-half"><span>Form 6 number <small>Optional — needed when creating a certificate</small></span><input name="form6" maxlength="100" placeholder="Enter when creating a certificate"></label>
         </div>
-        <p class="client-entry-id">Client ID is assigned automatically.</p>
+        <section class="client-entry-more-details" aria-labelledby="client-more-details-title"><h3 id="client-more-details-title">More details</h3><div class="form-grid">
+          <label class="field field-half"><span>Reference number <small>Optional</small></span><input name="reference" maxlength="100"></label>
+          <label class="field field-half"><span>Comments <small>Optional</small></span><input name="comments" maxlength="1000"></label>
+          <label class="field field-half"><span>Transporter / vehicle details <small>Optional</small></span><input name="transporter_details" maxlength="1000"></label>
+          <label class="field field-half"><span>Docket no. / vehicle no. <small>Optional</small></span><input name="docket_vehicle_no" maxlength="500"></label>
+          <label class="field field-half"><span>Weight slip / scale weight <small>Optional</small></span><input name="weight_slip_scale" maxlength="500"></label>
+        </div></section>
         </section>
-        <section class="client-entry-materials"><h3>Materials <small>Fill now or later in Excel</small></h3><p>Enter a total weight, or quantity and weight per piece. We calculate the weights using your plant's existing layout.</p><div id="client-material-rows"></div><button type="button" class="button button-quiet" id="add-client-material">＋ Add material</button></section>
-        <p class="form-hint">You can add just the company name. Status stays empty until the required details are filled in.</p>
+        <section class="client-entry-materials"><h3>Materials <small>Optional</small></h3><div id="client-material-rows"></div><p class="material-weight-total" id="client-material-weight-total" role="status" aria-live="polite" hidden></p><button type="button" class="button button-quiet" id="add-client-material">＋ Add material</button></section>
         <p class="form-error" id="add-client-error" role="alert" hidden></p>
       </div>
       <div class="modal-footer"><span class="required-note">Adds the client to the selected plant workbook.</span><div><button type="button" class="button button-quiet" data-close="add-client-modal">Cancel</button><button type="submit" class="button button-primary" id="save-client">Add to Excel</button></div></div>

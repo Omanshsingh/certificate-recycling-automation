@@ -1,4 +1,4 @@
-"""Three explicit certificate designs, backed by the supplied PowerPoint PDFs.
+"""Explicit certificate designs, backed by the supplied PowerPoint artwork.
 
 Original text is reused as vector PDF content when unchanged. Only operator
 edits and certificate values are typeset, so logos and artwork keep their
@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from copy import copy
 from datetime import date
+from decimal import Decimal
 from io import BytesIO
 import json
 import os
@@ -21,7 +22,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 
-TEMPLATE_NAMES = {"standard": "Standard COD", "sita": "Sita International", "siemens": "Siemens Medical"}
+TEMPLATE_NAMES = {"standard": "Standard COD", "sita": "Sita International", "siemens": "Siemens Medical", "destruction": "Secured Data Destruction"}
 TEMPLATE_ROOT = Path(__file__).resolve().parent / "templates" / "certificate-types"
 SHAPE_KEYS = {5: ("certificate_title", "Certificate title"), 6: ("intro", "Introduction"),
               7: ("from_line", "From line"), 8: ("statement", "Recycling statement"),
@@ -40,16 +41,17 @@ DETAIL_LABELS = {"model_name": "Model name", "model_serial": "Model serial numbe
 
 
 def clean_text(value):
-    return str(value or "").replace("\r\n", "\n").replace("\r", "\n").replace("\v", "\n")
+    return (str(value) if value is not None else "").replace("\r\n", "\n").replace("\r", "\n").replace("\v", "\n")
 
 
 def template_id(value):
     key = str(value or "standard").strip().casefold()
     # Accept full labels entered in Excel, without inferring from supplier names.
-    aliases = {"standard cod": "standard", "sita international": "sita", "siemens medical": "siemens"}
+    aliases = {"standard cod": "standard", "sita international": "sita", "siemens medical": "siemens",
+               "secured data destruction": "destruction", "data destruction": "destruction", "hdd cod": "destruction"}
     key = aliases.get(key, key)
     if key not in TEMPLATE_NAMES:
-        raise ValueError("Choose a certificate type: Standard COD, Sita International, or Siemens Medical.")
+        raise ValueError("Choose Standard COD, Sita International, Siemens Medical, or Secured Data Destruction.")
     return key
 
 
@@ -94,6 +96,7 @@ def regions(kind):
 
 
 def template_specs():
+    from destruction_certificate import SPEC
     common = {"cod_no", "cod_date", "inward_date", "certificate_weight", "reference", "form6"}
     return [{"id": kind, "name": name,
              "default_company": next(field["text"].strip() for field in regions(kind) if field["key"] == "company_display"), "fields": [
@@ -104,7 +107,7 @@ def template_specs():
          "type": "text"}
         for field in regions(kind) if field["key"] not in common
         and (field["group"] == "details" or field["key"] == "company_display")
-    ]} for kind, name in TEMPLATE_NAMES.items()]
+    ]} for kind, name in TEMPLATE_NAMES.items() if kind != 'destruction'] + [SPEC]
 
 
 def obsolete_template_warning(message):
@@ -139,8 +142,9 @@ def validate_fields(kind, values):
         return {}
     if not isinstance(values, dict):
         raise ValueError("Certificate fields must contain text values.")
-    allowed = {field["key"] for field in regions(kind)
-               if field["group"] == "details" or field["key"] == "company_display"} | {"weight_display"}
+    allowed = ({'destruction_date', 'device_receipts'} if template_id(kind) == 'destruction' else
+               {field["key"] for field in regions(kind)
+                if field["group"] == "details" or field["key"] == "company_display"} | {"weight_display"})
     result = {}
     for key, value in values.items():
         if key == "_annexure":
@@ -213,13 +217,21 @@ def display_values(batch, cod, issued_date):
     if not values.get("company_display", "").strip():
         values["company_display"] = company.upper()
     weight = batch.get("display_weight", batch.get("certificate_weight", batch.get("total_weight")))
-    weight_text = f"{float(weight):g} KG" if weight is not None else ""
+    # Excel stores 15 significant digits. Avoid binary arithmetic tails while
+    # retaining that precision and keeping the printed value out of exponent form.
+    printable_weight = format(weight, '.15g') if isinstance(weight, float) else str(weight)
+    weight_text = format(Decimal(printable_weight), 'f') if weight is not None else ''
+    if '.' in weight_text:
+        weight_text = weight_text.rstrip('0').rstrip('.')
+    weight_text = f'{weight_text} KG' if weight_text else ''
     weight_text = values.get("weight_display", "").strip() or weight_text
     receipt = parse_date(batch.get("inward_date"))
     values.update(cod_no=str(cod), cod_date=issued_date.strftime("%d.%m.%Y"),
                   inward_date=receipt.strftime("%d.%m.%Y") if receipt else "",
                   certificate_weight=weight_text, reference=str(batch.get("reference") or ""),
                   form6=str(batch.get("form6") or ""))
+    if template_id(batch.get('certificate_type')) == 'destruction':
+        values.update(company_display=supplier.upper(), certificate_weight='')
     return values
 
 
@@ -296,6 +308,9 @@ def _layout(region, value):
 
 
 def layout_warnings(batch, cod, issued_date):
+    if template_id(batch.get('certificate_type')) == 'destruction':
+        from destruction_certificate import layout_warnings as destruction_layout_warnings
+        return destruction_layout_warnings(batch)
     values = display_values(batch, cod, issued_date)
     warnings = []
     placed = list(positioned_regions(batch.get("certificate_type"), values))
@@ -398,6 +413,9 @@ def _original_region(source, region, height):
 
 def make_template_certificate(batch, cod, issued_date, destination, allow_warnings=False):
     kind = template_id(batch.get("certificate_type"))
+    if kind == 'destruction':
+        from destruction_certificate import make_certificate
+        return make_certificate(batch, cod, issued_date, destination)
     data = geometry(kind)
     values = display_values(batch, cod, issued_date)
     warnings = layout_warnings(batch, cod, issued_date)

@@ -56,7 +56,6 @@ class App:
         self.hour, self.minute, self.period = tk.StringVar(value=hour), tk.StringVar(value=minute), tk.StringVar(value=period)
         self.status = tk.StringVar(value="Choose both plant workbooks once, then mark approved rows Ready in Excel.")
         self.filter_value = tk.StringVar(value="All rows")
-        self.custom_cod = tk.StringVar(value="")
         self.pending_selected = None
         self._build()
         self.show_results()
@@ -91,12 +90,6 @@ class App:
         self.button(actions, "Create / edit from file…", self.create_from_file)
         self.button(actions, "Open certificate folder", self.open_certificates)
 
-        custom_cod = ttk.Frame(outer)
-        custom_cod.pack(fill="x", pady=(0, 8))
-        ttk.Label(custom_cod, text="Custom COD for selected PDF (optional):").pack(side="left")
-        ttk.Entry(custom_cod, textvariable=self.custom_cod, width=20).pack(side="left", padx=(6, 8))
-        ttk.Label(custom_cod, text="Leave empty to use the next number automatically.").pack(side="left")
-
         reminders = ttk.LabelFrame(outer, text="Daily reminder", padding=9)
         reminders.pack(fill="x", pady=(0, 8))
         ttk.Checkbutton(reminders, text="Show one reminder when inward details reach day 25", variable=self.reminders_enabled).pack(side="left")
@@ -106,7 +99,7 @@ class App:
         ttk.Spinbox(reminders, from_=0, to=59, width=3, textvariable=self.minute, format="%02.0f").pack(side="left")
         ttk.Combobox(reminders, state="readonly", values=("AM", "PM"), width=4, textvariable=self.period).pack(side="left", padx=4)
         self.button(reminders, "Save & update reminder", self.save_setup_and_schedule)
-        ttk.Label(outer, text="Save and close Excel before checking or generating. Warnings are shown before creation; you can explicitly accept them. PDFs are named COD_Company_city_1.pdf or COD_Company_city_2.pdf; COD matches the number written to Excel.", wraplength=1060).pack(anchor="w", pady=(0, 8))
+        ttk.Label(outer, text="Save and close Excel before checking or generating. Warnings are shown before creation; you can explicitly accept them. PDFs are named COD_Company_city.pdf; COD matches the number written to Excel.", wraplength=1060).pack(anchor="w", pady=(0, 8))
 
         line = ttk.Frame(outer)
         line.pack(fill="x", pady=(2, 3))
@@ -121,7 +114,7 @@ class App:
 
         columns = ("plant", "sn", "status", "client", "reference", "cod", "age", "details")
         self.table = ttk.Treeview(outer, columns=columns, show="headings", selectmode="browse")
-        headings = {"plant": "Plant", "sn": "Client ID", "status": "Status", "client": "Client", "reference": "Reference", "cod": "COD", "age": "Inward age", "details": "What to do"}
+        headings = {"plant": "Plant", "sn": "Serial Number", "status": "Status", "client": "Client", "reference": "Reference", "cod": "COD", "age": "Inward age", "details": "What to do"}
         widths = {"plant": 70, "sn": 82, "status": 110, "client": 175, "reference": 125, "cod": 75, "age": 86, "details": 390}
         for column in columns:
             self.table.heading(column, text=headings[column])
@@ -215,14 +208,6 @@ class App:
         if self.busy:
             return
         try:
-            manual_cod = self.custom_cod.get().strip()
-            if manual_cod and not (selected_only or check_only):
-                messagebox.showinfo(
-                    "Custom COD is for one client",
-                    "Select one Ready client and use Generate selected PDF, or clear the Custom COD box before generating all Ready PDFs.",
-                    parent=self.root,
-                )
-                return
             paths = self.selected_paths()
             if not self.save_setup():
                 return
@@ -242,45 +227,42 @@ class App:
                     return
                 if selected is None:
                     selected = (row["plant"], str(row["sn"]))
-                client_label = (row or {}).get("supplier") or selected[1]
-                if manual_cod and not messagebox.askyesno(
-                    "Use this custom COD?",
-                    f"Generate {client_label} with COD {manual_cod}?\n\n"
-                    "The number must be unique. After the PDF is created, this COD and its date will be saved back to the selected Excel row.",
-                    parent=self.root,
-                ):
-                    return
             self.busy = True
             action = "Checking both plant files…" if check_only else ("Generating selected certificate PDF…" if selected else "Generating PDFs for all Ready rows…")
             self.status.set(action)
-            threading.Thread(target=self._worker, args=(paths, check_only, selected, manual_cod if selected else None, False), daemon=True).start()
+            threading.Thread(target=self._worker, args=(paths, check_only, selected, False), daemon=True).start()
         except Exception as exc:
             messagebox.showerror("Cannot start", str(exc), parent=self.root)
 
-    def _worker(self, paths, check_only, selected, manual_cod=None, allow_warnings=False):
+    def _worker(self, paths, check_only, selected, allow_warnings=False):
         try:
             if not check_only and not allow_warnings:
                 # A dry run prevents valid rows from being generated before
                 # the operator has seen and accepted warnings on other rows.
-                preflight = run(paths, self.base, check_only=True, selected=selected,
-                                custom_cod=manual_cod, progress=lambda _: None)
-                preflight_payload = json.loads((preflight[2] / "Latest Results.json").read_text(encoding="utf-8"))
+                preflight_payload = {}
+                run(paths, self.base, check_only=True, selected=selected,
+                    progress=lambda _: None, report_sink=preflight_payload)
                 warnings = [row for row in preflight_payload.get("rows", [])
                             if row.get("outcome") == "needs_review"]
                 if warnings:
-                    self.events.put(("confirm_warnings", preflight_payload, manual_cod, paths, selected))
+                    self.events.put(("confirm_warnings", preflight_payload, paths, selected))
                     return
+            payload = {}
             result = run(paths, self.base, check_only=check_only, selected=selected,
-                         custom_cod=manual_cod, allow_warnings=allow_warnings,
-                         progress=lambda _: None)
-            payload = json.loads((result[2] / "Latest Results.json").read_text(encoding="utf-8"))
+                         allow_warnings=allow_warnings,
+                         progress=lambda _: None, report_sink=payload)
             if selected and not check_only:
                 generated_rows = {
                     (row.get("plant"), str(row.get("sn"))): row
                     for row in payload.get("rows", [])
                 }
-                run(paths, self.base, check_only=True, progress=lambda _: None)
-                refreshed = json.loads((result[2] / "Latest Results.json").read_text(encoding="utf-8"))
+                refreshed = {}
+                try:
+                    run(paths, self.base, check_only=True, progress=lambda _: None, report_sink=refreshed)
+                except Exception as exc:
+                    payload['setup_warning'] = f'Certificate saved, but the work list could not refresh: {exc}. Refresh before creating another certificate.'
+                    self.events.put(("done", payload))
+                    return
                 for row in refreshed.get("rows", []):
                     prior = generated_rows.get((row.get("plant"), str(row.get("sn"))))
                     if prior and prior.get("warnings"):
@@ -289,10 +271,9 @@ class App:
                         row["detail"] = prior.get("detail", row.get("detail", ""))
                 payload = refreshed
                 payload["created"] = result[0]
-                save_json(result[2] / "Latest Results.json", payload)
-            self.events.put(("done", payload, manual_cod))
+            self.events.put(("done", payload))
         except Exception as exc:
-            self.events.put(("error", str(exc), manual_cod))
+            self.events.put(("error", str(exc)))
 
     def create_from_file(self):
         """Enter certificate details from a workbook chosen in Explorer."""
@@ -316,20 +297,19 @@ class App:
 
     def _show_details_dialog(self, path, plant):
         fields = (
-            ("case_id", "Client ID / SN"), ("inward_date", "Inward date (DD.MM.YYYY)"),
+            ("case_id", "Serial Number"), ("inward_date", "Inward date (DD.MM.YYYY)"),
             ("supplier", "Company / supplier"), ("location", "City"),
             ("item", "Item"), ("quantity", "Quantity"),
             ("per_piece_weight", "Per-piece weight (KG)"), ("weight", "Inward weight (KG)"),
             ("certificate_weight", "Certificate / net weight (KG)"),
             ("form6", "Form 6 No. (mandatory)"), ("reference", "Reference No. (optional)"),
-            ("cod_no", "COD No. (optional)"), ("cod_date", "COD date (optional)"),
         )
         existing = {}
         selected = self.selected_row()
         if selected and Path(selected.get("file", "")).resolve() == Path(path).resolve():
             existing = {
                 "case_id": selected.get("sn", ""), "supplier": selected.get("supplier", ""),
-                "reference": selected.get("reference", ""), "cod_no": selected.get("certificate_no", ""),
+                "reference": selected.get("reference", ""),
                 "inward_date": selected.get("inward_date", ""),
             }
         dialog = tk.Toplevel(self.root)
@@ -352,7 +332,7 @@ class App:
         def save_details():
             details = {key: variable.get().strip() for key, variable in variables.items()}
             if not details["case_id"]:
-                messagebox.showerror("Client ID required", "Enter the Client ID / SN so the row can be found or added.", parent=dialog)
+                messagebox.showerror("Serial Number required", "Enter the Serial Number so the record can be found or added.", parent=dialog)
                 return
             try:
                 upsert_certificate_details(
@@ -493,14 +473,11 @@ class App:
             while True:
                 event = self.events.get_nowait()
                 kind, value = event[:2]
-                manual_cod = event[2] if len(event) > 2 else None
                 self.busy = False
                 if kind == "done":
                     self.last_result = value
                     self.show_results()
                     created = value.get("created", 0)
-                    if created and manual_cod:
-                        self.custom_cod.set("")
                     self.status.set(f"Finished. {created} certificate PDF(s) generated. All PDFs are in the Certificates folder.")
                 elif kind == "confirm_warnings":
                     payload = value
@@ -516,10 +493,10 @@ class App:
                         + "\n".join(lines), parent=self.root,
                     )
                     if accepted:
-                        paths, selected = event[3], event[4]
+                        paths, selected = event[2], event[3]
                         self.busy = True
                         self.status.set("Creating certificate PDF(s) with the accepted warnings…")
-                        threading.Thread(target=self._worker, args=(paths, False, selected, manual_cod, True), daemon=True).start()
+                        threading.Thread(target=self._worker, args=(paths, False, selected, True), daemon=True).start()
                     else:
                         self.last_result = payload
                         self.show_results()

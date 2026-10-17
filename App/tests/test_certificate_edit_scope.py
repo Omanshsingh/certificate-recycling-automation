@@ -593,7 +593,7 @@ class CertificateEditScopeTests(unittest.TestCase):
         self.assert_explicit_status_can_issue("N/A")
 
     def test_new_row_preflight_cancel_then_success_appends_only_after_confirmation(self):
-        details = self.details(case_id="NEW", reference="R-NEW", inward_date="")
+        details = self.details(case_id="NEW", reference="R-NEW", inward_date="", cod_date="")
         before = self.workbook_bytes()
         self.run_form(details, check_only=True)
         self.assert_untouched(before)
@@ -615,7 +615,7 @@ class CertificateEditScopeTests(unittest.TestCase):
     def test_certificate_only_rejects_new_row_without_any_excel_write(self):
         before = self.workbook_bytes()
         with self.assertRaises(ValueError):
-            web_app.create_certificate(self.body("certificate_only", self.details(case_id="NEW")))
+            web_app.create_certificate(self.body("certificate_only", self.details(case_id="NEW", cod_date="")))
         self.assert_untouched(before)
 
     def test_immutable_source_identity_and_invalid_scope_are_rejected_before_writes(self):
@@ -663,18 +663,25 @@ class CertificateEditScopeTests(unittest.TestCase):
         refresh.assert_not_called()
         self.assert_untouched(before)
 
-    def test_duplicate_cod_requires_confirmation_then_uses_shared_next_number(self):
+    def test_duplicate_cod_on_an_issued_inward_cannot_be_confirmed_into_a_new_number(self):
+        # An issued certificate keeps its COD. A copied COD conflict requires
+        # correction in Excel rather than silently renumbering issued history.
+        book = load_workbook(self.paths[0])
+        try:
+            book.active['K2'] = '0040'
+            book.active['L2'] = ISSUED_DATE
+            book.save(self.paths[0])
+        finally:
+            book.close()
         before = self.workbook_bytes()
         details = self.details(cod_no="0040")
         with patch.object(web_app, "refresh", side_effect=AssertionError("Warning return must not refresh")):
-            result = web_app.create_certificate(self.body(details=details))
-        self.assertTrue(result["requires_confirmation"])
-        self.assertIn("another", str(result["warnings"]).lower())
+            with self.assertRaisesRegex(ValueError, 'COD 0040 is also assigned'):
+                web_app.create_certificate(self.body(details=details))
         self.assert_untouched(before)
         created, _, _ = self.run_form(details, custom_cod="0040", allow_warnings=True)
-        self.assertEqual(created, 1, self.report())
-        self.assert_issued("0041")
-        self.assertEqual(self.paths[1].read_bytes(), before[1])
+        self.assertEqual(created, 0, self.report())
+        self.assert_untouched(before)
 
     def test_existing_generated_explicit_reissue_preflight_and_failure_keep_original_pdf(self):
         self.assertEqual(self.run_form()[0], 1, self.report())

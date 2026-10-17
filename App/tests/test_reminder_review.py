@@ -92,7 +92,7 @@ class ReminderReviewTests(unittest.TestCase):
             {'reminder_due': True, 'age_days': 100},
             {'system_alert': True, 'age_days': -8, 'supplier': 'Future company'},
         ])
-        self.assertIn('1 certificate needs follow-up.', text)
+        self.assertIn('1 certificate pending.', text)
         self.assertIn('1 record has details to check.', text)
         self.assertIn('Review now', text)
         self.assertNotIn('day -8', text)

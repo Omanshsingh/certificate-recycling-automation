@@ -20,7 +20,7 @@ class PlantWorkbookTemplateTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="plant-template-")))
 
-    def test_blank_template_has_the_shared_register_headers_and_a_styled_client_block(self):
+    def test_blank_template_has_the_shared_headers_and_a_fully_ruled_entry_row(self):
         for plant in ("plant1", "plant2"):
             with self.subTest(plant=plant):
                 data = plant_workbook_bytes(plant)
@@ -28,17 +28,28 @@ class PlantWorkbookTemplateTests(unittest.TestCase):
                 sheet = book["Sheet1"]
                 self.assertEqual(tuple(cell.value for cell in sheet[1]), HEADERS)
                 self.assertEqual(sheet.max_column, len(HEADERS))
-                self.assertIn("A2:A4", {str(area) for area in sheet.merged_cells.ranges})
-                self.assertIn("I2:I4", {str(area) for area in sheet.merged_cells.ranges})
-                self.assertIn("Q2:Q4", {str(area) for area in sheet.merged_cells.ranges})
+                self.assertEqual(sheet["G1"].value, "Per Pcs Weight in (KG)")
+                self.assertEqual(sheet["H1"].value, "Weight (KG)")
+                self.assertEqual(sheet.max_row, 2)
+                self.assertEqual(len(sheet.merged_cells.ranges), 0)
                 self.assertEqual(sheet.freeze_panes, "E2")
+                self.assertTrue(sheet.sheet_view.showGridLines)
                 self.assertEqual(sheet["A1"].font.name, "Calibri")
                 self.assertTrue(sheet["A1"].font.bold)
+                self.assertEqual(sheet["A1"].fill.fgColor.rgb, "FF4DD0E1")
+                self.assertEqual(sheet["A1"].alignment.horizontal, "center")
+                self.assertEqual(sheet["A1"].border.left.style, "thin")
+                self.assertEqual(sheet["H2"].border.top.style, "medium")
+                self.assertEqual(sheet["H2"].border.bottom.style, "medium")
                 self.assertEqual(sheet["A2"].border.left.style, "medium")
-                self.assertEqual(sheet["A4"].border.bottom.style, "medium")
-                self.assertTrue(any("Q2:Q10000" in str(rule.sqref)
+                self.assertEqual(sheet["A2"].border.bottom.style, "medium")
+                self.assertEqual(sheet["A2"].alignment.horizontal, "center")
+                self.assertEqual(sheet["C2"].alignment.horizontal, "center")
+                self.assertEqual(sheet["O2"].alignment.horizontal, "center")
+                self.assertTrue(any("R2:R10000" in str(rule.sqref)
                                     for rule in sheet.conditional_formatting))
                 self.assertEqual(len(sheet.data_validations.dataValidation), 1)
+                self.assertEqual(str(sheet.data_validations.dataValidation[0].sqref), "R2:R10000")
                 self.assertEqual(read_batches(BytesIO(data)), [])
                 book.close()
 
@@ -54,10 +65,13 @@ class PlantWorkbookTemplateTests(unittest.TestCase):
         })
         book = load_workbook(BytesIO(updated), data_only=False)
         sheet = book["Sheet1"]
-        self.assertEqual(sheet["I2"].value, "=SUM(G2:G3)")
-        self.assertEqual(sheet["Q2"].value, "Ready")
-        self.assertEqual(sheet["G2"].value, 12.5)
-        self.assertEqual(sheet["G3"].value, 8)
+        self.assertEqual(sheet["J2"].value, "=SUM(H2:H3)")
+        self.assertEqual(sheet["R2"].value, "Ready")
+        self.assertEqual(sheet["H2"].value, 12.5)
+        self.assertEqual(sheet["H3"].value, 8)
+        self.assertEqual(sheet["A2"].alignment.horizontal, "center")
+        self.assertEqual(sheet["E2"].alignment.horizontal, "center")
+        self.assertEqual(sheet["E3"].alignment.horizontal, "center")
         self.assertIn("A2:A3", {str(area) for area in sheet.merged_cells.ranges})
         book.close()
 
@@ -66,6 +80,47 @@ class PlantWorkbookTemplateTests(unittest.TestCase):
         self.assertEqual(saved[0]["case_id"], batch["case_id"])
         self.assertEqual(saved[0]["total_weight"], 20.5)
         self.assertEqual(saved[0]["reference"], "REF-1")
+
+    def test_single_item_client_keeps_a_complete_dark_border(self):
+        updated, _ = stage_new_client(SimpleNamespace(data=plant_workbook_bytes("plant1")), {
+            "supplier": "One item", "location": "Pune", "form6": "F6-ONE",
+            "items": [{"item": "Laptop", "quantity": 1, "weight": 2.5}],
+        })
+        book = load_workbook(BytesIO(updated), data_only=False)
+        sheet = book["Sheet1"]
+        for coordinate in ("A2", "E2", "H2", "R2"):
+            with self.subTest(cell=coordinate):
+                self.assertEqual(sheet[coordinate].border.top.style, "medium")
+                self.assertEqual(sheet[coordinate].border.bottom.style, "medium")
+        self.assertEqual(sheet["H2"].value, 2.5)
+        book.close()
+
+    def test_new_template_saves_operational_fields_and_supports_numeric_or_text_quantities(self):
+        data = plant_workbook_bytes("plant1")
+        updated, _ = stage_new_client(SimpleNamespace(data=data), {
+            "supplier":"Template client", "location":"Pune", "inward_date":"2026-10-01",
+            "form6":"F6-1", "comments":"Call before pickup",
+            "transporter_details":"ABC Logistics", "docket_vehicle_no":"DCK-101",
+            "weight_slip_scale":"Scale ticket 44", "items":[
+                {"item":"Laptop", "quantity":"2", "per_piece_weight":"3.5"},
+                {"item":"Cable lot", "quantity":"1 lot", "per_piece_weight":"3.5"},
+            ],
+        })
+        book = load_workbook(BytesIO(updated), data_only=False)
+        sheet = book["Sheet1"]
+        self.assertEqual([sheet.cell(2, column).value for column in range(11, 15)],
+                         ["Call before pickup", "ABC Logistics", "DCK-101", "Scale ticket 44"])
+        self.assertEqual(sheet["F2"].value, 2)
+        self.assertEqual(sheet["G2"].value, 3.5)
+        self.assertEqual(sheet["H2"].value, "=F2*G2")
+        self.assertEqual(sheet["F3"].value, "1 lot")
+        self.assertEqual(sheet["G3"].value, 3.5)
+        self.assertIsNone(sheet["H3"].value)
+        book.close()
+        batches = read_batches(BytesIO(updated))
+        self.assertEqual(batches[0]["items"][0]["weight"], 7)
+        self.assertEqual(batches[0]["items"][1]["quantity"], "1 lot")
+        self.assertIsNone(batches[0]["items"][1]["weight"])
 
     def test_create_protects_existing_workbook_and_only_writes_xlsx(self):
         destination = self.root / "Plant 1.xlsx"

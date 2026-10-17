@@ -272,6 +272,7 @@ class MissingCertificateRecoveryTests(unittest.TestCase):
                         self.assert_ready_preserves_identity()
                         row = self.report_row(state)
                         self.assertEqual(row["certificate_status"], "ready")
+                        self.assertFalse(row.get("has_issued_certificate", False))
                         self.assertNotIn(row["outcome"], ("generated", "completed", "generated_now"))
                         self.assertIn("missing", row["detail"].casefold())
                         web_app.workspace_state()

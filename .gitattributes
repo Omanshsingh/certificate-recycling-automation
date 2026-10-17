@@ -1,0 +1,3 @@
+# Preserve template file bytes, including PDF stream lengths and offsets.
+*.pdf binary
+*.pptx binary

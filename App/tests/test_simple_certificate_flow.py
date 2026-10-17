@@ -28,7 +28,7 @@ class SimpleCertificateFlowTests(unittest.TestCase):
         self.paths = [self.root / 'plant1.xlsx', self.root / 'plant2.xlsx']
         make_workbook(self.paths[0], [{'sn':'1001', 'supplier':'Different inward name',
             'location':'Pune site', 'date':date(2026, 9, 1), 'weight':12.345678901,
-            'quantity':1, 'per_piece_weight':12.345678901, 'form6':''}])
+            'quantity':1, 'per_piece_weight':12.345678901, 'form6':'FORM6-1001'}])
         make_workbook(self.paths[1], [{'sn':'2001', 'status':'N/A'}])
         shutil.copytree(APP / 'templates', self.root / 'App' / 'templates')
         save_json(self.root / 'settings.local.json', {'workbook_paths':[str(path) for path in self.paths],
@@ -60,7 +60,7 @@ class SimpleCertificateFlowTests(unittest.TestCase):
         finally:
             book.close()
 
-    def test_first_sita_uses_excel_facts_no_form6_and_never_saves_source_edits(self):
+    def test_sita_requires_inward_form6_but_does_not_print_it_or_save_source_edits(self):
         before, other = self.cells(), self.paths[1].read_bytes()
         response = self.create()
         self.assertEqual(response['created'], 1)
@@ -77,10 +77,149 @@ class SimpleCertificateFlowTests(unittest.TestCase):
         self.assertFalse(any('Form 6' in warning for warning in receipt['accepted_warnings']))
         text = PdfReader(self.root / receipt['pdf_path']).pages[0].extract_text()
         self.assertIn('SITA INFORMATION', text)
+        self.assertNotIn('FORM6-1001', text)
         row = web_app.target_row(response['state'], ('plant1', '1001'))
         self.assertTrue(row['has_issued_certificate'])
         self.assertEqual(row['last_certificate_details']['certificate_type'], 'sita')
         self.assertEqual(self.source()['certificate_type'], 'standard')
+
+    def test_sita_certificate_cannot_be_created_when_inward_form6_is_missing(self):
+        book = load_workbook(self.paths[0]); book.active['I2'] = ''; book.save(self.paths[0]); book.close()
+        with self.assertRaisesRegex(ValueError, 'Form 6'):
+            self.create(self.body('sita'))
+        self.assertFalse(list((self.root / 'Certificates').rglob('*.pdf')))
+
+    def test_form6_entered_at_creation_is_saved_and_printed_with_other_inward_facts_kept(self):
+        book = load_workbook(self.paths[0])
+        book.active['I2'] = ''
+        book.save(self.paths[0])
+        book.close()
+        before, other = self.source(), self.paths[1].read_bytes()
+        original = self.paths[0].read_bytes()
+        body = self.body('standard', form6='F6-ENTERED-AT-CREATION')
+        preview = web_app.preview_certificate(body)
+        self.assertEqual(self.paths[0].read_bytes(), original)
+        self.assertEqual(self.source()['form6'], '')
+        preview_text = PdfReader(self.root / 'Data' / 'Previews' / Path(preview['preview_url']).name).pages[0].extract_text()
+        self.assertIn('F6-ENTERED-AT-CREATION', preview_text)
+        result = self.create(body)
+        self.assertEqual(result['created'], 1)
+        saved = self.source()
+        self.assertEqual(saved['form6'], 'F6-ENTERED-AT-CREATION')
+        for key in ('supplier', 'location', 'inward_date', 'reference', 'items'):
+            self.assertEqual(saved[key], before[key], key)
+        self.assertEqual(saved['issued'], 'Generated')
+        receipt = latest_issuance(self.root, 'workbook', 'plant1', '1001')
+        printed = PdfReader(self.root / receipt['pdf_path']).pages[0].extract_text()
+        self.assertIn('F6-ENTERED-AT-CREATION', printed)
+        self.assertEqual(self.paths[1].read_bytes(), other)
+
+    def test_generation_cannot_bypass_missing_form6_with_confirmed_form_details(self):
+        book = load_workbook(self.paths[0])
+        book.active['I2'] = ''
+        book.save(self.paths[0])
+        book.close()
+        original = self.paths[0].read_bytes()
+        report = {}
+        result = runner.run(self.paths, self.root, selected=('plant1', '1001'),
+            details=web_app.editor_details(self.source()), update_excel=False,
+            allow_warnings=True, progress=None, report_sink=report)
+        self.assertEqual(result[0], 0)
+        self.assertTrue(any('Form 6' in row['detail'] for row in report['rows']))
+        self.assertEqual(self.paths[0].read_bytes(), original)
+        self.assertFalse(list((self.root / 'Certificates').rglob('*.pdf')))
+
+    def test_low_memory_has_an_actionable_error_preserves_excel_and_can_retry(self):
+        before = self.paths[0].read_bytes()
+        with patch.object(runner, 'make_certificate', side_effect=MemoryError()):
+            with self.assertRaisesRegex(ValueError, 'Not enough available memory.*Close unused apps'):
+                self.create(self.body('standard'))
+        self.assertEqual(self.paths[0].read_bytes(), before)
+        self.assertFalse(list((self.root / 'Certificates').rglob('*.pdf')))
+        self.assertIsNone(latest_issuance(self.root, 'workbook', 'plant1', '1001'))
+        self.assertEqual(self.create(self.body('standard'))['created'], 1)
+        self.assertEqual(self.source()['cod_no'], '0001')
+
+    def test_deferred_form6_save_does_not_write_pdf_only_company_and_material_edits(self):
+        book = load_workbook(self.paths[0])
+        book.active['I2'] = ''
+        book.save(self.paths[0])
+        book.close()
+        before = self.source()
+        body = self.body('standard', form6='F6-LATER', supplier='PDF company',
+                         items=[{'item': 'PDF asset', 'quantity': '1 Lot', 'weight': '20'}])
+        body.update(edit_scope='certificate_only', pdf_only_edits=True)
+        self.assertEqual(self.create(body)['created'], 1)
+        saved = self.source()
+        self.assertEqual(saved['form6'], 'F6-LATER')
+        self.assertEqual(saved['supplier'], before['supplier'])
+        self.assertEqual(saved['items'], before['items'])
+        self.assertEqual(saved['certificate_type'], before['certificate_type'])
+        receipt = latest_issuance(self.root, 'workbook', 'plant1', '1001')
+        self.assertEqual(receipt['after']['supplier'], 'PDF company')
+        self.assertEqual(receipt['after']['items'][0]['weight'], 20)
+
+    def test_deferred_form6_failed_save_leaves_no_certificate_and_retry_succeeds(self):
+        book = load_workbook(self.paths[0])
+        book.active['I2'] = ''
+        book.save(self.paths[0])
+        book.close()
+        original = self.paths[0].read_bytes()
+        body = self.body('standard', form6='F6-RETRY')
+        with patch.object(runner.WorkbookSession, '_persist', side_effect=PermissionError('Excel is in use')):
+            with self.assertRaisesRegex(ValueError, 'Excel is in use'):
+                self.create(body)
+        self.assertEqual(self.paths[0].read_bytes(), original)
+        self.assertFalse(list((self.root / 'Certificates').rglob('*.pdf')))
+        self.assertIsNone(latest_issuance(self.root, 'workbook', 'plant1', '1001'))
+        self.assertEqual(self.create(self.body('standard', form6='F6-RETRY'))['created'], 1)
+        self.assertEqual(self.source()['form6'], 'F6-RETRY')
+        self.assertEqual(self.source()['cod_no'], '0001')
+
+    def test_filled_entries_with_shared_reference_create_each_template_with_distinct_cods(self):
+        kinds = ('standard', 'sita', 'siemens')
+        make_workbook(self.paths[0], [{'sn': str(1001 + index), 'supplier': 'Same company',
+            'location': 'Mumbai', 'date': date(2026, 9, 1), 'weight': 7,
+            'form6': f'F6-{index}', 'reference': 'SHARED-REFERENCE'} for index in range(3)])
+        seen = set()
+        for index, kind in enumerate(kinds):
+            source = read_batches(self.paths[0])[index]
+            details = web_app.editor_details(source)
+            details.update(certificate_type=kind, certificate_fields={
+                'model_name': 'Scanner', 'model_serial': 'MODEL-1', 'tube_serial': 'TUBE-1'}
+                if kind == 'siemens' else {})
+            body = {'plant': 'plant1', 'source_sn': source['case_id'], 'source_plant': 'plant1',
+                    'source_kind': 'workbook', 'edit_scope': 'certificate_only',
+                    'details': details, 'expected_revision': workspace_revision(self.root)}
+            result = self.create(body)
+            if result.get('requires_confirmation'):
+                self.assertTrue(any('Reference SHARED-REFERENCE' in warning
+                    for row in result['warnings'] for warning in row['warnings']))
+                body.update(confirmed=True, override_reason='These are separate inwards with a shared reference.')
+                result = self.create(body)
+            self.assertEqual(result['created'], 1, kind)
+            saved = read_batches(self.paths[0])[index]
+            self.assertEqual(saved['cod_no'], f'{index + 1:04d}')
+            self.assertEqual(saved['issued'], 'Generated')
+            self.assertEqual(saved['reference'], 'SHARED-REFERENCE')
+            self.assertEqual(saved['total_weight'], 7)
+            receipt = latest_issuance(self.root, 'workbook', 'plant1', source['case_id'])
+            self.assertEqual(receipt['after']['certificate_type'], kind)
+            self.assertNotIn(receipt['pdf_path'], seen)
+            seen.add(receipt['pdf_path'])
+            pdf = PdfReader(self.root / receipt['pdf_path'])
+            self.assertEqual(len(pdf.pages), 1)
+            self.assertIn(saved['cod_no'], pdf.pages[0].extract_text())
+
+    def test_cod_and_certificate_date_are_system_managed(self):
+        with self.assertRaisesRegex(ValueError, 'assigned automatically'):
+            web_app.validate_manual_identifiers({'details': {'cod_no':'0099'}})
+        with self.assertRaisesRegex(ValueError, 'certificate date is assigned automatically'):
+            web_app.validate_manual_identifiers({'details': {'cod_date':'2020-01-01'}})
+        body = self.body(cod_no='0099', cod_date='2020-01-01')
+        with self.assertRaisesRegex(ValueError, 'locked|first generation'):
+            self.create(body)
+        self.assertFalse(list((self.root / 'Certificates').rglob('*.pdf')))
 
     def test_preview_and_forged_first_generation_edits_are_readonly_and_rejected(self):
         original = self.paths[0].read_bytes()
@@ -261,7 +400,22 @@ class SimpleCertificateFlowTests(unittest.TestCase):
         row = web_app.target_row(response['state'], ('plant1', '1001'))
         self.assertEqual(row['last_certificate_details']['supplier'], 'Corrected name')
         self.assertEqual(row['last_certificate_details']['location'], 'Mumbai')
-        self.assertTrue(list((self.root / 'Data' / 'Archive' / 'Superseded Certificates').glob('*.pdf')))
+        self.assertTrue(list((self.root / 'Data' / 'Archive' / 'Superseded Certificates').rglob('*.pdf')))
+
+    def test_issued_certificate_date_can_be_corrected_but_cod_stays_fixed(self):
+        self.create()
+        first = latest_issuance(self.root, 'workbook', 'plant1', '1001')
+        body = self.correction()
+        body['edit_scope'] = 'update_excel'
+        body['details']['cod_date'] = '2026-09-28'
+        self.assertEqual(self.create(body)['created'], 1)
+        last = latest_issuance(self.root, 'workbook', 'plant1', '1001')
+        self.assertEqual(last['cod'], first['cod'])
+        self.assertEqual(last['certificate_date'], '2026-09-28')
+        self.assertEqual(self.source()['cod_no'], first['cod'])
+        self.assertEqual(self.source()['cod_date'], date(2026, 9, 28))
+        text = PdfReader(self.root / last['pdf_path']).pages[0].extract_text()
+        self.assertIn('28.09.2026', text)
 
     def test_yes_updates_only_selected_inward_and_no_correction_save_on_failure(self):
         self.create()
@@ -285,7 +439,7 @@ class SimpleCertificateFlowTests(unittest.TestCase):
         runner.run(self.paths, self.root, check_only=True, progress=None)
         row = web_app.target_row(web_app.workspace_state(False), ('plant1', '1001'))
         self.assertEqual(row['certificate_status'], 'ready')
-        self.assertTrue(row['has_issued_certificate'])
+        self.assertTrue(row.get('has_issued_certificate', False))
         self.assertEqual(row['last_certificate_details']['certificate_type'], 'siemens')
 
     def test_bulk_recreation_retains_app_only_type_and_siemens_identifiers(self):

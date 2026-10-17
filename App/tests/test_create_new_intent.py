@@ -59,7 +59,7 @@ class CreateNewIntentTests(unittest.TestCase):
                 "case_id": case_id, "supplier": "Requested Company Ltd", "location": "Pune",
                 "inward_date": "2026-09-01", "item": "Servers", "weight": "10",
                 "form6": "FORM-REQUEST", "reference": "REF-REQUEST",
-                "cod_date": "2026-10-01", "certificate_type": "standard",
+                "certificate_type": "standard",
                 "certificate_fields": {},
             },
             "expected_revision": workspace_revision(self.root),
@@ -114,7 +114,7 @@ class CreateNewIntentTests(unittest.TestCase):
                 with patch.object(web_app, "run", side_effect=AssertionError("No preflight")) as run:
                     status, response = self.post_create(body)
                 self.assertEqual(status, 400, response)
-                self.assertIn("This Excel ID already exists", response["error"])
+                self.assertIn("This Serial Number is already used", response["error"])
                 self.assertIn("Choose the company from the list", response["error"])
                 run.assert_not_called()
                 self.assertEqual(self.snapshot(), before)
@@ -129,7 +129,7 @@ class CreateNewIntentTests(unittest.TestCase):
                 with patch.object(web_app, "run", side_effect=AssertionError("No preflight")) as run:
                     status, response = self.post_create(body)
                 self.assertEqual(status, 400, response)
-                self.assertIn("This Excel ID already exists", response["error"])
+                self.assertIn("This Serial Number is already used", response["error"])
                 run.assert_not_called()
                 self.assertEqual(self.snapshot(), before)
 
@@ -142,7 +142,7 @@ class CreateNewIntentTests(unittest.TestCase):
                 patch.object(web_app, "read_batches", wraps=read_batches) as read:
             status, response = self.post_create(body)
         self.assertEqual(status, 400, response)
-        self.assertIn("This Excel ID already exists", response["error"])
+        self.assertIn("This Serial Number is already used", response["error"])
         read.assert_called_once_with(self.paths[1].resolve())
         run.assert_not_called()
         self.assertEqual(self.snapshot(), before)

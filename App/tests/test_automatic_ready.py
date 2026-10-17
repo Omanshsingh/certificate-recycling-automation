@@ -22,12 +22,13 @@ class AutomaticReadyTests(AutomationTestBase):
         finally:
             book.close()
 
-    def test_empty_incomplete_becomes_ready_after_excel_details_are_filled(self):
+    def test_incomplete_rows_auto_alert_then_become_ready_after_details_are_filled(self):
         make_workbook(self.plant1, [{'sn':'1001', 'status':'', 'supplier':''}])
         self.refresh_sheet()
-        self.assertEqual(self.statuses(), [None])
+        self.assertEqual(self.statuses(), ['Alert'])
         book = load_workbook(self.plant1)
         book.active['C2'] = 'Completed company'
+        book.active['I2'] = 'FORM-1001'
         book.save(self.plant1)
         book.close()
         original = read_batches(self.plant1)[0]
@@ -47,7 +48,7 @@ class AutomaticReadyTests(AutomationTestBase):
             {'sn':'C', 'status':'   ', 'supplier':''},
         ])
         self.refresh_sheet()
-        self.assertEqual(self.statuses(), [None, 'Ready', None])
+        self.assertEqual(self.statuses(), ['Alert', 'Ready', 'Alert'])
         book = load_workbook(self.plant1)
         try:
             validation = next(v for v in book.active.data_validations.dataValidation if 'M2:M10000' in str(v.sqref))
@@ -63,15 +64,34 @@ class AutomaticReadyTests(AutomationTestBase):
                    {'cod_date':AS_OF + timedelta(days=1)}, {'cod':'=1+1'}]
         make_workbook(self.plant1, [dict(change, sn=str(i), status='') for i, change in enumerate(changes)])
         self.refresh_sheet()
-        self.assertEqual(self.statuses(), [None] * len(changes))
+        self.assertEqual(self.statuses(), ['Alert'] * len(changes))
 
     def test_explicit_statuses_are_preserved(self):
         statuses = ['Ready', 'Alert', 'N/A', 'Generated', 'Generated Manual', 'Completed', 'User value']
-        make_workbook(self.plant1, [dict(sn=str(i), status=status) for i, status in enumerate(statuses)])
+        make_workbook(self.plant1, [dict(sn=str(i), status=status,
+                                         supplier='' if status == 'Alert' else 'Client')
+                                    for i, status in enumerate(statuses)])
         self.refresh_sheet()
         self.assertEqual(self.statuses(), statuses)
 
-    def test_sita_and_siemens_need_no_form6_or_manual_template_identifiers(self):
+    def test_book_my_junk_is_always_na_and_never_auto_ready(self):
+        make_workbook(self.plant1, [{
+            'sn':'B-MJ', 'supplier':'Reverse E - Commerce Pvt. Ltd. (Book My Junk)',
+            'form6':'FORM-MJ', 'status':'',
+        }])
+        self.refresh_sheet()
+        self.assertEqual(read_batches(self.plant1)[0]['issued'], 'N/A')
+        self.assertEqual(self.statuses(), ['N/A'])
+
+        book = load_workbook(self.plant1)
+        book.active['M2'] = 'Ready'
+        book.save(self.plant1)
+        book.close()
+        self.refresh_sheet()
+        self.assertEqual(self.statuses(), ['N/A'])
+        self.assertEqual(read_batches(self.plant1)[0]['issued'], 'N/A')
+
+    def test_form6_is_required_even_for_sita_and_siemens_templates(self):
         make_workbook(self.plant1, [dict(sn=kind, status='', form6='') for kind in ('sita', 'siemens', 'standard')])
         book = load_workbook(self.plant1)
         book.active['N1'] = 'Certificate Type'
@@ -80,7 +100,14 @@ class AutomaticReadyTests(AutomationTestBase):
         book.save(self.plant1)
         book.close()
         self.refresh_sheet()
-        self.assertEqual(self.statuses(), ['Ready', 'Ready', None])
+        self.assertEqual(self.statuses(), ['Alert', 'Alert', 'Alert'])
+        book = load_workbook(self.plant1)
+        book.active['I2'] = 'SITA-F6'
+        book.active['I3'] = 'SIEMENS-F6'
+        book.save(self.plant1)
+        book.close()
+        self.refresh_sheet()
+        self.assertEqual(self.statuses(), ['Ready', 'Ready', 'Alert'])
 
     def test_protected_merged_and_formula_status_cells_are_kept(self):
         for kind in ('protected', 'merged', 'formula'):
@@ -125,7 +152,7 @@ class AutomaticReadyTests(AutomationTestBase):
         book.save(self.plant1)
         book.close()
         self.refresh_sheet()
-        self.assertEqual(self.statuses(), [None] * 4)
+        self.assertEqual(self.statuses(), ['Alert', None, None, None])
         book = load_workbook(self.plant1)
         book.active['H3'] = 3
         book.save(self.plant1)
@@ -159,4 +186,4 @@ class AutomaticReadyTests(AutomationTestBase):
         make_workbook(self.plant2, [dict(sn='C', status='N/A')])
         created, review, _ = self.execute()
         self.assertEqual((created, review), (1, 1))
-        self.assertEqual(self.statuses(), ['Generated', None])
+        self.assertEqual(self.statuses(), ['Generated', 'Alert'])

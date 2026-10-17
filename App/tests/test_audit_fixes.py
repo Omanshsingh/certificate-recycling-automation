@@ -209,14 +209,15 @@ class AuditFixTests(unittest.TestCase):
                                  setattr(book.active['O2'], 'value', date(2026, 9, 20)),
                                  setattr(book.active['I2'], 'value', None)))
         source = read_batches(self.paths[0])[0]
-        self.assertFalse(source['blocking_issues'])
+        self.assertEqual(source['blocking_issues'], ['missing Form 6 number / manifest number'])
         self.assertEqual(source['form6'], '')
         self.assertFalse(inward_details_complete(source, AS_OF))
         for heading in ('Form 6 alternate number', 'Site region', 'Reference Email Sent Date / Reference No'):
             with self.subTest(heading=heading):
                 self.mutate(lambda book:setattr(book.active['P1'], 'value', heading))
                 self.mutate(lambda book:setattr(book.active['P2'], 'value', 'Unmapped value'))
-                self.assertTrue(read_batches(self.paths[0])[0]['blocking_issues'])
+                self.assertTrue(any('not recognised' in issue
+                                    for issue in read_batches(self.paths[0])[0]['blocking_issues']))
 
     def test_note_footer_is_not_a_fake_inward(self):
         self.mutate(lambda book:book.active.append(['Note: checked by supervisor']))
@@ -257,10 +258,10 @@ class AuditFixTests(unittest.TestCase):
         self.mutate(lambda book:setattr(book.active['H2'],'value','7000 g'))
         self.assertFalse(inward_details_complete(read_batches(self.paths[0])[0],AS_OF))
 
-    def test_empty_status_selected_sita_and_siemens_generate_without_source_edits(self):
+    def test_empty_status_selected_sita_and_siemens_generate_with_required_form6(self):
         for kind in ('sita','siemens'):
             with self.subTest(kind=kind):
-                make_workbook(self.paths[0],[dict(sn='A',status='',form6='')])
+                make_workbook(self.paths[0],[dict(sn='A',status='',form6='FORM-A')])
                 source=read_batches(self.paths[0])[0]
                 details=web_app.editor_details(source);details['certificate_type']=kind
                 if kind=='siemens': details['certificate_fields']=dict(model_name='Scanner',model_serial='M1',tube_serial='T1')
@@ -292,17 +293,32 @@ class AuditFixTests(unittest.TestCase):
         self.execute(check_only=True)
         row=next(row for row in self.report()['rows'] if row['sn']=='A')
         self.assertTrue(any('weight' in warning for warning in row['warnings']))
-        self.assertEqual(row['certificate_status'],'blank')
-        self.assertEqual(read_batches(self.paths[0])[0]['issued'],'')
+        self.assertIn('weight', row['detail'])
+        self.assertEqual(row['certificate_status'],'alert')
+        self.assertEqual(read_batches(self.paths[0])[0]['issued'],'Alert')
 
     def test_future_cod_date_requires_review_for_ready_and_empty_status(self):
-        self.mutate(lambda book:(setattr(book.active['L2'],'value',date(2050,1,1)),setattr(book.active['M2'],'value','Ready')))
-        self.assertEqual(self.execute()[0],0)
-        row=next(row for row in self.report()['rows'] if row['sn']=='A')
-        self.assertTrue(any('COD Date is in the future' in warning for warning in row['warnings']))
-        self.assertFalse(inward_details_complete(read_batches(self.paths[0])[0],AS_OF))
-        self.assertEqual(self.execute(allow_warnings=True,override_reason='Future date agreed')[0],1)
-        self.assertIn('01.01.2050',self.pdf_text())
+        for status in ('Ready', ''):
+            with self.subTest(status=status):
+                make_workbook(self.paths[0], [dict(sn='A', status=status, cod_date=date(2050,1,1))])
+                self.assertEqual(self.execute()[0],0)
+                row=next(row for row in self.report()['rows'] if row['sn']=='A')
+                self.assertEqual(row['certificate_status'], 'alert')
+                self.assertTrue(any('COD Date is in the future' in warning for warning in row['warnings']))
+                self.assertFalse(inward_details_complete(read_batches(self.paths[0])[0],AS_OF))
+                self.assertEqual(self.execute(allow_warnings=True,override_reason='Future date agreed')[0],0)
+                self.assertFalse(list((self.root/'Certificates').rglob('*.pdf')))
+                self.assertEqual(read_batches(self.paths[0])[0]['cod_no'], '')
+
+                # Correcting the source date makes this automatic Alert Ready
+                # on the next review; confirmation cannot approve a bad date.
+                self.mutate(lambda book:setattr(book.active['L2'],'value',AS_OF))
+                self.execute(check_only=True)
+                reviewed = next(row for row in self.report()['rows'] if row['sn']=='A')
+                self.assertEqual(reviewed['certificate_status'], 'ready')
+                self.assertFalse(any('COD Date is in the future' in warning for warning in reviewed['warnings']))
+        self.assertEqual(self.execute()[0],1)
+        self.assertIn(AS_OF.strftime('%d.%m.%Y'), self.pdf_text())
 
     def test_shared_validation_and_colour_rules_keep_non_status_ranges(self):
         def rules(book):

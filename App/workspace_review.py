@@ -14,7 +14,7 @@ def workspace_revision(root, file_overrides=None):
     root = Path(root).resolve()
     settings = load_settings(root)
     paths = [root / 'settings.local.json', root / 'Data' / 'Custom Certificates.json',
-             root / 'Data' / 'Certificate Inventory.json']
+             root / 'Data' / 'Certificate Inventory.json', root / 'Data' / 'History Reset.json']
     paths.extend(Path(value).resolve() for value in settings.get('workbook_paths', []) if value)
     for folder in (root / 'Certificates', root / 'Data' / 'Attachments', root / 'App' / 'templates' / 'certificate-types'):
         paths.extend(path for path in sorted(folder.rglob('*')) if path.is_file() and not path.name.startswith('.'))

@@ -134,15 +134,15 @@ class NativeTemplateTests(TemporaryCertificateTest):
                 self.assertFalse(native_images - image_fingerprints(output),
                                  f"{kind} lost or changed a native background image")
 
-    def test_specs_expose_three_explicit_designs_and_siemens_serial_fields(self):
+    def test_specs_expose_four_explicit_designs_and_siemens_serial_fields(self):
         specs = {spec["id"]: spec for spec in template_specs()}
-        self.assertEqual(set(specs), {"standard", "sita", "siemens"})
+        self.assertEqual(set(specs), {"standard", "sita", "siemens", "destruction"})
         keys = {field["key"] for field in specs["siemens"]["fields"]}
         self.assertTrue({"model_name", "model_serial", "tube_serial", "site_location"} <= keys)
         for spec in specs.values():
             keys = [field["key"] for field in spec["fields"]]
             self.assertEqual(len(keys), len(set(keys)))
-            expected = {"company_display", "weight_display"}
+            expected = ({"destruction_date", "device_receipts"} if spec["id"] == "destruction" else {"company_display", "weight_display"})
             if spec["id"] == "siemens":
                 expected |= {"model_name", "model_serial", "tube_serial", "site_location"}
             self.assertEqual(set(keys), expected)
@@ -652,7 +652,7 @@ class DraftWorkflowTests(TemporaryCertificateTest):
         self.assertEqual(batch["certificate_type"], "sita")
         self.assertEqual(drafts.manual_rows(self.root)[0]["certificate_no"], "")
 
-    def test_missing_custom_cod_pdf_reconciles_and_recreates_without_clearing_number(self):
+    def test_missing_pdf_recreates_with_original_automatic_cod(self):
         first = self.generate(plant="plant2", details=self.details(cod_no="SITA-CUSTOM-77"))
         folder = self.root / "Certificates"
         self.manual_pdf(first).unlink()
@@ -666,15 +666,15 @@ class DraftWorkflowTests(TemporaryCertificateTest):
         register = drafts.read_register(self.root)
         record = register["records"][0]
         self.assertEqual(record["status"], "ready")
-        self.assertEqual(record["details"]["cod_no"], "SITA-CUSTOM-77")
+        self.assertEqual(record["details"]["cod_no"], first["certificate_no"])
         self.assertEqual(record["details"]["cod_date"], AS_OF.isoformat())
         regenerated = drafts.generate_draft(self.root, record_id=first["record_id"], as_of=AS_OF)
         self.assertEqual((regenerated["record_id"], regenerated["certificate_no"]),
-                         (first["record_id"], "SITA-CUSTOM-77"))
+                         (first["record_id"], first["certificate_no"]))
         self.assertTrue(self.manual_pdf(regenerated).exists())
         self.assertTrue(unrelated.exists())
 
-    def test_workbook_preflight_keeps_own_cod_but_manual_source_flags_duplicate(self):
+    def test_workbook_preflight_keeps_own_cod_and_manual_source_uses_automatic_cod(self):
         details = self.details(case_id="EXCEL-1", cod_no="0010")
         before = [path.read_bytes() for path in self.paths]
         _, cod, _, warnings = drafts.prepare_certificate(
@@ -683,9 +683,23 @@ class DraftWorkflowTests(TemporaryCertificateTest):
         _, cod, _, warnings = drafts.prepare_certificate(
             self.root, "plant1", details, as_of=AS_OF, source_kind="manual")
         self.assertEqual(cod, "0016")
-        self.assertTrue(any("belongs to another certificate" in warning for warning in warnings))
+        self.assertFalse(any("belongs to another certificate" in warning for warning in warnings))
         self.assertEqual([path.read_bytes() for path in self.paths], before)
         self.assertFalse((self.root / "Data" / "Custom Certificates.json").exists())
+
+    def test_issued_manual_certificate_date_can_be_corrected_with_cod_preserved(self):
+        first = self.generate(plant="plant1")
+        row = drafts.manual_rows(self.root)[0]
+        details = row["raw_details"]
+        details["cod_no"] = first["certificate_no"]
+        details["cod_date"] = "2026-09-28"
+        with patch.object(web_app, "ROOT", self.root):
+            web_app.validate_manual_identifiers({"record_id": first["record_id"], "details": details})
+        corrected = drafts.generate_draft(self.root, plant="plant1", details=details,
+                                           record_id=first["record_id"], as_of=AS_OF)
+        self.assertEqual(corrected["certificate_no"], first["certificate_no"])
+        self.assertEqual(drafts.manual_rows(self.root)[0]["certificate_date"], "2026-09-28")
+        self.assertIn("28.09.2026", pdf_text(self.manual_pdf(corrected)))
 
     def test_disconnected_source_requires_explicit_numbering_confirmation(self):
         settings_path = self.root / "settings.local.json"
@@ -708,14 +722,16 @@ class DraftWorkflowTests(TemporaryCertificateTest):
         row = drafts.manual_rows(self.root)[0]
         self.assertIsNone(row["certificate_weight"])
         self.assertEqual(row["display_weight"], 10)
-        for key in ("certificate_weight", "inward_date", "cod_date"):
+        for key in ("certificate_weight", "inward_date"):
             self.assertEqual(row["raw_details"][key], details[key])
+        self.assertEqual(row["raw_details"]["cod_date"], "")
         self.assertEqual(register.read_bytes(), before)
         edited = dict(row["raw_details"], supplier="Renamed Client Ltd")
         self.assertEqual(drafts.save_draft(self.root, "plant1", edited, record_id=record_id), record_id)
         saved = drafts.read_register(self.root)["records"][0]["details"]
-        for key in ("certificate_weight", "inward_date", "cod_date"):
+        for key in ("certificate_weight", "inward_date"):
             self.assertEqual(saved[key], details[key])
+        self.assertEqual(saved["cod_date"], "")
 
     def test_corrupted_xlsx_keeps_available_numbering_source_and_warns_before_generation(self):
         corrupted = b"This is not an XLSX ZIP package."
@@ -840,7 +856,7 @@ class DraftWorkflowTests(TemporaryCertificateTest):
                          (first["record_id"], first["certificate_no"]))
         self.assertEqual(list(folder.rglob("*.pdf")), [latest])
         archive = self.root / "Data" / "Archive" / "Superseded Certificates"
-        archived = list(archive.glob(f"*_{first['filename']}"))
+        archived = list(archive.rglob(first['filename']))
         self.assertEqual(len(archived), 1)
         self.assertEqual(archived[0].read_bytes(), original)
         record = drafts.read_register(self.root)["records"][0]
@@ -874,7 +890,7 @@ class DraftWorkflowTests(TemporaryCertificateTest):
 
         def fail_after_archive(_root, _data):
             self.assertTrue(old_pdf.exists(), 'Retire the previous PDF only after the source is committed')
-            archived = list(archive.glob("*.pdf"))
+            archived = list(archive.rglob("*.pdf"))
             self.assertEqual(len(archived), 0)
             self.assertEqual(old_pdf.read_bytes(), original_pdf)
             self.assertEqual(len([p for p in folder.rglob('*.pdf') if not p.name.startswith('.')]), 2)
@@ -958,10 +974,10 @@ class WebGenerationTests(TemporaryCertificateTest):
                 self.assertTrue(state["rows"][0]["system_alert"])
                 self.assertFalse(list((self.root / "Certificates").rglob("*.pdf")))
 
-    def test_selected_generation_warning_returns_whole_workspace_with_manual_rows(self):
+    def test_selected_generation_warning_keeps_workspace_unchanged_until_confirmation(self):
         selected = ("plant1", "SELECTED")
         warning_row = {"plant": "plant1", "sn": "SELECTED", "source_kind": "workbook",
-                       "certificate_status": "ready", "outcome": "needs_review",
+                       "certificate_status": "ready", "outcome": "ready",
                        "warnings": ["Material receipt date is missing"]}
         other_row = {"plant": "plant2", "sn": "OTHER", "source_kind": "workbook",
                      "certificate_status": "completed", "outcome": "completed"}
@@ -981,9 +997,10 @@ class WebGenerationTests(TemporaryCertificateTest):
         response = web_app.generate(selected=selected)
         self.assertTrue(response["requires_confirmation"])
         self.assertEqual(response["warnings"], [warning_row])
-        self.assertEqual(response["state"]["rows"], [warning_row, dict(other_row, has_issued_certificate=True), manual_row])
-        refresh.assert_called_once_with(paths)
-        runner.assert_called_once_with(paths, self.root, check_only=True, progress=None, report_sink={}, selected=selected)
+        self.assertNotIn('state', response)
+        refresh.assert_not_called()
+        runner.assert_called_once_with(paths, self.root, check_only=True, read_only_preflight=True,
+                                       allow_warnings=True, progress=None, report_sink={}, selected=selected)
         self.assertEqual(list(self.root.iterdir()), [])
 
 

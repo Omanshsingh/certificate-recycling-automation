@@ -39,41 +39,62 @@ class ClientIntakeTests(unittest.TestCase):
 
     def body(self, **details):
         return {'plant':'plant1', 'request_id':'a' * 32, 'expected_revision':workspace_revision(self.root),
-                'details':{'supplier':'New client', **details}}
+                'details':{'supplier':'New client', 'form6':'FORM-NEW', **details}}
 
-    def test_company_only_creates_blank_status_and_can_be_completed_in_excel(self):
+    def test_form6_is_required_before_adding_an_inward(self):
         before = self.paths[0].read_bytes()
         other = self.paths[1].read_bytes()
-        result = web_app.add_client(self.body())
-        self.assertEqual(result['client']['sn'], '1002')
-        self.assertEqual(result['client']['status'], 'blank')
-        book = load_workbook(self.paths[0]); sheet = book.active
-        self.assertIsNone(sheet['M3'].value)
-        self.assertIsNone(sheet['K3'].value); self.assertIsNone(sheet['L3'].value)
-        self.assertEqual(sheet['H3'].value, '=F3*G3')
-        sheet['B3'] = date(2026,10,1); sheet['E3'] = 'Laptop'; sheet['F3'] = 2; sheet['G3'] = 3; sheet['I3'] = 'FORM-NEW'
-        book.save(self.paths[0]); book.close()
-        from certificate_core import inward_details_complete
-        self.assertTrue(inward_details_complete(read_batches(self.paths[0])[-1]))
+        with self.assertRaisesRegex(ValueError, 'Form 6 number'):
+            web_app.add_client(self.body(form6=''))
+        self.assertEqual(self.paths[0].read_bytes(), before)
         self.assertEqual(self.paths[1].read_bytes(), other)
-        backups = list(web_app.BACKUP_DIR.glob('*.xlsx'))
-        self.assertEqual(len(backups), 1); self.assertEqual(backups[0].read_bytes(), before)
+        self.assertFalse(list(web_app.BACKUP_DIR.glob('*.xlsx')))
         self.assertFalse(list(self.root.rglob('*.pdf')))
+
+    def test_backdated_client_can_use_chronological_sr_and_excel_edits_remain_discoverable(self):
+        result = web_app.add_client(self.body(sn='1000', inward_date='2026-06-15',
+            form6='FORM-BACKDATED', items=[{'item':'Laptop','quantity':'1','weight':'4.5'}]))
+        self.assertEqual(result['client']['sn'], '1000')
+        batch = next(row for row in read_batches(self.paths[0]) if row['case_id'] == '1000')
+        self.assertEqual(batch['inward_date'], date(2026, 6, 15))
+        self.assertEqual(batch['issued'], 'Ready')
+
+        # Model the user later changing the SR/date directly in Excel. Refresh
+        # parsing must continue to identify the inward by its current SR.
+        book = load_workbook(self.paths[0]); sheet = book.active
+        sheet.cell(batch['source_row'], 1, '997')
+        sheet.cell(batch['source_row'], 2, date(2026, 6, 12))
+        book.save(self.paths[0]); book.close()
+        edited = next(row for row in read_batches(self.paths[0]) if row['case_id'] == '997')
+        self.assertEqual(edited['inward_date'], date(2026, 6, 12))
+        self.assertEqual(edited['supplier'], 'New client')
+
+    def test_duplicate_custom_sr_is_rejected_without_modifying_workbook(self):
+        before = self.paths[0].read_bytes()
+        with self.assertRaisesRegex(ValueError, 'already used'):
+            web_app.add_client(self.body(sn='1001'))
+        self.assertEqual(self.paths[0].read_bytes(), before)
 
     def test_multiple_materials_ready_and_old_rows_and_package_parts_preserved(self):
         details = {'inward_date':'2026-10-01', 'form6':'FORM-NEW', 'location':'Pune, Maharashtra',
                    'items':[{'item':'Laptop','quantity':'2','per_piece_weight':'3.5'}, {'item':'Printer','weight':'8'}]}
         original = self.paths[0].read_bytes()
+        original_batches = read_batches(BytesIO(original))
         web_app.add_client(self.body(**details))
-        batch = read_batches(self.paths[0])[-1]
+        current_batches = read_batches(self.paths[0])
+        batch = next(row for row in current_batches if row['supplier'] == 'New client')
         self.assertEqual(batch['issued'], 'Ready'); self.assertEqual(batch['total_weight'], 15)
         self.assertEqual(len(batch['items']), 2)
+        self.assertCountEqual([batch_content(row) for row in original_batches],
+                              [batch_content(row) for row in current_batches if row is not batch])
+        for previous in original_batches:
+            current = next(row for row in current_batches if row['case_id'] == previous['case_id'])
+            for key in ('cod_no', 'cod_date', 'issued'):
+                self.assertEqual(current[key], previous[key])
         with ZipFile(BytesIO(original)) as source, ZipFile(self.paths[0]) as after:
             member = _sheet_member(source, 'Inward Register')
-            old_xml = source.read(member).decode(); new_xml = after.read(member).decode()
-            old_rows = list(_element(old_xml, 'row').finditer(old_xml))
-            new_rows = list(_element(new_xml, 'row').finditer(new_xml))
-            self.assertEqual([m.group() for m in old_rows], [m.group() for m in new_rows[:len(old_rows)]])
+            # Date ordering can move complete sections and standardize their
+            # separators; unrelated XLSX parts must remain byte-for-byte intact.
             for name in source.namelist():
                 if name not in {member,'xl/styles.xml','xl/workbook.xml'}:
                     self.assertEqual(source.read(name), after.read(name), name)
@@ -96,6 +117,9 @@ class ClientIntakeTests(unittest.TestCase):
         self.assertIn('N4:N6', {str(area) for area in sheet.merged_cells.ranges})
         self.assertEqual(sheet['N4'].value, '=SUM(H4:H6)')
         self.assertEqual(sheet['H5'].value, '=F5*G5')
+        self.assertEqual(sheet['C4'].alignment.horizontal, 'center')
+        self.assertEqual(sheet['E4'].alignment.horizontal, 'center')
+        self.assertEqual(sheet['H5'].alignment.horizontal, 'center')
         self.assertIsNone(sheet['O4'].value); self.assertIsNone(sheet['K4'].value)
         self.assertEqual(copy(sheet['C4'].fill), copy(sheet['C2'].fill))
         self.assertEqual(sheet.row_dimensions[4].height, 32)
@@ -130,7 +154,7 @@ class ClientIntakeTests(unittest.TestCase):
         body = self.body(); web_app.add_client(body)
         before = self.paths[0].read_bytes()
         with self.assertRaisesRegex(ValueError, 'different details'):
-            web_app.add_client(dict(body, details={'supplier':'Different'}))
+            web_app.add_client(dict(body, details={'supplier':'Different', 'form6':'FORM-NEW'}))
         with self.assertRaisesRegex(ValueError, 'files changed'):
             web_app.add_client(dict(body, request_id='b' * 32))
         self.assertEqual(self.paths[0].read_bytes(), before)
@@ -171,6 +195,37 @@ class ClientIntakeTests(unittest.TestCase):
         self.assertEqual(book.active.cell(1,9).value, 'Certificate Issued')
         book.close()
 
+    def test_four_operational_details_are_saved_and_missing_columns_are_added(self):
+        details = {
+            'comments':'Collection completed',
+            'transporter_details':'ABC Logistics / KA-01-AA-1234',
+            'docket_vehicle_no':'DCK-204',
+            'weight_slip_scale':'Scale ticket 8891',
+        }
+        web_app.add_client(self.body(**details, items=[{'item':'Laptop','weight':5}]))
+        book = load_workbook(self.paths[0]); sheet = book.active
+        headers = {sheet.cell(1, column).value:column for column in range(1, sheet.max_column + 1)}
+        for label, value in zip(('Comments','Transporter/Vehicle Details','Docket No./Vehicle No','Weight Slip/Weight Scale'), details.values()):
+            self.assertEqual(sheet.cell(3, headers[label]).value, value)
+        book.close()
+
+    def test_text_quantity_does_not_multiply_but_numeric_quantity_does(self):
+        web_app.add_client(self.body(inward_date='2026-10-01', form6='FORM-NEW', items=[
+            {'item':'Lot of cables','quantity':'1 lot','per_piece_weight':'3.5'},
+            {'item':'Laptop','quantity':'2','per_piece_weight':'3.5'},
+        ]))
+        book = load_workbook(self.paths[0], data_only=False); sheet = book.active
+        self.assertEqual(sheet['F3'].value, '1 lot')
+        self.assertEqual(sheet['G3'].value, 3.5)
+        self.assertEqual(sheet['H3'].value, None)
+        self.assertEqual(sheet['F4'].value, 2)
+        self.assertEqual(sheet['H4'].value, '=F4*G4')
+        book.close()
+        batch = read_batches(self.paths[0])[-1]
+        self.assertEqual(batch['items'][0]['quantity'], '1 lot')
+        self.assertIsNone(batch['items'][0]['weight'])
+        self.assertEqual(batch['items'][1]['weight'], 7)
+
     def test_plant2_and_text_ids_get_an_automatic_unique_id(self):
         book = load_workbook(self.paths[1]); book.active['A2'] = 'CLIENT-2001'; book.save(self.paths[1]); book.close()
         other = self.paths[0].read_bytes()
@@ -192,26 +247,60 @@ class ClientIntakeTests(unittest.TestCase):
                         'form6':'SANDBOX-F6', 'items':[{'item':'Laptop','quantity':2,'per_piece_weight':3.5},{'item':'Printer','weight':8}]})
                     session._persist(updated)
                 after = read_batches(target)
-                self.assertEqual([batch_content(row) for row in original], [batch_content(row) for row in after[:-1]])
+                self.assertCountEqual([batch_content(row) for row in original],
+                                      [batch_content(row) for row in after if row['case_id'] != batch['case_id']])
                 self.assertEqual(batch['total_weight'],15); self.assertEqual(batch['issued'],'Ready')
 
-    def test_special_types_need_no_form6_and_type_is_stored(self):
-        for kind in ('sita','siemens'):
-            with self.subTest(kind=kind):
-                body = self.body(certificate_type=kind, inward_date='2026-10-01', items=[{'item':'Asset','weight':10}])
-                body['request_id'] = ('c' if kind == 'sita' else 'd') * 32
-                result = web_app.add_client(body)
-                self.assertEqual(result['client']['status'],'ready')
-                self.assertEqual(read_batches(self.paths[0])[-1]['certificate_type'],kind)
+    def test_added_clients_always_use_standard_certificate_type_and_require_form6(self):
+        body = self.body(certificate_type='sita', inward_date='2026-10-01', items=[{'item':'Asset','weight':10}])
+        result = web_app.add_client(body)
+        self.assertEqual(read_batches(self.paths[0])[-1]['certificate_type'],'standard')
+        self.assertEqual(read_batches(self.paths[0])[-1]['form6'],'FORM-NEW')
+        body = self.body(certificate_type='siemens', inward_date='2026-10-01', form6='FORM-NEW',
+                         items=[{'item':'Asset','weight':10}])
+        body['request_id'] = 'e' * 32
+        web_app.add_client(body)
+        self.assertEqual(read_batches(self.paths[0])[-1]['certificate_type'],'standard')
+        self.assertEqual(read_batches(self.paths[0])[-1]['form6'],'FORM-NEW')
 
-    def test_table_keeps_its_columns_and_saves_sita_type_in_properties(self):
+    def test_book_my_junk_client_is_added_as_na_and_cannot_be_issued(self):
+        result = web_app.add_client(self.body(
+            supplier='Reverse E - Commerce Pvt. Ltd. (Book My Junk)',
+            inward_date='2026-10-01', items=[{'item':'Asset','weight':10}],
+        ))
+        added = read_batches(self.paths[0])[-1]
+        self.assertEqual(added['issued'], 'N/A')
+        book = load_workbook(self.paths[0])
+        try:
+            self.assertEqual(book.active['M3'].value, 'N/A')
+        finally:
+            book.close()
+        details = web_app.editor_details(added)
+        with self.assertRaisesRegex(ValueError, 'marked N/A'):
+            web_app.create_certificate({
+                'plant':'plant1', 'source_sn':added['case_id'], 'source_plant':'plant1',
+                'details':details,
+            })
+
+    def test_table_keeps_its_columns_and_adds_standard_client(self):
         book = load_workbook(self.paths[0]); book.active.add_table(Table(displayName='Clients',ref='A1:M2'))
         book.save(self.paths[0]); book.close()
-        web_app.add_client(self.body(certificate_type='sita'))
+        web_app.add_client(self.body(certificate_type='sita', comments='Pickup arranged',
+                                     transporter_details='ABC Logistics', docket_vehicle_no='DCK-42',
+                                     weight_slip_scale='Scale 778'))
         book = load_workbook(self.paths[0]); table = book.active.tables['Clients']
-        self.assertEqual(table.ref,'A1:M3'); self.assertEqual(table.tableColumns[-1].name,'Certificate Issued')
-        self.assertEqual(read_batches(self.paths[0])[-1]['certificate_type'], 'sita')
+        self.assertEqual(table.ref,'A1:Q3')
+        self.assertEqual([column.name for column in table.tableColumns[-4:]],
+                         ['Comments','Transporter/Vehicle Details','Docket No./Vehicle No','Weight Slip/Weight Scale'])
+        self.assertEqual(read_batches(self.paths[0])[-1]['certificate_type'], 'standard')
         book.close()
+
+    def test_form6_is_required_even_when_the_certificate_uses_sita_template(self):
+        book = load_workbook(self.paths[0]); book.active['I2'] = ''; book.save(self.paths[0]); book.close()
+        source = read_batches(self.paths[0])[0]
+        from certificate_core import source_value_issues
+        self.assertIn('missing Form 6 number / manifest number', source_value_issues(source, certificate_type='sita'))
+        self.assertIn('missing Form 6 number / manifest number', source['blocking_issues'])
 
     def test_future_date_keeps_blank_status_and_text_is_not_an_excel_formula(self):
         web_app.add_client(self.body(supplier='=HYPERLINK("https://example.invalid")', inward_date='2099-01-01',

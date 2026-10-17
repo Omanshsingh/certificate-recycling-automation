@@ -64,7 +64,10 @@ class RegisterLayoutTests(unittest.TestCase):
                         {'item':'Monitor','quantity':2,'per_piece_weight':3},
                         {'item':'Printer','quantity':1,'per_piece_weight':8}]})
                 w=load_workbook(BytesIO(updated));s=w.active
-                self.assertEqual([c.value for c in s[1]],headers+['Certificate Issued'])
+                expected = headers + ['Certificate Issued']
+                if plant == 1:
+                    expected += ['Per Pcs Weight in (KG)']
+                self.assertEqual([c.value for c in s[1]], expected)
                 self.assertEqual(batch['total_weight'],14);self.assertEqual(batch['issued'],'Ready')
                 self.assertEqual(batch['reference'],'REF-NEW')
                 self.assertEqual(s['B4'].number_format,'dd.mm.yyyy')
@@ -72,7 +75,9 @@ class RegisterLayoutTests(unittest.TestCase):
                 self.assertIn('A4:A5',{str(a) for a in s.merged_cells.ranges})
                 self.assertEqual(s['E5'].border.bottom.style,'medium')
                 if plant==2:self.assertEqual(s['H4'].value,'=F4*G4')
-                else:self.assertEqual(s['G4'].value,6)
+                else:
+                    self.assertEqual(s['G4'].value, '=F4*O4')
+                    self.assertEqual(s['O4'].value, 3)
                 w.close()
                 with ZipFile(BytesIO(updated)) as z:
                     styles=ET.fromstring(z.read('xl/styles.xml')); ns={'x':styles.tag.split('}')[0][1:]}
@@ -134,6 +139,25 @@ class RegisterLayoutTests(unittest.TestCase):
                 payload=z.read(name)
                 self.assertIn(('<'+tag+' xmlns=').encode(),payload)
                 ET.fromstring(payload)
+
+    def test_metadata_survives_excel_custom_property_limit_for_many_clients(self):
+        from workbook_metadata import write_details,read_details,detail_key,PROPERTY_V2
+        from io import BytesIO
+        from zipfile import ZipFile
+        path,_=self.source(2)
+        updated=path.read_bytes()
+        expected={}
+        for index in range(1,11):
+            details={'reference':f'REF-{index:02d}',
+                     'certificate_fields':{'note':'client field ' + ('x'*500)}}
+            expected[detail_key('Sheet1',str(index))]=details
+            updated=write_details(updated,'Sheet1',str(index),details)
+        self.assertEqual(read_details(BytesIO(updated)),expected)
+        with ZipFile(BytesIO(updated)) as archive:
+            props=ET.fromstring(archive.read('docProps/custom.xml'))
+            chunks=[p for p in props if p.get('name','').startswith(PROPERTY_V2)]
+            self.assertGreater(len(chunks),len(expected))
+            self.assertTrue(all(len(next(iter(prop)).text or '')<=180 for prop in chunks))
 
 
 if __name__=='__main__':

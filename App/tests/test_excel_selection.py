@@ -64,13 +64,13 @@ class ExcelSelectionTests(unittest.TestCase):
             with self.assertRaisesRegex(OSError,'Finish any open message in Excel'):
                 open_excel_record(self.path,'Inward Register',2,case_id='1001',header_row=1)
 
-    def test_web_endpoint_rejects_duplicate_ids_before_launching_excel(self):
+    def test_web_endpoint_opens_duplicate_serials_for_repair_without_selecting_a_record(self):
         make_workbook(self.path,[{'sn':'1001'},{'sn':'1001'}])
         row = {'plant':'plant1','sn':'1001','file':str(self.path),'sheet':'Inward Register'}
-        with patch.object(web_app,'latest_result',return_value={'rows':[row]}), patch.object(web_app,'configured_paths',return_value=[self.path,self.root/'Other.xlsx']), patch.object(web_app,'open_excel_record') as native:
-            with self.assertRaisesRegex(ValueError,'changed'):
-                web_app.open_selected_workbook_record('plant1','1001')
-        native.assert_not_called()
+        with patch.object(web_app,'latest_result',return_value={'rows':[row]}), patch.object(web_app,'configured_paths',return_value=[self.path,self.root/'Other.xlsx']), patch.object(web_app,'open_excel_record',return_value=(self.path,'Inward Register',None)) as native:
+            opened = web_app.open_selected_workbook_record('plant1','1001')
+        self.assertEqual(opened, (self.path, 'Inward Register', None))
+        self.assertTrue(native.call_args.kwargs['allow_duplicate_repair'])
 
 
 if __name__ == '__main__':

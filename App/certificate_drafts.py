@@ -9,11 +9,13 @@ import uuid
 from zipfile import BadZipFile
 from openpyxl.utils.exceptions import InvalidFileException
 
-from certificate_core import certificate_number, material_items, number, parse_date, read_batches, status_value
+from certificate_core import (certificate_number, material_items, number, parse_date, read_batches,
+                              status_value, supplier_is_always_not_applicable)
 from certificate_templates import TEMPLATE_NAMES, layout_warnings, make_template_certificate, template_id, validate_fields, current_warnings
-from run_certificates import _highest_sequence, _safe_cod_name, certificate_filename, find_certificate, cod_identity
+from run_certificates import _highest_sequence, _safe_cod_name, certificate_filename, find_certificate, cod_identity, numbering_plan
 from certificate_inventory import (scan_inventory, cod_conflicts, reference_warnings, verify_publication,
-                                   issuance_paths, record_issuance, certificate_destination, safe_certificate_path)
+                                   issuance_paths, record_issuance, certificate_destination, safe_certificate_path,
+                                   unresolved_cod_entries, cod_recovery_message)
 from workflow_support import load_settings, run_lock, save_json
 from issuance_safety import IssuanceTransaction, recover_issuances, valid_pdf, file_digest, latest_issuance
 
@@ -52,12 +54,24 @@ def clean_details(details):
         raise ValueError("Enter the certificate details first.")
     kind = template_id(details.get("certificate_type"))
     result = {"certificate_type": kind, "certificate_fields": validate_fields(kind, details.get("certificate_fields"))}
+    if kind == 'destruction' and details.get('destruction_source') is not None:
+        link = details['destruction_source']
+        if (not isinstance(link, dict) or link.get('plant') not in {'plant1', 'plant2'}
+                or not isinstance(link.get('case_id'), str) or not link['case_id'].strip()
+                or len(link['case_id']) > 100):
+            raise ValueError('The linked inward is invalid. Reopen its data destruction request.')
+        result['destruction_source'] = {'plant': link['plant'], 'case_id': link['case_id'].strip()}
     for key in ("case_id", "supplier", "location", "inward_date", "item", "quantity", "per_piece_weight",
-                "weight", "certificate_weight", "form6", "reference", "cod_no", "cod_date"):
+                "weight", "certificate_weight", "form6", "reference"):
         value = str(details.get(key) if details.get(key) is not None else "").strip()
         if len(value) > 6000:
             raise ValueError(f"The {key} field is too long.")
         result[key] = value
+    # Keep identifiers long enough for source-specific validation and issued
+    # date corrections. Draft persistence and first issuance still enforce
+    # automatic values in save_draft()/prepare_certificate().
+    result["cod_no"] = str(details.get("cod_no") or "").strip()
+    result["cod_date"] = str(details.get("cod_date") or "").strip()
     if "items" in details:
         items = details["items"]
         if not isinstance(items, list) or len(items) > 100:
@@ -67,7 +81,7 @@ def clean_details(details):
             if not isinstance(item, dict):
                 raise ValueError(f"Material {index} is not a valid row.")
             clean_item = {}
-            for key, limit in (("item", 180), ("quantity", 40), ("per_piece_weight", 40), ("weight", 40)):
+            for key, limit in (("item", 500), ("quantity", 100), ("per_piece_weight", 100), ("weight", 100)):
                 value = str(item.get(key) if item.get(key) is not None else "").strip()
                 if len(value) > limit:
                     raise ValueError(f"Material {index}: {key.replace('_', ' ')} is too long.")
@@ -87,10 +101,37 @@ def _record(data, record_id):
     return result
 
 
+def _manual_record_issued(root, record):
+    return bool(record and (
+        _manual_status(record.get('status')) in {'generated_manual', 'completed'}
+        or latest_issuance(root, 'manual', record['plant'], record['id'])))
+
+
+def _validate_manual_plant(root, record, plant):
+    if record and plant != record['plant'] and _manual_record_issued(root, record):
+        raise ValueError('Plant is fixed for an issued certificate. Copy into a new certificate to use another plant.')
+
+
+def _validate_destruction_record(record, details, plant):
+    if record:
+        previous = record['details']
+        if (previous.get('certificate_type') == 'destruction') != (details['certificate_type'] == 'destruction'):
+            raise ValueError('Data destruction needs its own certificate record. Create a new certificate instead of replacing this one.')
+        link = previous.get('destruction_source')
+        if link:
+            if details.get('destruction_source') not in (None, link):
+                raise ValueError('The linked inward cannot be changed. Create a new request for another inward.')
+            details['destruction_source'] = dict(link)
+    if details.get('destruction_source') and details['destruction_source']['plant'] != plant:
+        raise ValueError('Keep the plant of the linked inward for this data destruction request.')
+
+
 def save_draft(root, plant, details, record_id=None, expected_revision=None):
     if plant not in {"plant1", "plant2"}:
         raise ValueError("Choose Plant 1 or Plant 2.")
     details = clean_details(details)
+    if supplier_is_always_not_applicable(details.get("supplier")):
+        raise ValueError("Reverse E-Commerce Pvt. Ltd. (Book My Junk) is always N/A and does not need a certificate.")
     with run_lock(root):
         recover_issuances(root)
         if expected_revision is not None:
@@ -98,10 +139,29 @@ def save_draft(root, plant, details, record_id=None, expected_revision=None):
             require_revision(root, expected_revision)
         data = read_register(root)
         existing = _record(data, record_id)
+        _validate_manual_plant(root, existing, plant)
+        _validate_destruction_record(existing, details, plant)
+        if not existing and details.get('destruction_source'):
+            linked = next((record for record in data['records']
+                           if record['details'].get('destruction_source') == details['destruction_source']), None)
+            if linked:
+                return linked['id']
         if existing:
-            # Editing a previously generated draft keeps its stable COD unless
-            # the operator explicitly enters another number.
-            details["cod_no"] = details["cod_no"] or existing["details"].get("cod_no", "")
+            details["cod_no"] = existing["details"].get("cod_no", "")
+            issued = _manual_record_issued(root, existing)
+            submitted_date = details.get('cod_date')
+            if issued and submitted_date:
+                parsed_date = parse_date(submitted_date)
+                if parsed_date is None:
+                    raise ValueError('Enter a valid certificate date.')
+                details['cod_date'] = parsed_date.isoformat()
+            else:
+                details["cod_date"] = existing["details"].get("cod_date", "")
+        else:
+            details["cod_no"] = ""
+            details["cod_date"] = ""
+        if existing:
+            # Keep issuance identifiers stable across corrections/recreation.
             existing.update(plant=plant, details=details, status="ready", updated_at=datetime.now().isoformat())
         else:
             existing = {"id": uuid.uuid4().hex, "plant": plant, "details": details, "status": "ready",
@@ -126,22 +186,41 @@ def numbering_sources(root, settings):
     return batches, warnings
 
 
-def prepare_certificate(root, plant, details, *, record_id=None, as_of=None, source_kind="manual"):
+def prepare_certificate(root, plant, details, *, record_id=None, as_of=None, source_kind="manual",
+                        starting_cod=None):
     """Preview/preflight without saving a draft, consuming a COD or changing Excel."""
     if plant not in {"plant1", "plant2"}:
         raise ValueError("Choose Plant 1 or Plant 2.")
     details = clean_details(details)
+    if supplier_is_always_not_applicable(details.get("supplier")):
+        raise ValueError("Reverse E-Commerce Pvt. Ltd. (Book My Junk) is always N/A and does not need a certificate.")
     data = read_register(root)
     existing = _record(data, record_id)
+    _validate_manual_plant(root, existing, plant)
+    _validate_destruction_record(existing, details, plant)
+    if existing:
+        # The COD never changes. An issued certificate may receive an
+        # explicitly corrected date; unissued drafts still use the automatic date.
+        details["cod_no"] = existing["details"].get("cod_no", "")
+        issued = _manual_record_issued(root, existing)
+        if issued:
+            details["cod_date"] = details.get("cod_date") or existing["details"].get("cod_date", "")
+        else:
+            details["cod_date"] = ""
+    elif source_kind == "manual":
+        details["cod_no"] = ""
+        details["cod_date"] = ""
     as_of = as_of or date.today()
     kind = details["certificate_type"]
     settings = load_settings(root)
     batches, warnings = numbering_sources(root, settings)
     inventory = scan_inventory(root)
-    next_number = _highest_sequence(batches, settings, Path(root) / "Certificates",
-                                    Path(root) / "Data" / "certificate-history.sqlite", inventory=inventory) + 1
-    automatic = certificate_number(next_number, settings)
+    numbering = numbering_plan(batches, settings, Path(root) / 'Certificates',
+                               inventory=inventory, starting_cod=starting_cod)
+    automatic = numbering['next_cod']
     requested = details["cod_no"] or (existing["details"].get("cod_no", "") if existing else "")
+    if not requested and numbering['needs_start'] and starting_cod is None:
+        raise ValueError('Enter the starting COD number before previewing or creating this certificate.')
     cod = requested or automatic
     allowed_paths = issuance_paths(inventory, cod, 'manual', plant, record_id)
     owned = bool(allowed_paths)
@@ -162,9 +241,7 @@ def prepare_certificate(root, plant, details, *, record_id=None, as_of=None, sou
         warnings.append(f"COD {cod} is already recorded in certificate PDF history ({names}). If you continue, new automatic COD {automatic} will be used; existing PDFs will not be overwritten.")
         cod = automatic
     warnings.extend(reference_warnings(inventory, details.get('reference'), allowed_paths, owned=owned))
-    for entry in inventory['entries']:
-        if entry['present'] and not entry['cods']:
-            warnings.append(f"{entry['path']}: its COD could not be checked. Confirm the next COD manually before continuing.")
+    warnings.extend(cod_recovery_message(entry['path']) for entry in unresolved_cod_entries(inventory))
     try:
         _safe_cod_name(cod)
     except ValueError as exc:
@@ -178,12 +255,14 @@ def prepare_certificate(root, plant, details, *, record_id=None, as_of=None, sou
         warnings.append('COD Date is in the future; check this date before creating the certificate')
     if not details["supplier"] and not details["certificate_fields"].get("company_display"):
         warnings.append("Company name is missing; the company line will be blank.")
-    if kind != "siemens" and receipt_date is None:
+    if kind not in {"siemens", "destruction"} and receipt_date is None:
         warnings.append("Material receipt date is missing or invalid; it will be blank on the certificate.")
     if receipt_date and receipt_date > as_of:
         warnings.append("Material receipt date is in the future; verify it before sending.")
     certificate_weight = number(details["certificate_weight"])
-    if source_kind == "manual" and "items" not in details:
+    if kind == 'destruction':
+        items, material_issues, inward_weight = [], [], 0
+    elif source_kind == "manual" and "items" not in details:
         items, material_issues = [], []
         inward_weight = number(details.get("weight")) or 0
     else:
@@ -192,7 +271,7 @@ def prepare_certificate(root, plant, details, *, record_id=None, as_of=None, sou
     for issue in material_issues:
         warnings.append(f"{issue.capitalize()}; check the material list and weight before sending.")
     display_weight = certificate_weight if certificate_weight is not None else inward_weight
-    if display_weight is None or display_weight <= 0:
+    if kind != 'destruction' and (display_weight is None or display_weight <= 0):
         warnings.append("Weight is missing, invalid or not positive; check the weight shown in the preview before sending.")
     if details["certificate_weight"] and certificate_weight is None:
         warnings.append("Certificate/net weight is invalid; inward weight will be used if available.")
@@ -203,9 +282,15 @@ def prepare_certificate(root, plant, details, *, record_id=None, as_of=None, sou
                            ("tube_serial", "X-ray tube serial number"), ("site_location", "Site location")):
             if not details["certificate_fields"].get(key, "").strip():
                 warnings.append(f"{label} is missing; enter N/A if it does not apply, or continue with a blank value.")
+    if kind == 'destruction':
+        if source_kind != 'manual':
+            raise ValueError('Use Data destruction beside the inward to create an additional certificate.')
+        from destruction_certificate import content_issues
+        warnings.extend(content_issues(details, as_of))
     batch = dict(details, case_id=details["case_id"] or record_id or "Custom", source_id=plant, items=items,
                  inward_date=receipt_date, certificate_weight=certificate_weight, total_weight=inward_weight,
-                 display_weight=display_weight, _data_root=str(root))
+                 display_weight=display_weight, _data_root=str(root),
+                 _numbering={key: value for key, value in numbering.items() if key != 'sequence'})
     warnings.extend(layout_warnings(batch, cod, issued_date))
     return batch, cod, issued_date, list(dict.fromkeys(warnings))
 
@@ -213,22 +298,28 @@ def prepare_certificate(root, plant, details, *, record_id=None, as_of=None, sou
 def current_record_pdf(root, record):
     """Check the current revision, not a superseded same-COD certificate."""
     filename = record.get("pdf_filename")
+    receipt = latest_issuance(root, 'manual', record['plant'], record['id'])
+    if not filename and not receipt:
+        return find_certificate(Path(root) / "Certificates", dict(record["details"], source_id=record["plant"]))
     if filename:
         relative = record.get('pdf_relative_path') or filename
-        if not isinstance(relative, str):
+    else:
+        recorded_path = Path(receipt.get('pdf_path', ''))
+        if recorded_path.parts[:1] != ('Certificates',) or len(recorded_path.parts) < 2:
             return None
-        try:
-            path = safe_certificate_path(root, relative)
-        except ValueError:
-            return None
-        receipt = latest_issuance(root, 'manual', record['plant'], record['id'])
-        healthy = valid_pdf(path)
-        if receipt and receipt.get('pdf_path') == path.relative_to(Path(root)).as_posix():
-            healthy = healthy and file_digest(path) == receipt['pdf_sha256']
-        elif receipt:
-            healthy = False
-        return path if healthy else None
-    return find_certificate(Path(root) / "Certificates", dict(record["details"], source_id=record["plant"]))
+        relative = Path(*recorded_path.parts[1:]).as_posix()
+    if not isinstance(relative, str):
+        return None
+    try:
+        path = safe_certificate_path(root, relative)
+    except ValueError:
+        return None
+    healthy = valid_pdf(path)
+    if receipt and receipt.get('pdf_path') == path.relative_to(Path(root)).as_posix():
+        healthy = healthy and file_digest(path) == receipt['pdf_sha256']
+    elif receipt:
+        healthy = False
+    return path if healthy else None
 
 
 def _manual_status(value):
@@ -249,6 +340,8 @@ def manual_rows(root):
         details = record["details"]
         materials, _ = material_items(details)
         status = _manual_status(record.get("status", "ready"))
+        has_issued_certificate = (status in {"generated_manual", "completed"}
+                                  or bool(latest_issuance(root, 'manual', record['plant'], record['id'])))
         batch = dict(details, source_id=record["plant"])
         missing = status in {"generated_manual", "completed"} and not current_record_pdf(root, record)
         if missing:
@@ -259,6 +352,8 @@ def manual_rows(root):
                       if materials else number(details.get("weight")))
         rows.append({
             "source_kind": "manual", "record_id": record["id"], "plant": record["plant"],
+            "destruction_source": details.get('destruction_source'),
+            "destruction_pending": details.get('certificate_type') == 'destruction' and status != 'completed',
             "raw_details": dict(details),
             "case_id": details.get("case_id", ""),
             "sn": details.get("case_id") or f"Custom {record['id'][:8]}", "supplier": details.get("supplier", ""),
@@ -266,6 +361,7 @@ def manual_rows(root):
             "certificate_fields": details.get("certificate_fields", {}), "form6": details.get("form6", ""),
             "reference": details.get("reference", ""), "inward_date": details.get("inward_date", ""),
             "certificate_no": details.get("cod_no", ""), "certificate_date": details.get("cod_date", ""),
+            "has_issued_certificate": has_issued_certificate,
             "certificate_weight": number(details.get("certificate_weight")), "display_weight": weight,
             "weight_source": "certificate" if number(details.get("certificate_weight")) is not None else "inward",
             "certificate_status": status, "outcome": "ready" if missing else status,
@@ -298,20 +394,38 @@ def reconcile_manual(root):
 
 
 def generate_draft(root, plant=None, details=None, record_id=None, confirmed=False, as_of=None,
-                   override_reason='', expected_revision=None):
+                   override_reason='', expected_revision=None, starting_cod=None):
     with run_lock(root):
         recover_issuances(root)
         if expected_revision is not None:
             from workspace_review import require_revision
             require_revision(root, expected_revision)
-        inventory = scan_inventory(root, persist=True)
+        # Keep review inputs unchanged until the certificate commits. Updating
+        # the ledger here would invalidate the revision checked below.
+        inventory = scan_inventory(root)
+        unresolved = unresolved_cod_entries(inventory)
+        if unresolved:
+            messages = [cod_recovery_message(entry['path']) for entry in unresolved[:3]]
+            if len(unresolved) > 3:
+                messages.append(f"There are {len(unresolved) - 3} more PDFs to check.")
+            raise ValueError(' '.join(messages))
         data = read_register(root)
         existing = _record(data, record_id)
         if existing and details is None:
             details, plant = existing["details"], existing["plant"]
         elif existing and plant is None:
             plant = existing["plant"]
-        batch, cod, issued_date, warnings = prepare_certificate(root, plant, details, record_id=record_id, as_of=as_of)
+        _validate_manual_plant(root, existing, plant)
+        candidate = clean_details(details)
+        _validate_destruction_record(existing, candidate, plant)
+        details = candidate
+        if candidate['certificate_type'] == 'destruction':
+            from destruction_certificate import content_issues
+            issues = content_issues(candidate, as_of)
+            if issues:
+                raise ValueError(' '.join(issues))
+        batch, cod, issued_date, warnings = prepare_certificate(root, plant, details, record_id=record_id,
+                                                               as_of=as_of, starting_cod=starting_cod)
         if warnings and not confirmed:
             row = {"plant": plant, "supplier": batch["supplier"], "sn": batch["case_id"],
                    "certificate_status": "ready", "outcome": "needs_review", "warnings": warnings,
@@ -319,7 +433,7 @@ def generate_draft(root, plant=None, details=None, record_id=None, confirmed=Fal
             return {"requires_confirmation": True, "warnings": [row], "created": 0, "record_id": record_id}
         details = clean_details(details)
         details.update(cod_no=cod, cod_date=issued_date.isoformat())
-        filename = certificate_filename(batch, int(plant[-1]), cod)
+        filename = certificate_filename(batch, cod=cod)
         folder = Path(root) / "Certificates"
         destination = certificate_destination(root, 'manual', filename)
         relative_path = destination.relative_to(folder).as_posix()
@@ -370,7 +484,11 @@ def generate_draft(root, plant=None, details=None, record_id=None, confirmed=Fal
                 transaction.rollback()
             raise
         finally:
-            temporary.unlink(missing_ok=True)
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError as exc:
+                if committed:
+                    warnings.append(f'Certificate saved; its temporary preview file could not be removed: {exc}.')
         # Failure to cache an already-committed issuance must not report it as
         # uncreated; the durable register still reserves its COD on the retry.
         try:

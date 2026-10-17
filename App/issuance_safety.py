@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import uuid
 
@@ -93,9 +94,46 @@ def audit_records(root):
 
 
 def latest_issuance(root, source_kind, plant, key):
+    identity = lambda value: str(value).strip().casefold() if source_kind == 'workbook' else str(value)
     return next((row for row in reversed(audit_records(root))
                  if row.get('state') == 'complete' and row.get('source_kind') == source_kind
-                 and row.get('plant') == plant and str(row.get('key')) == str(key)), None)
+                 and row.get('plant') == plant and identity(row.get('key')) == identity(key)), None)
+
+
+def workbook_receipt_conflict(batch, receipt):
+    """Reject reused Serial Numbers before restoring another inward's history."""
+    if not receipt:
+        return ''
+    from certificate_core import parse_date
+
+    def cod_key(value):
+        value = str(value or '').strip()
+        return str(int(value)) if value.isascii() and value.isdecimal() else value.casefold()
+
+    current_cod = cod_key(batch.get('cod_no', batch.get('certificate_no')))
+    previous_cod = cod_key(receipt.get('cod'))
+    if current_cod and previous_cod and current_cod == previous_cod:
+        return ''
+
+    def source_facts(record):
+        if not isinstance(record, dict) or not record.get('supplier') or not record.get('items'):
+            return None
+        received = parse_date(record.get('inward_date'))
+        if received is None:
+            return None
+        facts = {key: record.get(key) for key in ('supplier', 'location', 'form6', 'reference', 'items')}
+        facts['inward_date'] = received.isoformat()
+        return json.dumps(facts, sort_keys=True, default=str)
+
+    facts = source_facts(batch)
+    if not current_cod and facts is not None and any(
+            facts == source_facts(receipt.get(key)) for key in ('before', 'after')):
+        return ''
+    serial = batch.get('case_id', batch.get('sn', ''))
+    return (f'Serial Number {serial} is linked to an earlier certificate, but the current Excel '
+            'record does not match that history. Open Excel and check the Serial Number and COD. '
+            'Give a new inward an unused Serial Number, or restore the correct identifiers for '
+            'the existing inward, then save and refresh.')
 
 
 class IssuanceTransaction:
@@ -123,7 +161,7 @@ class IssuanceTransaction:
                 payload = path.read_bytes()
                 _write_bytes(self.folder / backup, payload)
                 old.append({'path': relative, 'snapshot': backup, 'sha256': digest_bytes(payload),
-                            'archive': f'Data/Archive/Superseded Certificates/{self.id}_{path.name}'})
+                            'archive': f'Data/Archive/Superseded Certificates/{self.id}/{len(old)}/{path.name}'})
         self.data = {
             'version': 1, 'id': self.id, 'state': 'prepared',
             'started_at': datetime.now(timezone.utc).isoformat(), 'operator': getpass.getuser(),
@@ -161,6 +199,27 @@ class IssuanceTransaction:
         self.mark_source_committed()
         self._finish_committed()
 
+    def _archive_destination(self, old, index, original):
+        relative = old.get('archive')
+        if not isinstance(relative, str):
+            raise ValueError('Invalid certificate archive path.')
+        legacy = f'Data/Archive/Superseded Certificates/{self.id}_{original.name}'
+        if relative.replace('\\', '/') == legacy and len((self.id + '_' + original.name).encode('utf-16-le')) // 2 > 255:
+            snapshot = old.get('snapshot')
+            expected = old.get('sha256')
+            if (not isinstance(snapshot, str) or not re.fullmatch(r'previous-[0-9]+\.pdf', snapshot)
+                    or not isinstance(expected, str) or not re.fullmatch(r'[0-9a-f]{64}', expected)
+                    or file_digest(self.folder / snapshot) != expected):
+                raise ValueError('The previous PDF recovery copy failed verification. Files were preserved.')
+            # Only the known, impossible legacy filename is migrated. Journal
+            # the verified new destination before creating or moving a file.
+            old['archive'] = f'Data/Archive/Superseded Certificates/{self.id}/{index}/{original.name}'
+            self._save()
+        archive = (self.root / old['archive']).resolve()
+        if not archive.is_relative_to(self.root / 'Data' / 'Archive' / 'Superseded Certificates'):
+            raise ValueError('Invalid certificate archive path.')
+        return archive
+
     def _finish_committed(self):
         destination = _certificate_path(self.root, self.data['pdf_path'])
         if not destination.exists():
@@ -171,11 +230,9 @@ class IssuanceTransaction:
         # Do not hide a replacement made outside this app during recovery.
         if file_digest(destination) != self.data['pdf_sha256']:
             raise ValueError('The issued PDF changed during recovery. Its saved copy is retained; ask IT to review it.')
-        for old in self.data['previous_pdfs']:
+        for index, old in enumerate(self.data['previous_pdfs']):
             path = _certificate_path(self.root, old['path'])
-            archive = (self.root / old['archive']).resolve()
-            if not archive.is_relative_to(self.root / 'Data' / 'Archive' / 'Superseded Certificates'):
-                raise ValueError('Invalid certificate archive path.')
+            archive = self._archive_destination(old, index, path)
             archive.parent.mkdir(parents=True, exist_ok=True)
             if not archive.exists():
                 _write_bytes(archive, (self.folder / old['snapshot']).read_bytes())
@@ -183,7 +240,7 @@ class IssuanceTransaction:
                 # A crash during archive creation can leave a partial file.
                 # Keep that file for diagnosis, then atomically publish the
                 # verified original snapshot instead of trusting its presence.
-                preserved = archive.with_name(archive.name + '.interrupted-' + uuid.uuid4().hex)
+                preserved = archive.with_name('.interrupted-' + uuid.uuid4().hex + '.pdf')
                 os.replace(archive, preserved)
                 _write_bytes(archive, (self.folder / old['snapshot']).read_bytes())
             if file_digest(archive) != old['sha256']:
@@ -212,9 +269,9 @@ class IssuanceTransaction:
                 _replace_snapshot(self.folder / previous['snapshot'], destination, stage, previous['sha256'])
         elif current == self.data['pdf_sha256']:
             # Quarantine, not permanent deletion: retains the uncommitted output.
-            quarantine = self.root / 'Data' / 'Archive' / 'Uncommitted Certificates'
+            quarantine = self.root / 'Data' / 'Archive' / 'Uncommitted Certificates' / self.id
             quarantine.mkdir(parents=True, exist_ok=True)
-            os.replace(destination, quarantine / f'{self.id}_{destination.name}')
+            os.replace(destination, quarantine / destination.name)
         self.data.update(state='rolled_back', completed_at=datetime.now(timezone.utc).isoformat())
         self._save()
 

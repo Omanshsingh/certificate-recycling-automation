@@ -27,6 +27,7 @@ class Node {
   closest() { return null; }
   getBoundingClientRect() { return {left:10,right:100,top:10,bottom:100}; }
   focus() { this.focused = true; }
+  setCustomValidity(message) { this.validationMessage = message; }
   showModal() { this.open = true; }
   close() { this.open = false; this.dispatch('close'); }
   showPopover() { this.popoverOpen = true; }
@@ -80,8 +81,9 @@ function harness(options = {}) {
   const ui = vm.runInContext(`${source}\n({app, stateLabel, statusClass, nextStep, matches, makeActions, makeClientCell, makeDetailRow, renderFolderInventory, simpleWarning, readableNumber, detailsBody, materialWeightTotal, updateMaterialWeightTotal, renderMaterialRows, visiblePage, pastCertificateNumbers, certificateFileTitle, showSavedFile, renderPastNumbers, api, fieldDifferences, renderChangeSummary, editorDirty, saveWorkingDraft, saveDraft, readWorkingDraft, clearWorkingDraft, offerDraftRecovery, restoreWorkingDraft, requestDetailsClose, finishDraftClose, certificateUrl, showGenerationSuccess, submitGeneration, bulkGenerationPayload, openBulkGeneration, startBulkGeneration, renderEditorSummary, setEditorMode, validateEditor, finishEditing, openDetails, saveDetails, showWarnings, confirmWarnings, pickAnnexure, previewDetails, toggleFullPdfPreview, backupAction, openBackupRestore, restoreBackup, historyDifferences, loadHistory, showHistoryDetail, invalidatePreview, confirmAction, settleActionConfirmation, handleAction, wire, stopApp, summarize})`, context);
   Object.assign(ui, vm.runInContext('({savedFilePlant, savedFileUrl, savedFileMatches, setWorkspaceView, resetRecordFilters, nextWorkbookId, suggestWorkbookId, printedWeight, updatePrintedWeight, schedulePreview, saveSettings, settingsValues, openSettings, requestSettingsClose, returnFromWarnings, toast, makeStatus, reconnectDashboard, saveExcelChoice, renderTemplateEditor})',context));
   Object.assign(ui, vm.runInContext('({startInlineEdit, finishInlineEdit, syncWorkbookChanges, setState, renderWorkbookIssues, refreshState, pollReminderReview})',context));
-  Object.assign(ui, vm.runInContext('({openAddClient, renderClientMaterials, clientMaterialValues, saveClient, updateClientType})',context));
+  Object.assign(ui, vm.runInContext('({openAddClient, renderClientMaterials, clientMaterialValues, saveClient, validateClientSerialNumber, duplicateSerialNumber, compareRows})',context));
   Object.assign(ui, vm.runInContext('({excelTarget, openClientInExcel})',context));
+  Object.assign(ui, vm.runInContext('({noticeText, showDetailsError, warningInfo, renderWarningList, hasWarnings, needsAttention})',context));
   return {ui, controls, storage, requests, window, context, closeButtons, timers, settingsInputs};
 }
 
@@ -137,7 +139,7 @@ test('Refresh does not announce success for an incomplete workbook scan', async 
 test('Locked files, future dates and ambiguous totals have specific next steps', () => {
   const {ui}=harness();
   assert.match(ui.simpleWarning('plant1.xlsx is unavailable: Cannot update plant1.xlsx. Save and close it in Excel, then try again. (Windows error 32)'),
-    /Close plant1.xlsx in Excel.*Save and close.*Refresh/);
+    /Excel file is in use.*Close Excel or wait a moment.*retry/);
   assert.match(ui.simpleWarning('COD Date is in the future; check this date before creating the certificate'),
     /COD date is in the future.*later than today.*confirm this future date deliberately/);
   assert.match(ui.simpleWarning('Excel row 4: total row needs checking. It does not clearly match the materials; correct or remove the summary row before generating.'),
@@ -152,6 +154,34 @@ test('Missing source files cannot re-enable creation in the preview', () => {
   assert.equal(h.controls.get('#preview-details').disabled,false);
 });
 
+test('Issued duplicate and history-conflict records remain blocked and keep Open in Excel available', async () => {
+  for (const certificate_status of ['ready','generated','completed']) {
+    for (const conflict of [{duplicate_serial_number:true}, {record_identity_conflict:'This Serial Number belongs to a different inward in certificate history. Check Excel before continuing.'}]) {
+      const h = harness(), form = editing(h); h.controls.get('#details-modal').open = false;
+      vm.runInContext('updateSourceControls = () => {}; renderTemplateEditor = () => {};',h.context);
+      const row = {source_kind:'workbook',plant:'plant1',sn:'1001',supplier:'Current company',
+        certificate_status,has_issued_certificate:true,issuance_blocked:true,
+        items:[{item:'Laptops',weight:10}],certificate_type:'standard',last_certificate_details:{supplier:'Wrong historical company',certificate_type:'sita'},...conflict};
+      const actions = all(h.ui.makeActions(row,0), node => node.tag === 'button');
+      assert.equal(actions.filter(node => node.textContent === 'Open in Excel').length,1);
+      assert.equal(actions.filter(node => node.dataset.action === 'edit-details' || node.dataset.action === 'complete').length,0);
+      await h.ui.openDetails(row,false,true);
+      assert.equal(h.ui.app.editor.issuanceBlocked,true);
+      assert.equal(h.controls.get('#save-details').disabled,true);
+      assert.equal(h.controls.get('#preview-details').disabled,true);
+      assert.equal(h.controls.get('#details-error').hidden,false);
+      assert.match(h.controls.get('#details-error').textContent,/Serial Number/);
+      assert.equal(form.values.supplier,'Current company','Conflicted receipts must not replace the live source details.');
+      assert.equal(h.ui.app.editor.template,'standard','Conflicted history must not choose the certificate template.');
+      h.ui.invalidatePreview();
+      assert.equal(h.controls.get('#details-error').hidden,false,'Editing must not hide the identity repair message.');
+      await h.ui.previewDetails();
+      await h.ui.saveDetails({preventDefault(){},currentTarget:form});
+      assert.equal(h.requests.length,0,'Blocked records cannot preview or submit by bypassing the disabled button.');
+    }
+  }
+});
+
 test('Duplicate issue cards keep the COD change, reference and next steps visible without technical filenames', async () => {
   const h = harness({fetch:async () => ({ok:true,json:async () => ({preview_url:`/previews/${'a'.repeat(32)}.pdf`,
     certificate_no:'0393', warnings:duplicateIssueExamples})})}); editing(h);
@@ -159,14 +189,15 @@ test('Duplicate issue cards keep the COD change, reference and next steps visibl
   const list = h.controls.get('#preview-warnings');
   const cards = all(list,node => node.className === 'issue-card'); assert.equal(cards.length,2);
   const visibleCopy = card => card.children.filter(node => node.tag !== 'details').map(text).join(' ');
-  assert.match(visibleCopy(cards[0]),/COD 0365 is already used.*COD 0393.*Existing PDFs stay unchanged.*What to do:.*inward already has a certificate/);
-  assert.match(visibleCopy(cards[1]),/Reference already used.*DUMMY-REF-1002.*reference unchanged.*What to do:.*same inward.*cancel/);
+  assert.match(visibleCopy(cards[0]),/COD 0365 is already used.*COD 0393.*Existing PDFs stay unchanged.*inward already has a certificate/);
+  assert.match(visibleCopy(cards[1]),/Reference already used.*DUMMY-REF-1002.*reference unchanged.*same inward.*cancel/);
+  assert.doesNotMatch(visibleCopy(cards[0]) + visibleCopy(cards[1]),/What to do:/);
   for (let index = 0; index < cards.length; index++) {
     assert.doesNotMatch(visibleCopy(cards[index]), /\.pdf|PDF history|automatic COD/);
     const details = cards[index].children.find(node => node.tag === 'details');
     assert.notEqual(details.open,true); assert.ok(text(details).includes(duplicateIssueExamples[index]));
   }
-  assert.equal(h.controls.get('#preview-warnings-title').textContent,'2 things to check before creating');
+  assert.equal(h.controls.get('#preview-warnings-title').textContent,'Check before creating');
   assert.equal(h.requests.length,1); assert.equal(h.requests[0].endpoint,'/api/preview');
   h.ui.invalidatePreview(); assert.equal(h.controls.get('#preview-warnings-title').hidden,true);
   assert.equal(list.children.length,0);
@@ -211,7 +242,7 @@ test('Unknown issues stay fully visible and company rows show a short useful iss
   assert.equal(all(card,node => node.tag === 'script').length,0);
   const client = h.ui.makeClientCell({supplier:'Acme',certificate_status:'ready',warnings:duplicateIssueExamples},0);
   const note = all(client,node => node.className === 'row-alert-note')[0];
-  assert.equal(note.textContent,'COD 0365 is already used · 1 more issue');
+  assert.equal(note.textContent,'COD 0365 is already used');
   assert.match(note.title,/0393.*DUMMY-REF-1002/); assert.doesNotMatch(note.textContent,/\.pdf|…/);
 });
 
@@ -325,7 +356,7 @@ test('Full logs are retained only inside a closed technical disclosure', () => {
 test('Unknown warnings retain the full consequence instead of being hidden', () => {
   const {ui} = harness(); const unknown = 'COD 0324 is used. A new number will be assigned; existing PDFs will not be overwritten.';
   assert.equal(ui.simpleWarning(unknown), unknown);
-  assert.match(ui.simpleWarning('missing Form 6 number / manifest number'), /blank on the PDF/);
+  assert.match(ui.simpleWarning('missing Form 6 number / manifest number'), /Enter it when creating the certificate/);
 });
 test('Saved list contains only current PDFs, not deleted files or nested disclosures', () => {
   const {ui,controls} = harness();
@@ -379,7 +410,7 @@ test('Material totals add entered line weights and quantity calculations, and fl
   assert.equal(ui.materialWeightTotal([{item:'Laptops'}]).state,'incomplete');
   assert.equal(ui.materialWeightTotal([{item:'Laptops',weight:'-1'}]).state,'invalid');
   ui.updateMaterialWeightTotal([{item:'Laptops',weight:'12'},{item:'Monitors',weight:'3'}]);
-  assert.equal(controls.get('#material-weight-total').textContent,'Total inward weight: 15 kg');
+  assert.equal(controls.get('#material-weight-total').textContent,'Total weight: 15 kg');
 });
 test('Typing Certificate Weight applies it automatically and clearing it restores the source weight', () => {
   // Use a real harness editor state, then exercise the exact payload sent to the server.
@@ -779,7 +810,8 @@ test('Stale workspace errors keep the edited form and recoverable draft open', a
   vm.runInContext('setBusy = () => {}; setDetailsBusy = on => { app.detailsBusy = on; };',h.context);
   await h.ui.submitGeneration(h.ui.detailsBody(form),false,'/api/create',true);
   assert.equal(h.controls.get('#details-modal').open,true); assert.equal(h.ui.readWorkingDraft().values.supplier,'Keep me');
-  assert.match(h.controls.get('#toast-message').textContent,/Refresh.*reopen/);
+  assert.equal(h.controls.get('#toast').classList.contains('visible'),false);
+  assert.match(text(h.controls.get('#details-error')),/Refresh.*review/);
   assert.equal(h.controls.get('#details-error').hidden,false);
 });
 
@@ -984,8 +1016,8 @@ test('Raster first-page preview is default; full embedded PDF loads only on requ
   assert.equal(h.controls.get('#preview-image').src,`http://127.0.0.1:8000/previews/${id}.png`);
   assert.equal(h.controls.get('#preview-image').hidden,false); assert.equal(h.controls.get('#preview-frame').hidden,true);
   assert.equal(h.controls.get('#preview-frame').src,undefined);
-  assert.match(h.controls.get('#preview-status').textContent,/Preview is up to date.*company and weight/);
-  assert.match(h.controls.get('#preview-number').textContent,/Certificate number: 0091.*not reserved/);
+  assert.equal(h.controls.get('#preview-status').textContent,'Preview ready');
+  assert.match(h.controls.get('#preview-number').textContent,/COD 0091/);
   h.ui.toggleFullPdfPreview();
   assert.equal(h.controls.get('#preview-frame').hidden,false); assert.equal(h.controls.get('#preview-frame').src,h.controls.get('#preview-link').href);
   assert.equal(h.controls.get('#preview-full-pdf').attributes['aria-expanded'],'true');
@@ -1125,13 +1157,17 @@ test('First preview exposes reference, COD/date, inward ID and all read-only mat
   const before = JSON.stringify(h.ui.detailsBody(form));
   h.ui.setEditorMode();
   const facts = text(h.controls.get('#editor-facts'));
-  for (const value of ['REF-1010','F6-1010','0362','2026','Inward ID / SN','1001']) assert.ok(facts.includes(value));
+  for (const value of ['REF-1010','F6-1010','0362','2026','Serial Number','1001']) assert.ok(facts.includes(value));
   const materials = h.controls.get('#editor-materials');
   assert.match(text(materials), /Laptops.*Quantity: 2.*3.5 kg per piece.*7 kg total/);
   assert.match(text(materials), /Monitors.*Quantity: 3.*2 kg per piece.*6 kg total/);
   assert.equal(all(materials, node => ['input','button','details'].includes(node.tag)).length, 0);
   assert.equal(JSON.stringify(h.ui.detailsBody(form)), before, 'Summary rendering cannot change source or submit resolved preview values.');
   for (const name of ['reference','cod_no','cod_date']) assert.equal(form.elements.namedItem(name).readOnly, true);
+  h.ui.app.editor.firstGeneration = false; h.ui.app.editor.existing = true; h.ui.app.editor.issuedCertificate = true;
+  h.ui.setEditorMode(true);
+  assert.equal(form.elements.namedItem('cod_no').readOnly, true, 'the COD remains fixed after issuance');
+  assert.equal(form.elements.namedItem('cod_date').readOnly, false, 'the date can be corrected after issuance');
   form.values.certificate_type = 'sita'; h.ui.renderEditorSummary();
   assert.doesNotMatch(text(h.controls.get('#editor-facts')), /Form 6|F6-1010/);
 });
@@ -1140,6 +1176,7 @@ test('Preview facts use the actual rendered COD, date and printed weight and cle
   const h = harness({fetch:async () => ({ok:true,json:async () => ({preview_url:`/previews/${'a'.repeat(32)}.pdf`,
     certificate_no:'0042',certificate_date:'2026-09-30',printed_details:{certificate_weight:'12 KG',company_display:'ACME, MUMBAI'}})})});
   const form = editing(h); form.values.cod_no = '0001'; form.values.cod_date = '';
+  form.values.inward_date = '2026-09-02';
   h.ui.app.editor.firstGeneration = true;
   h.ui.renderMaterialRows([{item:'Laptops',weight:'100.2'}]);
   h.ui.renderEditorSummary(); assert.match(text(h.controls.get('#editor-facts')), /Set automatically/);
@@ -1148,7 +1185,7 @@ test('Preview facts use the actual rendered COD, date and printed weight and cle
   const facts = text(h.controls.get('#editor-facts'));
   assert.match(facts, /0042/); assert.match(facts, /2026/); assert.match(facts, /12 KG · material total/);
   assert.doesNotMatch(facts, /0001|Set automatically/);
-  assert.match(h.controls.get('#preview-number').textContent, /COD date:.*2026.*not reserved/);
+  assert.match(h.controls.get('#preview-number').textContent, /COD 0042.*30.*2026/);
   assert.equal(JSON.stringify(h.ui.detailsBody(form)), before);
   h.ui.invalidatePreview();
   assert.equal(h.ui.app.editor.previewFacts, null);
@@ -1216,7 +1253,7 @@ test('Material entry shows name and weight first while quantity fields retain th
   const h = harness(); h.ui.renderMaterialRows([{item:'Laptops',weight:'21',quantity:'3',per_piece_weight:'7'}]);
   const row = h.ui.app.materialRows[0];
   assert.equal(row.element.children[1].children.length,2);
-  assert.match(text(row.element.children[1]),/Material or asset.*Weight \(kg\)/);
+  assert.match(text(row.element.children[1]),/Material or asset.*Weight \(KG\)/);
   const calculation = row.element.children[2]; assert.equal(calculation.tag,'details'); assert.equal(calculation.open,false);
   assert.equal(row.inputs.quantity.value,'3'); assert.equal(row.inputs.per_piece_weight.value,'7');
   assert.equal(h.ui.materialWeightTotal().total,21);
@@ -1236,6 +1273,16 @@ test('Generated certificate rows open the exact safe PDF locally and expose comp
   assert.equal(h.requests.length,0);
 });
 
+test('A recovered Ready inward with old certificate details is offered for creation again', () => {
+  const h = harness();
+  const row = {source_kind:'workbook',plant:'plant1',sn:'1001',supplier:'Recovered client',
+    certificate_status:'ready',has_issued_certificate:false,
+    last_certificate_details:{certificate_type:'siemens'}};
+  const actions = all(h.ui.makeActions(row,0), node => node.tag === 'button').map(node => node.textContent);
+  assert.ok(actions.includes('Review & create'));
+  assert.equal(actions.includes('Edit certificate'),false);
+});
+
 test('Alert shortcut count respects plant selection without making Blank or N/A eligible for creation', () => {
   const h = harness(); h.controls.get('#plant-filter').value = 'plant2';
   h.ui.app.state.rows = [{plant:'plant1',certificate_status:'alert'}, {plant:'plant2',certificate_status:'alert'},
@@ -1249,8 +1296,9 @@ test('First issuance opens a preview with one edit control; PDF corrections leav
   for (const kind of ['existing','new','copy']) {
     const h = harness(); const form = editing(h); h.controls.get('#details-modal').open = false;
     vm.runInContext('updateSourceControls = () => {}; renderTemplateEditor = () => {}; globalThis.previews = []; previewDetails = async () => previews.push(detailsBody(document.querySelector("#details-form")));',h.context);
-    const row = {plant:'plant2',sn:'2001',supplier:'Northstar',weight:12,inward_date:'2026-10-01',items:[{item:'Laptops',weight:12}]};
+    const row = {plant:'plant2',sn:'2001',supplier:'Northstar',form6:'F6-2001',weight:12,inward_date:'2026-10-01',items:[{item:'Laptops',weight:12}]};
     await h.ui.openDetails(kind === 'new' ? null : row,kind === 'copy');
+    if (kind === 'new') assert.equal(form.values.inward_date,'','A new certificate must not assume today was the receipt date.');
     assert.equal(h.controls.get('#editor-fields').hidden,false);
     assert.equal(h.controls.get('#excel-detail-fields').hidden,kind === 'existing');
     assert.equal(h.context.previews.length,kind === 'existing' ? 1 : 0);
@@ -1264,9 +1312,72 @@ test('First issuance opens a preview with one edit control; PDF corrections leav
       assert.equal(h.controls.get('#excel-detail-fields').hidden,false,'the single edit button reveals certificate-only corrections');
       h.ui.app.editor.pdfEditUsed = true;
       assert.equal(h.ui.detailsBody(h.controls.get('#details-form')).pdf_only_edits,true);
-      assert.equal(h.controls.get('#material-weight-total').textContent,'Total inward weight: 12 kg');
+      assert.equal(h.controls.get('#material-weight-total').textContent,'Total weight: 12 kg');
     }
   }
+});
+
+test('New certificate receipt date starts blank and can be entered manually', () => {
+  const h = harness(), form = editing(h);
+  h.ui.app.editor.sourceSn = null;
+  form.values.inward_date = '';
+  assert.equal(h.ui.validateEditor(),true,'A genuinely unknown date remains optional and can be reviewed as a warning.');
+  form.values.inward_date = '2026-10-01';
+  assert.equal(h.ui.validateEditor(),true);
+  h.ui.app.editor.sourceSn = '1001'; h.ui.app.editor.firstGeneration = true;
+  form.values.inward_date = '';
+  h.ui.setEditorMode(true);
+  assert.equal(form.elements.namedItem('inward_date').readOnly,false,'The date can be entered manually when Excel has no date.');
+  form.values.certificate_type = 'siemens'; form.values.inward_date = '';
+  assert.equal(h.ui.validateEditor(),true,'Siemens hides the receipt date and does not require it.');
+});
+
+test('An inward with deferred Form 6 opens the field for certificate creation', async () => {
+  const h = harness(); const form = editing(h); h.controls.get('#details-modal').open = false;
+  vm.runInContext('updateSourceControls = () => {}; renderTemplateEditor = () => {}; previewDetails = async () => {};', h.context);
+  await h.ui.openDetails({source_kind:'workbook',plant:'plant1',sn:'1001',supplier:'Acme',
+    form6:'',inward_date:'2026-10-01',items:[{item:'Laptop',weight:7}]});
+  assert.equal(h.controls.get('#excel-detail-fields').hidden,false);
+  assert.equal(form.elements.namedItem('form6').readOnly,false);
+  form.values.form6 = 'F6-AT-CREATION';
+  const body = h.ui.detailsBody(form);
+  assert.equal(body.details.form6,'F6-AT-CREATION');
+  assert.equal(body.edit_scope,'certificate_only');
+  assert.equal(h.requests.length,0,'Entering the number must not save Excel before generating.');
+});
+
+test('Source controls preserve review mode for a filled inward and explicit edit mode', () => {
+  const h = harness(), form = editing(h);
+  Object.assign(h.ui.app.editor, {existing:true,firstGeneration:true,editingDetails:false});
+  form.values.form6 = 'F6-FILLED';
+  for (const name of ['certificate_weight','case_id','inward_date','form6','reference']) {
+    const field = new Node('label'), span = new Node('span');
+    field.append(span); field.querySelector = () => span;
+    form.elements.namedItem(name).closest = () => field;
+  }
+  vm.runInContext('suggestWorkbookId = () => {}; updatePrintedWeight = () => {}; updateSourceControls();',h.context);
+  assert.equal(h.controls.get('#editor-summary').hidden,false);
+  assert.equal(h.controls.get('#excel-detail-fields').hidden,true);
+  assert.equal(form.elements.namedItem('form6').readOnly,true);
+  h.ui.setEditorMode(true);
+  vm.runInContext('updateSourceControls();',h.context);
+  assert.equal(h.controls.get('#excel-detail-fields').hidden,false);
+  assert.equal(form.elements.namedItem('form6').readOnly,false);
+});
+
+test('Choosing a certificate type exposes its fields from the first-issuance review', () => {
+  const h = harness(), form = editing(h);
+  Object.assign(h.ui.app.editor, {existing:true,firstGeneration:true,editingDetails:false});
+  form.values.form6 = 'F6-FILLED';
+  h.ui.wire();
+  vm.runInContext('renderTemplateEditor = () => {}; updateSourceControls = () => {};',h.context);
+  h.ui.setEditorMode(false);
+  assert.equal(h.controls.get('#excel-detail-fields').hidden,true);
+  form.values.certificate_type = 'siemens';
+  form.dispatch('change', {target:{name:'certificate_type',value:'siemens'}});
+  assert.equal(h.controls.get('#excel-detail-fields').hidden,false);
+  assert.equal(h.controls.get('#template-editor').hidden,false);
+  assert.equal(h.ui.detailsBody(form).pdf_only_edits,true);
 });
 
 test('An explicit Edit details action starts an existing record in the form', async () => {
@@ -1505,6 +1616,56 @@ test('Automatic previews debounce edits and issue only a read-only preview reque
   assert.equal(h.ui.app.previewLoading,false);
 });
 
+test('Automatic preview failures stay inline with one Open in Excel action and no toast', async () => {
+  const error = 'Serial Number "R1-10" is repeated in sheet "Register", rows 8, 9. Open Excel and give each inward a different Serial Number, then save and refresh before creating a certificate.';
+  const h = harness({fetch:async () => ({ok:false,status:400,json:async () => ({error})})});
+  editing(h); h.ui.renderMaterialRows([{item:'Laptop',weight:10}]);
+  h.ui.schedulePreview();
+  await h.timers.get(h.ui.app.previewTimer).fn();
+  assert.equal(h.requests.length,1);
+  assert.equal(h.requests[0].endpoint,'/api/preview');
+  assert.equal(h.controls.get('#preview-status').textContent,'Preview unavailable');
+  const inline = h.controls.get('#details-error');
+  assert.equal(inline.hidden,false);
+  assert.match(text(inline),/Serial Number R1-10 is repeated.*Excel rows 8 and 9.*Change.*refresh/);
+  assert.equal(all(inline,node => node.tag === 'button' && node.textContent === 'Open in Excel').length,1);
+  assert.equal(h.controls.get('#toast').classList.contains('visible'),false);
+  assert.equal(h.ui.app.previewLoading,false);
+  assert.equal(h.controls.get('#details-modal').open,true);
+});
+
+test('Repeated Serial Number notices preserve the number and row locations in concise text', () => {
+  const h = harness();
+  for (const rows of ['8, 9','8 and 9']) {
+    const raw = `Serial Number "R1-10" is repeated in sheet "Inward Register", rows ${rows}. Open Excel and give each inward a different Serial Number, then save and refresh before creating a certificate.`;
+    const short = h.ui.noticeText(raw);
+    assert.match(short,/Serial Number R1-10 is repeated\. Excel rows 8 and 9\./);
+    assert.match(short,/Change the repeated number in Excel, then refresh\./);
+    assert.doesNotMatch(short,/Inward Register|before creating a certificate|What to do:/);
+  }
+  const list = new Node('ul');
+  h.ui.renderWarningList(list,['Serial Number "R1-10" is repeated in rows 8, 9.','Serial Number "R1-10" is repeated in rows 8, 9.']);
+  assert.equal(list.children.length,1,'Repeated notices should produce one issue card.');
+});
+
+test('Routine workbook reading notices do not turn healthy companies into Needs attention', () => {
+  const h = harness();
+  const routine = 'Excel is open or in use. Showing its saved contents; save and close it before the app writes changes.';
+  for (const certificate_status of ['ready','generated','completed','na']) {
+    const row = {certificate_status,warnings:[routine],workbook_read_only:true};
+    assert.equal(Boolean(h.ui.hasWarnings(row)),false);
+    assert.equal(Boolean(h.ui.needsAttention(row)),false);
+    assert.notEqual(h.ui.stateLabel(row),'Needs attention');
+  }
+  const list = new Node('ul'); h.ui.renderWarningList(list,[routine]);
+  assert.equal(list.children.length,0);
+  const issue = {certificate_status:'ready',warnings:[routine,'missing Form 6 number / manifest number']};
+  assert.equal(h.ui.needsAttention(issue),true,'A genuine missing field must still require attention.');
+  h.ui.renderWarningList(list,issue.warnings); assert.equal(list.children.length,1);
+  assert.match(text(list),/Form 6 number missing/);
+  assert.equal(h.ui.needsAttention({certificate_status:'ready',warnings:[routine],reminder_due:true}),true);
+});
+
 test('Automatic preview waits through incomplete entries and warning review and stops after closing', async () => {
   for (const mode of ['invalid','empty-name','empty-weight','warning','busy','closed','other-editor']) {
     const h = harness(); const form = editing(h); h.ui.renderMaterialRows([{item:'Laptops',weight:10}]);
@@ -1718,20 +1879,22 @@ test('New workbook payload states create-only intent, while existing and manual 
 
 test('New certificate form rejects an already-known ID before sending any mutation', async () => {
   const h = harness(); const form = editing(h); h.ui.app.editor.existing = false; h.ui.app.editor.sourceSn = null;
+  form.values.inward_date = '2026-10-01';
   h.ui.app.state.rows = [{plant:'plant1',sn:'1001',certificate_status:'na'}];
   await h.ui.saveDetails({preventDefault(){},currentTarget:form});
   assert.equal(h.requests.length,0); assert.equal(h.controls.get('#record-options').open,true);
-  assert.match(h.controls.get('#details-error').textContent,/already exists/);
+  assert.match(h.controls.get('#details-error').textContent,/Serial Number.*already used/);
   assert.equal(form.elements.namedItem('case_id').focused,true);
 });
 
 test('Moving an existing custom certificate to Excel is create-only, never an unguarded upsert', async () => {
   const h = harness(); const form = editing(h);
   h.ui.app.editor.existing = true; h.ui.app.editor.recordId = 'custom-1'; h.ui.app.editor.sourceSn = null;
+  form.values.inward_date = '2026-10-01';
   h.ui.app.state.rows = [{plant:'plant1',sn:'1001',certificate_status:'na'}];
   assert.equal(h.ui.detailsBody(form).create_new,true);
   await h.ui.saveDetails({preventDefault(){},currentTarget:form});
-  assert.equal(h.requests.length,0); assert.match(h.controls.get('#details-error').textContent,/already exists/);
+  assert.equal(h.requests.length,0); assert.match(h.controls.get('#details-error').textContent,/Serial Number.*already used/);
   h.ui.app.editor.touched.clear(); form.values.case_id = ''; h.ui.suggestWorkbookId();
   assert.equal(form.values.case_id,'1002');
 });
@@ -1876,9 +2039,12 @@ test('Issued editing uses the first preview layout and opening pencils changes n
   assert.equal(h.controls.get('#editor-summary').hidden,false);
   assert.equal(h.controls.get('#excel-detail-fields').hidden,true);
   assert.equal(h.controls.get('#template-editor').hidden,true);
-  for (const key of ['supplier','reference','cod_no','cod_date','certificate_weight','materials']) {
+  for (const key of ['supplier','reference','certificate_weight','materials']) {
     h.ui.startInlineEdit(key,key); assert.equal(h.ui.app.editor.inlineEdit.key,key);
     assert.equal(JSON.stringify(h.ui.detailsBody(form)),original); h.ui.finishInlineEdit();
+  }
+  for (const key of ['cod_no','cod_date']) {
+    h.ui.startInlineEdit(key,key); assert.equal(h.ui.app.editor.inlineEdit,null);
   }
   for (const key of ['plant','case_id','source_kind']) { h.ui.startInlineEdit(key,key); assert.equal(h.ui.app.editor.inlineEdit,null); }
   assert.equal(h.ui.editorDirty(),false); assert.equal(h.requests.length,0);
@@ -1921,7 +2087,7 @@ test('Inline material edit preserves named source controls and submits every cha
   h.ui.setEditorMode(); h.ui.startInlineEdit('materials','Materials');
   const editor = h.ui.app.editor.inlineEdit.container;
   const inputs = all(editor,node => node.tag === 'input'); assert.ok(inputs.every(input => !input.name));
-  const secondWeight = inputs.find(input => input.attributes['aria-label'] === 'Weight (kg) for material 2');
+  const secondWeight = inputs.find(input => input.attributes['aria-label'] === 'Weight (KG) for material 2');
   secondWeight.value = '8'; secondWeight.dispatch('input');
   const items = h.ui.detailsBody(form).details.items;
   assert.equal(items[0].weight,'100.19999999999999'); assert.equal(items[1].weight,'8');
@@ -2049,7 +2215,7 @@ test('Restoring an older first-generation draft keeps Excel facts and discards u
 
 function clientEntry(h) {
   const form = h.controls.get('#add-client-form');
-  const defaults = {plant:'plant1',certificate_type:'standard',supplier:'',location:'',inward_date:'',form6:'',reference:''};
+  const defaults = {plant:'plant1',sn:'',supplier:'',location:'',inward_date:'',form6:'',reference:'',comments:'',transporter_details:'',docket_vehicle_no:'',weight_slip_scale:''};
   form.values = {...defaults};
   const inputs = Object.fromEntries(Object.keys(defaults).map(name => {
     const input = new Node('input'); input.name = name;
@@ -2065,6 +2231,85 @@ function clientEntry(h) {
   return {form,inputs};
 }
 
+test('Add client explains a duplicate Serial Number before saving and clears it after correction', async () => {
+  const h = harness(), {form,inputs} = clientEntry(h);
+  h.ui.app.state.rows = [
+    {source_kind:'workbook',plant:'plant1',sn:'ABC-10',supplier:'Existing company'},
+    {source_kind:'manual',plant:'plant1',case_id:'LOCAL-1',supplier:'Local company'},
+  ];
+  h.ui.openAddClient();
+  form.values.supplier = 'New company'; form.values.form6 = 'F-NEW'; form.values.sn = ' abc-10 ';
+  assert.equal(h.ui.validateClientSerialNumber(),false);
+  assert.match(inputs.sn.validationMessage,/Already used by Existing company.*another number or leave blank/);
+  assert.equal(h.controls.get('#client-serial-number-hint').hidden,false);
+  assert.equal(inputs.sn.attributes['aria-invalid'],'true');
+  await h.ui.saveClient();
+  assert.equal(h.requests.length,0);
+  form.values.plant = 'plant2';
+  assert.equal(h.ui.validateClientSerialNumber(),true);
+  assert.equal(inputs.sn.validationMessage,'');
+  assert.equal(h.controls.get('#client-serial-number-hint').hidden,true);
+  assert.equal(h.controls.get('#client-serial-number-hint').textContent,'');
+  assert.equal(inputs.sn.attributes['aria-invalid'],'false');
+  form.values.plant = 'plant1'; form.values.sn = 'LOCAL-1';
+  assert.equal(h.ui.validateClientSerialNumber(),true,'Local certificates do not reserve workbook Serial Numbers.');
+  form.values.sn = '';
+  assert.equal(h.ui.validateClientSerialNumber(),true);
+});
+
+test('Company order follows received date across statuses and keeps unknown dates last', () => {
+  const h = harness();
+  const rows = [
+    {sn:'3',plant:'plant1',inward_date:'',certificate_status:'ready'},
+    {sn:'2',plant:'plant1',inward_date:'2026-08-12',certificate_status:'ready'},
+    {sn:'9',plant:'plant1',inward_date:'11-08-2026',certificate_status:'completed'},
+    {sn:'1',plant:'plant1',inward_date:'not a date',certificate_status:'alert'},
+  ];
+  assert.deepEqual(rows.sort(h.ui.compareRows).map(row => row.sn),['9','2','1','3']);
+});
+
+test('Add client leaves certificate template selection to certificate creation', () => {
+  const html = fs.readFileSync(path.join(__dirname,'../web/index.html'),'utf8');
+  const form = html.match(/<form id="add-client-form">([\s\S]*?)<\/form>/)[1];
+  assert.doesNotMatch(form,/Standard COD|name="certificate_type"/);
+  assert.doesNotMatch(form,/class="client-entry-id"|Numeric quantities can use|Required for every inward/);
+  assert.match(form,/id="client-serial-number-hint"[^>]*hidden/);
+  assert.match(html,/<select name="certificate_type"><option value="standard">Standard/);
+});
+
+test('Add client keeps calculation and additional fields visible without dropdowns', () => {
+  const h = harness(); clientEntry(h); h.ui.openAddClient();
+  assert.equal(h.controls.get('#client-serial-number-hint').hidden,true);
+  assert.equal(h.controls.get('#client-serial-number-hint').textContent,'');
+  const inputs = h.ui.app.clientMaterialRows[0];
+  assert.equal(inputs.hint.hidden,true);
+  assert.equal(inputs.hint.textContent,'');
+  assert.equal(h.controls.get('#client-material-weight-total').hidden,true);
+  const card = h.controls.get('#client-material-rows').children[0];
+  const grid = card.children[1];
+  assert.match(text(grid.children[0]),/Material or asset/);
+  assert.match(text(grid.children[1]),/Weight \(KG\)/);
+  const calculation = all(grid,node => node.className?.includes('client-material-calculation'))[0];
+  assert.ok(calculation);
+  assert.equal(all(grid,node => node.tag === 'details').length,0);
+  assert.match(text(calculation),/Calculate weight.*Quantity in Pcs.*Per Pcs Weight/);
+  const html = fs.readFileSync(path.join(__dirname,'../web/index.html'),'utf8');
+  const optional = html.match(/<section class="client-entry-more-details"[\s\S]*?<\/section>/)[0];
+  for (const name of ['reference','comments','transporter_details','docket_vehicle_no','weight_slip_scale']) {
+    assert.ok(optional.includes(`name="${name}"`),name);
+  }
+});
+
+test('Opening Excel for repair gives a short success notice', async () => {
+  const warning = 'Serial Number 10 is repeated. The matching rows are selected in Excel; give each inward a unique Serial Number.';
+  const h = harness({fetch:async () => ({ok:true,json:async () => ({selected:true,selection:'repair',warning})})});
+  await h.ui.openClientInExcel('plant1','10');
+  assert.equal(h.controls.get('#toast-message').textContent,'Excel opened. Check the Serial Number, then save and refresh.');
+  assert.equal(h.controls.get('#dismiss-toast').hidden,true);
+  assert.equal(h.controls.get('#toast').classList.contains('error'),false);
+  assert.equal(h.ui.app.openingExcel,false);
+});
+
 test('Add client follows the plant and keeps unfinished inputs without a certificate preview', () => {
   const h = harness(), {form,inputs} = clientEntry(h);
   h.controls.get('#plant-filter').value = 'plant2';
@@ -2078,17 +2323,43 @@ test('Add client follows the plant and keeps unfinished inputs without a certifi
   assert.equal(form.values.supplier,'New company');
   assert.equal(h.ui.clientMaterialValues()[0].item,'Laptop');
   assert.equal(h.ui.app.clientRequestId,requestId);
-  form.values.certificate_type = 'sita'; h.ui.updateClientType();
-  assert.equal(inputs.form6.closest().hidden,true);
-  form.values.certificate_type = 'standard'; h.ui.updateClientType();
-  assert.equal(inputs.form6.closest().hidden,false);
+  assert.notEqual(inputs.form6.closest().hidden,true);
+});
+
+test('Add client saves with Form 6 blank and leaves it for certificate creation', async () => {
+  const h = harness({fetch:async () => ({ok:true,json:async () => ({client_added:true,
+    client:{sn:'1002',plant:'plant1',supplier:'New company',status:'blank'},
+    state:{rows:[],scan_complete:true}})})});
+  const {form} = clientEntry(h);
+  h.ui.openAddClient(); form.values.supplier = 'New company';
+  await h.ui.saveClient();
+  assert.equal(h.requests.length,1);
+  assert.equal(h.requests[0].payload.details.form6,'');
+});
+
+test('Add client calculates numeric quantity but leaves text quantities for manual weight', () => {
+  const h = harness();
+  h.ui.renderClientMaterials([{item:'Laptop',quantity:'2',per_piece_weight:'3.5'}]);
+  const material = h.ui.app.clientMaterialRows[0];
+  assert.equal(material.weight.value,'7');
+  assert.equal(h.ui.clientMaterialValues()[0].weight,'');
+  material.quantity.value = '1 lot'; material.quantity.dispatch('input');
+  assert.equal(material.weight.value,'');
+  assert.equal(material.hint.textContent,'Enter weight directly.');
+  material.weight.value = '12';
+  assert.equal(h.ui.clientMaterialValues()[0].weight,'12');
 });
 
 test('Add client saves every material once and shows the new Excel entry in the list', async () => {
   let resolveSave;
   const h = harness({fetch:() => new Promise(resolve => { resolveSave = resolve; })});
   const {form} = clientEntry(h); h.ui.openAddClient();
-  form.values.supplier = 'New company';
+  form.values.supplier = 'New company'; form.values.form6 = 'FORM-NEW';
+  form.values.sn = '1000'; form.values.inward_date = '2026-06-15';
+  form.values.comments = 'Return visit';
+  form.values.transporter_details = 'ABC Logistics';
+  form.values.docket_vehicle_no = 'D-123';
+  form.values.weight_slip_scale = '18.5';
   h.ui.renderClientMaterials([{item:'Laptop',quantity:'2',per_piece_weight:'3.5'},{item:'Printer',weight:'8'}]);
   const pending = h.ui.saveClient();
   await h.ui.saveClient();
@@ -2097,6 +2368,13 @@ test('Add client saves every material once and shows the new Excel entry in the 
   assert.equal(h.requests[0].payload.expected_revision,'revision-1');
   assert.equal(h.requests[0].payload.details.items.length,2);
   assert.equal(h.requests[0].payload.details.items[1].weight,'8');
+  assert.equal(h.requests[0].payload.details.sn,'1000');
+  assert.equal(h.requests[0].payload.details.inward_date,'2026-06-15');
+  assert.equal(h.requests[0].payload.details.comments,'Return visit');
+  assert.equal(h.requests[0].payload.details.transporter_details,'ABC Logistics');
+  assert.equal(h.requests[0].payload.details.docket_vehicle_no,'D-123');
+  assert.equal(h.requests[0].payload.details.weight_slip_scale,'18.5');
+  assert.equal(Object.hasOwn(h.requests[0].payload.details,'certificate_type'),false);
   resolveSave({ok:true,json:async () => ({client_added:true,client:{sn:'1002',plant:'plant1',supplier:'New company',status:'ready'},state:{rows:[],scan_complete:true},workspace_revision:'revision-2'})});
   await pending;
   assert.equal(h.controls.get('#add-client-modal').open,false);
@@ -2109,7 +2387,7 @@ test('Add client saves every material once and shows the new Excel entry in the 
 
 test('Failed Add client retains the form and stable request ID for a safe retry', async () => {
   const h = harness({fetch:async () => ({ok:false,status:400,json:async () => ({error:'Save and close Plant 1.xlsx in Excel, then try again.'})})});
-  const {form} = clientEntry(h); h.ui.openAddClient(); form.values.supplier = 'New company';
+  const {form} = clientEntry(h); h.ui.openAddClient(); form.values.supplier = 'New company'; form.values.form6 = 'FORM-NEW';
   const requestId = h.ui.app.clientRequestId;
   await h.ui.saveClient();
   assert.equal(h.controls.get('#add-client-modal').open,true);
@@ -2175,4 +2453,44 @@ test('Opening Excel prevents duplicate launches and announces success only after
   resolveOpen({ok:true,json:async () => ({ok:true,selected:false})}); await failure;
   assert.match(h.controls.get('#toast-message').textContent,/could not confirm/);
   assert.equal(h.controls.get('#busy-overlay').hidden,true);
+});
+
+test('Data destruction requests remain attention items after PDF creation until Completed', () => {
+  const h = harness();
+  const row = {source_kind:'manual',record_id:'request-1',plant:'plant1',sn:'1001',supplier:'Acme',
+    certificate_type:'destruction',certificate_status:'generated_manual',pdf_filename:'0303_Acme.pdf',destruction_pending:true};
+  h.ui.app.state.rows = [row];
+  assert.equal(h.ui.needsAttention(row),true);
+  assert.match(h.ui.nextStep(row),/Send the data destruction PDF.*Completed/);
+  h.ui.summarize();
+  assert.equal(h.controls.get('#destruction-pending').hidden,false);
+  assert.match(h.controls.get('#destruction-pending').textContent,/1 data destruction request/);
+  row.destruction_pending = false; row.certificate_status = 'completed'; h.ui.summarize();
+  assert.equal(h.controls.get('#destruction-pending').hidden,true);
+});
+
+test('Data destruction payload retains its disabled type and inward link during editing', () => {
+  const h = harness(); const form = editing(h);
+  form.values.source_kind = 'manual'; form.values.certificate_type = 'destruction';
+  form.elements.namedItem('certificate_type').disabled = true;
+  const link = {plant:'plant1',case_id:'1001'};
+  Object.assign(h.ui.app.editor, {template:'destruction',destructionSource:link,recordId:'request-1',sourceSn:null,
+    fields:{destruction:{destruction_date:'2026-10-16',device_receipts:'[{"date":"2026-10-01","count":"12"}]'}}});
+  const payload = h.ui.detailsBody(form);
+  assert.equal(payload.source_kind,'manual');
+  assert.equal(payload.details.certificate_type,'destruction');
+  assert.deepEqual(payload.details.destruction_source,link);
+  h.ui.saveWorkingDraft();
+  assert.equal(h.ui.readWorkingDraft().values.certificate_type,'destruction');
+});
+
+test('Data destruction automatic preview works with device counts and no material weight', async () => {
+  const h = harness(); const form = editing(h);
+  form.values.source_kind = 'manual'; form.values.certificate_weight = ''; form.values.weight = '';
+  h.ui.app.editor.template = 'destruction';
+  vm.runInContext('globalThis.destructionPreviewCount=0; previewDetails=async()=>{destructionPreviewCount++}',h.context);
+  h.ui.schedulePreview();
+  const timer = [...h.timers.values()].find(timer => timer.delay === 1000);
+  assert(timer); await timer.fn();
+  assert.equal(vm.runInContext('destructionPreviewCount',h.context),1);
 });
