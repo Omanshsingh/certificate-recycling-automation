@@ -7,6 +7,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $certificateRoot = if ((Split-Path $PSScriptRoot -Leaf) -eq 'App') { Split-Path $PSScriptRoot -Parent } else { $PSScriptRoot }
+$certificateBootstrapPythonDir = Join-Path $env:LOCALAPPDATA 'Programs/Python/CertificateAutomation-3.13'
 
 function Resolve-CertificatePython {
     param([bool]$RequirePackages = $true)
@@ -15,6 +16,10 @@ function Resolve-CertificatePython {
     $localPython = Join-Path $certificateRoot '.venv\Scripts\python.exe'
     if (Test-Path -LiteralPath $localPython -PathType Leaf) {
         [void]$candidates.Add([pscustomobject]@{ Executable = $localPython; Prefix = @() })
+    }
+    $bootstrapPython = Join-Path $certificateBootstrapPythonDir 'python.exe'
+    if (Test-Path -LiteralPath $bootstrapPython -PathType Leaf) {
+        [void]$candidates.Add([pscustomobject]@{ Executable = $bootstrapPython; Prefix = @() })
     }
     # Python Install Manager puts its py.exe launcher in WindowsApps. Do not
     # run that launcher as though it were python.exe; ask it for installed
@@ -62,7 +67,7 @@ function Resolve-CertificatePython {
     # PowerShell 5.1, pywin32 GUI imports can interfere with captured output.
     # Avoid a quoted assert message: Windows PowerShell 5.1 can misquote that
     # embedded string when forwarding the -c argument to python.exe.
-    $pathProbe = 'import sys; assert sys.version_info >= (3, 11); print(sys.executable)'
+    $pathProbe = 'import sys; assert sys.version_info >= (3, 11) and sys.maxsize > 2**32; print(sys.executable)'
     $packageProbe = ''
     if ($RequirePackages) {
         $packageProbe = 'import tkinter, openpyxl, reportlab, pypdf, fontTools, pypdfium2, PIL; '
@@ -114,6 +119,45 @@ function Resolve-CertificatePython {
         return $path
     }
     return $null
+}
+
+function Install-CertificatePythonRuntime {
+    if (-not [Environment]::Is64BitOperatingSystem) {
+        throw 'Automatic Python setup requires 64-bit Windows. Ask IT to install 64-bit Python 3.11 or newer with Tkinter, then run Setup Once.bat again.'
+    }
+    # Python 3.13 remains on the official standalone Windows installer path.
+    # Update the pinned version and digest from python.org when refreshing setup.
+    $pythonVersion = '3.13.17'
+    $installerName = "python-$pythonVersion-amd64.exe"
+    $installerUri = "https://www.python.org/ftp/python/$pythonVersion/$installerName"
+    $expectedSha256 = '5DA012101BA2E17113A9A1CD901E9CE1441086F2B7ECB5DE06EC94163899A190'
+    $installerPath = Join-Path $env:TEMP ("certificate-automation-python-$pythonVersion-" + [Guid]::NewGuid().ToString('N') + '.exe')
+
+    try {
+        Write-Host "No supported Python installation was found. Downloading the official Python $pythonVersion installer..."
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri $installerUri -OutFile $installerPath -UseBasicParsing
+        $actualSha256 = (Get-FileHash -LiteralPath $installerPath -Algorithm SHA256).Hash.ToUpperInvariant()
+        if ($actualSha256 -ne $expectedSha256) {
+            throw 'The downloaded Python installer did not match its published SHA-256 checksum. The file was not run.'
+        }
+
+        Write-Host 'Installing Python for this Windows account...'
+        $installerArguments = '/quiet InstallAllUsers=0 PrependPath=0 Include_launcher=0 Include_tcltk=1 Include_pip=1 Include_test=0 Include_doc=0 Shortcuts=0 TargetDir="' + $certificateBootstrapPythonDir + '"'
+        $process = Start-Process -FilePath $installerPath -ArgumentList $installerArguments -Wait -PassThru
+        if ($process.ExitCode -ne 0) {
+            throw "The Python installer exited with code $($process.ExitCode)."
+        }
+        if (-not (Test-Path -LiteralPath (Join-Path $certificateBootstrapPythonDir 'python.exe') -PathType Leaf)) {
+            throw 'Python setup finished without creating the expected interpreter. Ask IT to install Python 3.13 for this Windows account.'
+        }
+    } catch {
+        throw ('Could not install Python automatically. Check internet access to python.org and Windows app-install permissions, then retry Setup Once.bat. Details: ' + $_.Exception.Message)
+    } finally {
+        if (Test-Path -LiteralPath $installerPath -PathType Leaf) {
+            Remove-Item -LiteralPath $installerPath -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 try {
@@ -191,6 +235,10 @@ try {
         exit 0
     }
     $certificatePython = Resolve-CertificatePython -RequirePackages ($Mode -ne 'Setup' -and $Mode -ne 'Snooze')
+    if (-not $certificatePython -and $Mode -eq 'Setup') {
+        Install-CertificatePythonRuntime
+        $certificatePython = Resolve-CertificatePython -RequirePackages $false
+    }
     if (-not $certificatePython -and $Mode -eq 'Daily') {
         # Let the guarded runner record missing-package failures without a popup.
         $certificatePython = Resolve-CertificatePython -RequirePackages $false
@@ -198,9 +246,9 @@ try {
     if (-not $certificatePython) {
         $diagnostics = @($script:CertificatePythonProbeFailures | Select-Object -Unique)
         if ($diagnostics.Count) {
-            throw ('No usable Python 3.11+ installation was found. Checks tried:' + [Environment]::NewLine + ' - ' + ($diagnostics -join ([Environment]::NewLine + ' - ')) + [Environment]::NewLine + 'Run Setup Once.bat from this Windows account, or ask IT to repair Python/packages for this account.')
+            throw ('No usable 64-bit Python 3.11+ installation was found. Checks tried:' + [Environment]::NewLine + ' - ' + ($diagnostics -join ([Environment]::NewLine + ' - ')) + [Environment]::NewLine + 'Run Setup Once.bat from this Windows account to install Python and packages, or ask IT to repair this account.')
         }
-        throw 'No Python installation or Python Install Manager runtime was found. Check Python Manager for an installed 3.11+ runtime, then run Setup Once.bat from this Windows account.'
+        throw 'No 64-bit Python 3.11+ installation or Python Install Manager runtime was found. Run Setup Once.bat from this Windows account to install Python and the required packages automatically.'
     }
     if ($Mode -eq 'Diagnose') {
         Write-Host "Python check passed. Interpreter: $certificatePython"
