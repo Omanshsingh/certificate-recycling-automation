@@ -93,14 +93,14 @@ Daily reminders only check and notify. They never generate PDFs on their own. Ge
 
 ## Setup
 
-- Run **Setup\Setup Once.bat** to install Python packages for the current Windows account.
+- Run **Setup\Setup Once.bat**. It finds supported 64-bit Python even when it is not on PATH; if none is available, it downloads Python 3.13.17 from python.org, verifies the installer SHA-256, and installs it for the current Windows account. It then installs the app's locked packages.
 - Run **Prepare Certificates.bat** to start the local server and open the dashboard. Use **Close dashboard** at the top when finished.
 - Save both workbook paths in Settings. Save and close Excel before checking or generating because Excel may lock an open workbook.
 - To enable reminders, turn on the reminder in Settings and click **Save**, or run **Setup\Create Daily Reminder Task.bat**.
 
-Dependencies: Python 3.11+, `openpyxl`, `reportlab`, `pypdf`, `fonttools`, `pypdfium2`, Pillow, and Tkinter (used for the Windows file picker). PowerPoint is not required to create certificates: the supplied layouts are included as PDF templates. The local dashboard uses Python's standard library; no web framework or internet connection is needed. Outlook and pywin32 are not needed.
+Dependencies: 64-bit Python 3.11+, `openpyxl`, `reportlab`, `pypdf`, `fonttools`, `pypdfium2`, Pillow, and Tkinter (used for the Windows file picker). PowerPoint is not required to create certificates: the supplied layouts are included as PDF templates. The local dashboard uses Python's standard library; no web framework is needed. Internet is required once if Setup must download Python and install packages. Outlook and pywin32 are not needed.
 
-Setup uses `App/requirements.lock.txt` for reproducible package versions. `pypdfium2` and Pillow render the first page in the editor, so preview does not depend on the browser's built-in PDF viewer. Open the full PDF to check every attached annexure page. A normal installation needs internet once to obtain packages, not to use the app afterward.
+Setup uses `App/requirements.lock.txt` for reproducible package versions. `pypdfium2` and Pillow render the first page in the editor, so preview does not depend on the browser's built-in PDF viewer. Open the full PDF to check every attached annexure page. A normal installation needs internet once to download Python if missing and install packages, not to use the app afterward.
 
 ## Safe creation and recovery
 
