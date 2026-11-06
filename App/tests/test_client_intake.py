@@ -14,8 +14,9 @@ from openpyxl import load_workbook
 from openpyxl.styles import Alignment, PatternFill
 from openpyxl.worksheet.datavalidation import DataValidation
 from openpyxl.worksheet.table import Table, TableStyleInfo
+from openpyxl.utils.cell import get_column_letter
 
-from certificate_core import batch_content, read_batches
+from certificate_core import batch_content, read_batches, select_register
 from client_intake import stage_new_client
 from workbook_store import WorkbookSession, _element, _sheet_member
 from workflow_support import save_json
@@ -24,6 +25,10 @@ from tests.test_certificate_workflow import make_workbook
 import web_app
 
 APP = Path(__file__).resolve().parents[1]
+
+
+def column_for(sheet, heading):
+    return next(cell.column for cell in sheet[1] if cell.value == heading)
 
 
 class ClientIntakeTests(unittest.TestCase):
@@ -41,15 +46,13 @@ class ClientIntakeTests(unittest.TestCase):
         return {'plant':'plant1', 'request_id':'a' * 32, 'expected_revision':workspace_revision(self.root),
                 'details':{'supplier':'New client', 'form6':'FORM-NEW', **details}}
 
-    def test_form6_is_required_before_adding_an_inward(self):
-        before = self.paths[0].read_bytes()
-        other = self.paths[1].read_bytes()
-        with self.assertRaisesRegex(ValueError, 'Form 6 number'):
-            web_app.add_client(self.body(form6=''))
-        self.assertEqual(self.paths[0].read_bytes(), before)
-        self.assertEqual(self.paths[1].read_bytes(), other)
-        self.assertFalse(list(web_app.BACKUP_DIR.glob('*.xlsx')))
-        self.assertFalse(list(self.root.rglob('*.pdf')))
+    def test_inward_can_be_saved_before_form6_is_entered(self):
+        result = web_app.add_client(self.body(form6='', inward_date='2026-10-01',
+                                              items=[{'item':'Asset','weight':5}]))
+        added = next(row for row in read_batches(self.paths[0])
+                     if row['case_id'] == result['client']['sn'])
+        self.assertEqual(added['form6'], '')
+        self.assertEqual(added['issued'], 'Ready')
 
     def test_backdated_client_can_use_chronological_sr_and_excel_edits_remain_discoverable(self):
         result = web_app.add_client(self.body(sn='1000', inward_date='2026-06-15',
@@ -68,6 +71,20 @@ class ClientIntakeTests(unittest.TestCase):
         edited = next(row for row in read_batches(self.paths[0]) if row['case_id'] == '997')
         self.assertEqual(edited['inward_date'], date(2026, 6, 12))
         self.assertEqual(edited['supplier'], 'New client')
+
+    def test_add_client_updates_the_checked_dashboard_without_a_full_refresh(self):
+        body = self.body(inward_date='2026-10-01', items=[{'item':'Laptop','weight':5}])
+        expected = body['expected_revision']
+        state = {'scan_complete':True, 'rows':[{'source_kind':'workbook','plant':'plant1','sn':'1001',
+                'supplier':'Existing client','certificate_status':'generated'}]}
+        with patch.object(web_app, 'WORKSPACE_STATE_CACHE', (expected, state)), \
+                patch.object(web_app, 'refresh', side_effect=AssertionError('A full refresh should not run after adding a client')):
+            result = web_app.add_client(body)
+        self.assertTrue(result['client_added'])
+        self.assertEqual(web_app.target_row(result['state'], ('plant1','1001'))['certificate_status'], 'generated')
+        added = web_app.target_row(result['state'], ('plant1',result['client']['sn']))
+        self.assertEqual(added['supplier'], 'New client')
+        self.assertEqual(added['certificate_status'], 'ready')
 
     def test_duplicate_custom_sr_is_rejected_without_modifying_workbook(self):
         before = self.paths[0].read_bytes()
@@ -99,6 +116,26 @@ class ClientIntakeTests(unittest.TestCase):
                 if name not in {member,'xl/styles.xml','xl/workbook.xml'}:
                     self.assertEqual(source.read(name), after.read(name), name)
 
+    def test_new_material_blocks_show_cod_lines_even_when_source_layout_was_merged(self):
+        book = load_workbook(self.paths[0]); sheet, _, cols = select_register(book)
+        sheet.cell(3, cols['item'] + 1, 'Older second asset')
+        sheet.cell(3, cols['weight'] + 1, 2)
+        for key in ('cod_no', 'cod_date'):
+            col = cols[key] + 1
+            sheet.merge_cells(start_row=2, end_row=3, start_column=col, end_column=col)
+        book.save(self.paths[0]); book.close()
+        web_app.add_client(self.body(items=[{'item':f'New asset {i}', 'weight':i} for i in (1, 2, 3)]))
+        batches = read_batches(self.paths[0])
+        book = load_workbook(self.paths[0]); sheet, _, cols = select_register(book)
+        added = next(b for b in batches if b['supplier'] == 'New client')
+        for key in ('cod_no', 'cod_date'):
+            col = cols[key] + 1
+            self.assertFalse(any(a.min_col <= col <= a.max_col for a in sheet.merged_cells.ranges))
+            for row in range(added['source_row'], added['source_row'] + 2):
+                self.assertEqual(sheet.cell(row, col).border.bottom.style, 'thin')
+                self.assertEqual(sheet.cell(row + 1, col).border.top.style, 'thin')
+        book.close()
+
     def test_layout_merges_totals_and_dropdowns_are_cloned_without_previous_values(self):
         book = load_workbook(self.paths[0]); sheet = book.active
         sheet.append([None,None,None,None,'Battery',1,2,'=F3*G3'])
@@ -114,17 +151,22 @@ class ClientIntakeTests(unittest.TestCase):
         web_app.add_client(self.body(items=[{'item':'Laptop','weight':5},{'item':'Printer','quantity':2,'per_piece_weight':3},{'item':'UPS','weight':2}]))
         book = load_workbook(self.paths[0]); sheet = book.active
         self.assertIn('A4:A6', {str(area) for area in sheet.merged_cells.ranges})
-        self.assertIn('N4:N6', {str(area) for area in sheet.merged_cells.ranges})
-        self.assertEqual(sheet['N4'].value, '=SUM(H4:H6)')
+        headers = {cell.value:cell.column for cell in sheet[1] if cell.value}
+        total_col = headers['Total Weight in KG']
+        total_letter = get_column_letter(total_col)
+        self.assertIn(f'{total_letter}4:{total_letter}6', {str(area) for area in sheet.merged_cells.ranges})
+        self.assertEqual(sheet.cell(4, total_col).value, '=SUM(H4:H6)')
         self.assertEqual(sheet['H5'].value, '=F5*G5')
-        self.assertEqual(sheet['C4'].alignment.horizontal, 'center')
-        self.assertEqual(sheet['E4'].alignment.horizontal, 'center')
-        self.assertEqual(sheet['H5'].alignment.horizontal, 'center')
-        self.assertIsNone(sheet['O4'].value); self.assertIsNone(sheet['K4'].value)
+        self.assertEqual(sheet['C4'].alignment.horizontal, 'left')
+        self.assertEqual(sheet['E4'].alignment.horizontal, 'left')
+        self.assertEqual(sheet['H5'].alignment.horizontal, 'left')
+        self.assertIsNone(sheet.cell(4, headers['Weight Slip/Weight Scale']).value)
+        self.assertIsNone(sheet.cell(4, headers['Comments']).value)
         self.assertEqual(copy(sheet['C4'].fill), copy(sheet['C2'].fill))
         self.assertEqual(sheet.row_dimensions[4].height, 32)
         self.assertTrue(any('D4' in rule for rule in sheet.data_validations.dataValidation))
-        self.assertTrue(any('M6' in rule for rule in sheet.data_validations.dataValidation))
+        status_letter = get_column_letter(headers['Certificate Issued'])
+        self.assertTrue(any(f'{status_letter}6' in rule for rule in sheet.data_validations.dataValidation))
         book.close()
 
     def test_retry_after_lost_response_does_not_add_twice_even_with_stale_revision(self):
@@ -179,7 +221,10 @@ class ClientIntakeTests(unittest.TestCase):
         sheet.add_table(table); book.save(self.paths[0]); book.close()
         web_app.add_client(self.body(items=[{'item':'Printer','weight':5},{'item':'Laptop','weight':3}]))
         book = load_workbook(self.paths[0]); table = book.active.tables['Clients']
-        self.assertEqual(table.ref, 'A1:M4'); self.assertEqual(table.autoFilter.ref, 'A1:M4'); book.close()
+        last_column = get_column_letter(book.active.max_column)
+        self.assertEqual(table.ref, f'A1:{last_column}4')
+        self.assertEqual(table.autoFilter.ref, f'A1:{last_column}4')
+        book.close()
 
     def test_missing_optional_details_are_saved_without_extra_columns(self):
         book = load_workbook(self.paths[0]); sheet = book.active
@@ -189,10 +234,11 @@ class ClientIntakeTests(unittest.TestCase):
         after = read_batches(self.paths[0])
         self.assertEqual([batch_content(batch) for batch in after[:-1]], before)
         self.assertEqual(after[-1]['form6'],'FORM-NEW'); self.assertEqual(after[-1]['reference'],'REF-NEW')
-        self.assertEqual(after[-1]['missing_headers'], ['cod_no','cod_date'])
+        self.assertEqual(after[-1]['missing_headers'], [])
         book = load_workbook(self.paths[0])
-        self.assertEqual(book.active.max_column, 9)
-        self.assertEqual(book.active.cell(1,9).value, 'Certificate Issued')
+        headers = [cell.value for cell in book.active[1]]
+        self.assertEqual(headers[-3:], ['COD No', 'COD Date', 'Certificate Issued'])
+        self.assertEqual(len(headers), len(set(headers)))
         book.close()
 
     def test_four_operational_details_are_saved_and_missing_columns_are_added(self):
@@ -256,12 +302,12 @@ class ClientIntakeTests(unittest.TestCase):
         result = web_app.add_client(body)
         self.assertEqual(read_batches(self.paths[0])[-1]['certificate_type'],'standard')
         self.assertEqual(read_batches(self.paths[0])[-1]['form6'],'FORM-NEW')
-        body = self.body(certificate_type='siemens', inward_date='2026-10-01', form6='FORM-NEW',
+        body = self.body(certificate_type='siemens', inward_date='2026-10-01', form6='FORM-NEW-2',
                          items=[{'item':'Asset','weight':10}])
         body['request_id'] = 'e' * 32
         web_app.add_client(body)
         self.assertEqual(read_batches(self.paths[0])[-1]['certificate_type'],'standard')
-        self.assertEqual(read_batches(self.paths[0])[-1]['form6'],'FORM-NEW')
+        self.assertEqual(read_batches(self.paths[0])[-1]['form6'],'FORM-NEW-2')
 
     def test_book_my_junk_client_is_added_as_na_and_cannot_be_issued(self):
         result = web_app.add_client(self.body(
@@ -272,7 +318,8 @@ class ClientIntakeTests(unittest.TestCase):
         self.assertEqual(added['issued'], 'N/A')
         book = load_workbook(self.paths[0])
         try:
-            self.assertEqual(book.active['M3'].value, 'N/A')
+            status_column = column_for(book.active, 'Certificate Issued')
+            self.assertEqual(book.active.cell(3, status_column).value, 'N/A')
         finally:
             book.close()
         details = web_app.editor_details(added)
@@ -291,22 +338,27 @@ class ClientIntakeTests(unittest.TestCase):
         book = load_workbook(self.paths[0]); table = book.active.tables['Clients']
         self.assertEqual(table.ref,'A1:Q3')
         self.assertEqual([column.name for column in table.tableColumns[-4:]],
+                         ['Weight Slip/Weight Scale','COD No','COD Date','Certificate Issued'])
+        self.assertEqual([column.name for column in table.tableColumns[10:14]],
                          ['Comments','Transporter/Vehicle Details','Docket No./Vehicle No','Weight Slip/Weight Scale'])
         self.assertEqual(read_batches(self.paths[0])[-1]['certificate_type'], 'standard')
         book.close()
 
-    def test_form6_is_required_even_when_the_certificate_uses_sita_template(self):
+    def test_form6_can_be_entered_when_creating_a_certificate(self):
         book = load_workbook(self.paths[0]); book.active['I2'] = ''; book.save(self.paths[0]); book.close()
         source = read_batches(self.paths[0])[0]
         from certificate_core import source_value_issues
-        self.assertIn('missing Form 6 number / manifest number', source_value_issues(source, certificate_type='sita'))
-        self.assertIn('missing Form 6 number / manifest number', source['blocking_issues'])
+        self.assertEqual(source['form6'], '')
+        self.assertNotIn('missing Form 6 number / manifest number',
+                         source_value_issues(source, certificate_type='sita'))
+        self.assertNotIn('missing Form 6 number / manifest number', source['blocking_issues'])
 
     def test_future_date_keeps_blank_status_and_text_is_not_an_excel_formula(self):
         web_app.add_client(self.body(supplier='=HYPERLINK("https://example.invalid")', inward_date='2099-01-01',
                                     form6='FORM-NEW', items=[{'item':'Asset','weight':10}]))
         book = load_workbook(self.paths[0]); self.assertEqual(book.active['C3'].data_type,'s')
-        self.assertIsNone(book.active['M3'].value); book.close()
+        status_column = column_for(book.active, 'Certificate Issued')
+        self.assertIsNone(book.active.cell(3, status_column).value); book.close()
 
     def test_locked_excel_and_backup_failure_keep_original_file(self):
         from workbook_store import exclusive_file
@@ -336,7 +388,7 @@ class ClientIntakeTests(unittest.TestCase):
 
     def test_newly_added_formula_block_can_generate_a_certificate(self):
         shutil.copytree(APP/'templates', self.root/'App'/'templates')
-        result = web_app.add_client(self.body(inward_date='2026-10-01', form6='NEW-F6',
+        result = web_app.add_client(self.body(inward_date='2026-10-01', form6='NEW-F6', reference='NEW-REF',
                         items=[{'item':'Laptop','quantity':2,'per_piece_weight':3.5},{'item':'Printer','weight':8}]))
         from run_certificates import run
         created,_,_ = run(self.paths,self.root,selected=('plant1',result['client']['sn']),progress=None)

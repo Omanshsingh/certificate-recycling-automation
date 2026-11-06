@@ -19,6 +19,7 @@ import run_certificates as runner
 import web_app
 from workbook_store import WorkbookSession, stage_certificate_details
 from workflow_support import save_json
+from workspace_review import workspace_revision
 from tests.test_certificate_templates import write_register
 
 
@@ -120,13 +121,21 @@ class CertificateEditScopeTests(unittest.TestCase):
         self.assertTrue(list(self.backups.glob("*.xlsx")))
         return batch
 
+    @staticmethod
+    def merge_fields(sheet):
+        # Shared client details retain their merges. COD/date now deliberately
+        # use separate cells so the requested light asset-row lines are visible.
+        return {(sheet.cell(1,area.min_col).value,sheet.cell(1,area.max_col).value,
+                 area.min_row,area.max_row) for area in sheet.merged_cells.ranges
+                if sheet.cell(1,area.min_col).value not in {'COD No','COD Date'}}
+
     def merge_shared_details(self, *extra):
         book = load_workbook(self.paths[0])
         try:
             for column in ('A', 'B', 'C', 'D', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', *extra):
                 book.active.merge_cells(f'{column}2:{column}3')
             book.save(self.paths[0])
-            return {str(area) for area in book.active.merged_cells.ranges}
+            return self.merge_fields(book.active)
         finally:
             book.close()
 
@@ -148,7 +157,7 @@ class CertificateEditScopeTests(unittest.TestCase):
         self.assertEqual(batch['items'][1:], continuation)
         book = load_workbook(self.paths[0])
         try:
-            self.assertEqual({str(area) for area in book.active.merged_cells.ranges}, merges)
+            self.assertEqual(self.merge_fields(book.active), merges)
             self.assertIsNone(book.active['A3'].value)
             self.assertIsNone(book.active['C3'].value)
         finally:
@@ -164,7 +173,7 @@ class CertificateEditScopeTests(unittest.TestCase):
         self.assertEqual(batch['items'], source['items'])
         book = load_workbook(self.paths[0])
         try:
-            self.assertEqual({str(area) for area in book.active.merged_cells.ranges}, merges)
+            self.assertEqual(self.merge_fields(book.active), merges)
         finally:
             book.close()
         pdf = next(self.folder.rglob('*.pdf'))
@@ -193,7 +202,7 @@ class CertificateEditScopeTests(unittest.TestCase):
         self.assertEqual(self.batch()['issued'], 'Completed')
         book = load_workbook(self.paths[0])
         try:
-            self.assertEqual({str(area) for area in book.active.merged_cells.ranges}, merges)
+            self.assertEqual(self.merge_fields(book.active), merges)
             self.assertIsNone(book.active['M3'].value)
         finally:
             book.close()
@@ -269,7 +278,7 @@ class CertificateEditScopeTests(unittest.TestCase):
                     self.assertEqual(self.paths[1].read_bytes(), other)
                     book = load_workbook(self.paths[0])
                     try:
-                        self.assertEqual({str(area) for area in book.active.merged_cells.ranges}, merges)
+                        self.assertEqual(self.merge_fields(book.active), merges)
                         self.assertIsNone(book.active['A3'].value)
                     finally:
                         book.close()
@@ -300,7 +309,7 @@ class CertificateEditScopeTests(unittest.TestCase):
                 self.assertEqual(self.batch()['reference'], f'AFTER-FIRST-{attempt}')
             book = load_workbook(self.paths[0])
             try:
-                self.assertEqual({str(area) for area in book.active.merged_cells.ranges}, merges)
+                self.assertEqual(self.merge_fields(book.active), merges)
             finally:
                 book.close()
 
@@ -364,7 +373,8 @@ class CertificateEditScopeTests(unittest.TestCase):
         batch = self.assert_issued()
         self.assertEqual(batch["certificate_weight"], 20)
         self.assertEqual(batch["display_weight"], 20)
-        self.assertEqual(self.cells()[1][13], 20)
+        cells=self.cells()
+        self.assertEqual(cells[1][cells[0].index('Certificate Weight (KG)')], 20)
 
     def test_checked_certificate_weight_requires_a_positive_value(self):
         with self.assertRaisesRegex(ValueError, "positive Certificate Weight"):
@@ -484,8 +494,13 @@ class CertificateEditScopeTests(unittest.TestCase):
             {"item": "Keyboards", "weight": "4"},
         ])
         with WorkbookSession(self.paths[0], self.backups) as session:
-            with self.assertRaisesRegex(ValueError, "room for 2 material row"):
-                stage_certificate_details(session, details, validate_cells=True)
+            updated, staged = stage_certificate_details(session, details, validate_cells=True)
+            from io import BytesIO
+            rows = read_batches(BytesIO(updated))
+            self.assertEqual([item['item'] for item in staged['items']], ['Laptops','Monitors','Keyboards'])
+            next_client = next(row for row in rows if row['case_id'] == 'NEXT')
+            self.assertEqual(next_client['supplier'], 'Next Client')
+            self.assertEqual(next_client['source_row'], 5)
         self.assertEqual(self.paths[0].read_bytes(), before)
 
     def test_certificate_only_commits_outputs_but_keeps_all_source_cells_and_metadata(self):
@@ -504,9 +519,10 @@ class CertificateEditScopeTests(unittest.TestCase):
         after = self.cells()
         for row_index, row in enumerate(before):
             for column, value in enumerate(row):
-                if row_index == 1 and column in {10, 11, 12}:
+                if row_index > 0 and before[0][column] in {'COD No', 'COD Date', 'Certificate Issued'}:
                     continue
-                self.assertEqual(after[row_index][column], value, (row_index, column))
+                current_column=after[0].index(before[0][column])
+                self.assertEqual(after[row_index][current_column], value, (row_index, column))
         for key in ("supplier", "location", "inward_date", "form6", "reference", "items",
                     "total_weight", "certificate_weight", "certificate_type", "certificate_fields"):
             self.assertEqual(batch[key], original[key], key)
@@ -548,6 +564,19 @@ class CertificateEditScopeTests(unittest.TestCase):
         refresh.assert_called_once()
         self.assertIn("original inward details were kept", web_app.target_row(result["state"], ("plant1", "CLIENT"))["detail"])
 
+    def test_web_creation_reuses_checked_rows_instead_of_scanning_workbooks_again(self):
+        state = web_app.workspace_state(recheck_obsolete=False)
+        expected = workspace_revision(self.root)
+        with patch.object(web_app, "WORKSPACE_STATE_CACHE", (expected, state)), \
+                patch.object(web_app, "refresh", side_effect=AssertionError("A full refresh should not run after creation")):
+            result = web_app.create_certificate(self.body("certificate_only"))
+        self.assertFalse(result["requires_confirmation"])
+        self.assertEqual(result["created"], 1)
+        row = web_app.target_row(result["state"], ("plant1", "CLIENT"))
+        self.assertEqual(row["certificate_status"], "generated")
+        self.assertTrue(row["pdf_filename"])
+        self.assertIn("original inward details were kept", row["detail"])
+
     def test_changed_template_type_is_rendered_but_not_persisted_in_certificate_only_scope(self):
         original_metadata = (self.batch()["certificate_type"], self.batch()["certificate_fields"])
         details = self.details(certificate_type="sita", certificate_fields={"company_display": "Sita Client"})
@@ -561,7 +590,7 @@ class CertificateEditScopeTests(unittest.TestCase):
         self.assertIn("Sita Client", text)
 
     def test_default_web_scope_preserves_excel_details_for_corrections(self):
-        body = self.body(details=self.details(certificate_type="sita", certificate_fields={"company_display": "Sita Client"}))
+        body = self.body(details=self.details(certificate_fields={"company_display": "Corrected Client"}))
         del body["edit_scope"]
         with patch.object(web_app, "refresh", side_effect=lambda *_: self.report()):
             result = web_app.create_certificate(body)

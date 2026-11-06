@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+import zlib
 from unittest.mock import patch
 
 from openpyxl import Workbook
@@ -66,7 +67,7 @@ def register(path, *, case_id, cod="", status="Ready", reference="WORKBOOK-REF")
         sheet.title = "Inward Register"
         sheet.append(HEADERS)
         sheet.append([case_id, date(2026, 9, 1), "Independent Client Ltd", "Pune", "Servers",
-                      2, 5, 10, "FORM-1", reference, cod, AS_OF if cod else None,
+                      2, 5, 10, f"FORM-{zlib.crc32((str(path) + case_id).encode()):08X}", reference, cod, AS_OF if cod else None,
                       status, "sita", "{}"])
         book.save(path)
     finally:
@@ -101,10 +102,12 @@ class TemporaryInventoryTest(unittest.TestCase):
 
 
 class CertificateFolderStructureTests(TemporaryInventoryTest):
-    def test_startup_creates_three_named_destinations_and_scanner_tracks_all(self):
+    def test_startup_creates_two_folders_for_three_source_kinds_and_scanner_tracks_all(self):
         folders = ensure_certificate_folders(self.root)
         self.assertEqual({kind: path.name for kind, path in folders.items()}, CERTIFICATE_FOLDERS)
         self.assertTrue(all(path.is_dir() for path in folders.values()))
+        self.assertEqual({path.name for path in self.folder.iterdir()}, {'Auto Generated', 'Manually Added'})
+        self.assertEqual(folders['workbook'], folders['manual'])
         for index, kind in enumerate(('workbook', 'manual', 'external'), 1):
             external_pdf(folders[kind] / f'{index:04d}_Client_City_1.pdf', cod=f'{index:04d}')
 
@@ -118,11 +121,13 @@ class CertificateFolderStructureTests(TemporaryInventoryTest):
         self.assertEqual(inventory['entries'], [])
         self.assertEqual(list(self.folder.iterdir()), [])
 
-    def test_pdf_path_validation_allows_legacy_and_named_folders_only(self):
+    def test_pdf_path_validation_allows_nested_certificate_folders_but_not_traversal(self):
         self.assertEqual(safe_certificate_path(self.root, 'legacy.pdf'), self.folder / 'legacy.pdf')
         self.assertEqual(safe_certificate_path(self.root, 'Auto Generated/new.pdf'),
                          self.folder / 'Auto Generated' / 'new.pdf')
-        for unsafe in ('../outside.pdf', 'Unknown/nested.pdf', 'Auto Generated/deeper/file.pdf',
+        for relative in ('Unknown/nested.pdf', 'Auto Generated/deeper/file.pdf'):
+            self.assertEqual(safe_certificate_path(self.root, relative), self.folder / relative)
+        for unsafe in ('../outside.pdf', '/outside.pdf', 'not-a-pdf.txt',
                        'Manually Added\\..\\outside.pdf'):
             with self.subTest(path=unsafe), self.assertRaises(ValueError):
                 safe_certificate_path(self.root, unsafe)
@@ -210,10 +215,10 @@ class InventoryApiTests(TemporaryInventoryTest):
         self.assertFalse(deleted["present"])
         self.assertEqual((deleted["cods"], deleted["references"]), (["0319"], ["REF-OLD"]))
         self.assertEqual(cod_conflicts(second, "319"), [deleted])
-        self.assertTrue(reference_warnings(second, "REF-OLD"))
+        self.assertFalse(reference_warnings(second, "REF-OLD"))
         # An ownership flag alone cannot exempt an unrelated historical PDF.
         self.assertEqual(cod_conflicts(second, "319", owned=True), [deleted])
-        self.assertTrue(reference_warnings(second, "REF-OLD", owned=True))
+        self.assertFalse(reference_warnings(second, "REF-OLD", owned=True))
         self.assertFalse(cod_conflicts(second, "319", allowed_paths=[deleted["path"]], owned=True))
         self.assertFalse(reference_warnings(second, "REF-OLD", allowed_paths=[deleted["path"]], owned=True))
         self.assertTrue(list((self.root / "Data" / "Certificate Inventory Backups").glob("*.json")))
@@ -277,8 +282,7 @@ class InventoryApiTests(TemporaryInventoryTest):
         self.assertFalse(cod_conflicts(inventory, "16", allowed_paths=allowed, owned=True))
         self.assertTrue(cod_conflicts(inventory, "319", allowed_paths=allowed, owned=True))
         warnings = reference_warnings(inventory, "SHARED-REF", allowed_paths=allowed, owned=True)
-        self.assertIn(foreign.name, " ".join(warnings))
-        self.assertNotIn(own.name, " ".join(warnings))
+        self.assertEqual(warnings, [])
 
     def test_allowed_owned_pdf_is_exempt_but_mismatched_printed_number_is_not(self):
         path = external_pdf(self.folder / "0319_External_1.pdf", cod="0319", reference="REF-OLD")
@@ -290,12 +294,11 @@ class InventoryApiTests(TemporaryInventoryTest):
         inventory = scan_inventory(self.root)
         self.assertTrue(cod_conflicts(inventory, "319", allowed_paths=allowed, owned=True))
 
-    def test_duplicate_reference_warns_without_reserving_an_unrelated_cod(self):
+    def test_duplicate_reference_is_silent_without_reserving_an_unrelated_cod(self):
         path = external_pdf(self.folder / "0319_External_1.pdf", cod="0319", reference="REF-EXTERNAL")
         inventory = scan_inventory(self.root)
         warnings = reference_warnings(inventory, "ref-external")
-        self.assertTrue(warnings)
-        self.assertIn(path.name, " ".join(warnings))
+        self.assertEqual(warnings, [])
         self.assertFalse(cod_conflicts(inventory, "0199"))
         self.assertFalse(reference_warnings(inventory, ""))
         self.assertFalse(reference_warnings(inventory, "DIFFERENT-REF"))
@@ -446,28 +449,25 @@ class InventoryWorkflowTests(TemporaryInventoryTest):
         self.assertTrue(external.is_file(), "A never-issued draft must not archive a foreign PDF found by typed COD")
         self.assertEqual(external.read_bytes(), original)
 
-    def test_reference_collision_warns_and_cod_stays_automatic(self):
+    def test_reference_collision_is_silent_and_cod_stays_automatic(self):
         external = external_pdf(self.folder / "0319_External_2.pdf", cod="0319", reference="SHARED-REF")
         original = external.read_bytes()
         details = self.details(cod_no="0199", reference="SHARED-REF")
         response = drafts.generate_draft(self.root, plant="plant1", details=details, as_of=AS_OF)
-        self.assertTrue(response["requires_confirmation"])
-        self.assertTrue(any("Reference" in warning for row in response["warnings"] for warning in row["warnings"]))
-        response = drafts.generate_draft(self.root, plant="plant1", details=details, confirmed=True, as_of=AS_OF)
+        self.assertFalse(response["requires_confirmation"])
+        self.assertFalse(any(warning.startswith('Reference ') for warning in response['warnings']))
         self.assertEqual(response["certificate_no"], "0320")
         self.assertEqual(drafts.read_register(self.root)["records"][0]["details"]["reference"], "SHARED-REF")
         self.assertEqual(external.read_bytes(), original)
 
-    def test_reference_collision_warns_but_confirmed_workbook_cod_stays_unchanged(self):
+    def test_reference_collision_is_silent_and_workbook_cod_stays_unchanged(self):
         external = external_pdf(self.folder / "0319_External_2.pdf", cod="0319", reference="SHARED-REF")
         original = external.read_bytes()
         register(self.paths[0], case_id="NEW-EXCEL", reference="SHARED-REF")
         options = {"as_of": AS_OF, "progress": lambda _: None, "selected": ("plant1", "NEW-EXCEL"), "custom_cod": "0199"}
         created, _, _ = run(self.paths, self.root, **options)
-        self.assertEqual(created, 0)
-        self.assertTrue(any("Reference" in warning for row in self.results()["rows"] for warning in row.get("warnings", [])))
-        created, _, _ = run(self.paths, self.root, allow_warnings=True, **options)
         self.assertEqual(created, 1)
+        self.assertFalse(any(warning.startswith('Reference ') for row in self.results()['rows'] for warning in row.get('warnings', [])))
         batch = read_batches(self.paths[0])[0]
         self.assertEqual((batch["cod_no"], batch["reference"]), ("0199", "SHARED-REF"))
         self.assertEqual(external.read_bytes(), original)
@@ -485,37 +485,29 @@ class InventoryWorkflowTests(TemporaryInventoryTest):
         self.assertFalse(recreated["requires_confirmation"])
         self.assertEqual(recreated["certificate_no"], first["certificate_no"])
 
-    def test_owned_regeneration_still_warns_for_deleted_foreign_reference_without_changing_it(self):
+    def test_owned_regeneration_is_silent_for_deleted_foreign_reference(self):
         first = self.generate_manual()
         foreign = external_pdf(self.folder / "0319_Foreign_Client_2.pdf", cod="0319", reference="MANUAL-REF")
         scan_inventory(self.root, persist=True)
         foreign.unlink()
         response = drafts.generate_draft(self.root, record_id=first["record_id"], as_of=AS_OF)
-        self.assertTrue(response["requires_confirmation"])
-        self.assertEqual(response["created"], 0)
-        self.assertTrue(any(foreign.name in warning
-                            for row in response["warnings"] for warning in row.get("warnings", [])))
-        response = drafts.generate_draft(self.root, record_id=first["record_id"], confirmed=True, as_of=AS_OF)
+        self.assertFalse(response["requires_confirmation"])
         self.assertEqual((response["created"], response["certificate_no"]), (1, first["certificate_no"]))
         record = drafts.read_register(self.root)["records"][0]
         self.assertEqual(record["details"]["reference"], "MANUAL-REF")
         self.assertFalse(foreign.exists())
 
-    def test_owned_manual_recreation_with_external_same_cod_in_other_plant_warns_and_renumbers(self):
+    def test_owned_manual_recreation_with_foreign_same_cod_cannot_change_issued_cod(self):
         first = self.generate_manual()
         self.issued_pdf(first).unlink()
         drafts.reconcile_manual(self.root)
         external = external_pdf(self.folder / f"{first['certificate_no']}_External_Client_2.pdf",
                                 cod=first["certificate_no"], reference="EXT-REF")
         original = external.read_bytes()
-        response = drafts.generate_draft(self.root, record_id=first["record_id"], as_of=AS_OF)
-        self.assertTrue(response["requires_confirmation"])
-        self.assertEqual(response["created"], 0)
+        for confirmed in (False, True):
+            with self.assertRaisesRegex(ValueError, 'already used by another PDF'):
+                drafts.generate_draft(self.root, record_id=first['record_id'], confirmed=confirmed, as_of=AS_OF)
         self.assertEqual(drafts.read_register(self.root)["records"][0]["details"]["cod_no"], first["certificate_no"])
-        response = drafts.generate_draft(self.root, record_id=first["record_id"], confirmed=True, as_of=AS_OF)
-        self.assertEqual(response["created"], 1)
-        self.assertEqual(response["certificate_no"], "0017")
-        self.assertEqual(response["record_id"], first["record_id"])
         self.assertEqual(external.read_bytes(), original)
 
     def test_owned_workbook_regeneration_keeps_cod_without_duplicate_warning(self):
@@ -540,14 +532,11 @@ class InventoryWorkflowTests(TemporaryInventoryTest):
         self.assertEqual(issuance_paths(inventory, first["certificate_no"], "manual", "plant1", first["record_id"]), [])
         register_path = self.root / "Data" / "Custom Certificates.json"
         original_register = register_path.read_bytes()
-        response = drafts.generate_draft(self.root, record_id=first["record_id"], as_of=AS_OF)
-        self.assertTrue(response["requires_confirmation"])
-        self.assertEqual(response["created"], 0)
+        for confirmed in (False, True):
+            with self.assertRaisesRegex(ValueError, 'already used by another PDF'):
+                drafts.generate_draft(self.root, record_id=first['record_id'], confirmed=confirmed, as_of=AS_OF)
         self.assertEqual(register_path.read_bytes(), original_register)
         self.assertEqual(replaced.read_bytes(), replacement)
-        response = drafts.generate_draft(self.root, record_id=first["record_id"], confirmed=True, as_of=AS_OF)
-        self.assertEqual((response["created"], response["certificate_no"]), (1, "0017"))
-        self.assertEqual(response["record_id"], first["record_id"])
         self.assertTrue(replaced.is_file(), "An externally replaced issued PDF must not be archived as an owned revision")
         self.assertEqual(replaced.read_bytes(), replacement)
         self.assertFalse(list((self.root / "Data" / "Archive" / "Superseded Certificates").glob("*.pdf")))
@@ -671,7 +660,7 @@ class InventoryWorkflowTests(TemporaryInventoryTest):
         self.assertEqual(existing.read_bytes(), captured[0])
         self.assertEqual(list(self.folder.rglob("*.pdf")), [existing])
 
-    def test_new_duplicate_reference_during_render_aborts_without_confirmation(self):
+    def test_new_duplicate_reference_during_render_needs_no_confirmation(self):
         external = self.folder / "0319_External_Client_2.pdf"
         renderer = drafts.make_template_certificate
         captured = []
@@ -683,11 +672,11 @@ class InventoryWorkflowTests(TemporaryInventoryTest):
             return result
 
         with patch("certificate_drafts.make_template_certificate", side_effect=render_then_add_reference):
-            with self.assertRaisesRegex(ValueError, "reference appeared while rendering"):
-                self.generate_manual()
+            response = self.generate_manual()
+        self.assertEqual(response['created'], 1)
         self.assertEqual(external.read_bytes(), captured[0])
-        self.assertEqual(list(self.folder.iterdir()), [external])
-        self.assertFalse((self.root / "Data" / "Custom Certificates.json").exists())
+        self.assertTrue(self.issued_pdf(response).is_file())
+        self.assertEqual(drafts.read_register(self.root)['records'][0]['details']['reference'], 'MANUAL-REF')
 
     def test_confirmed_reference_race_keeps_requested_cod_and_reference(self):
         external = self.folder / "0319_External_Client_2.pdf"

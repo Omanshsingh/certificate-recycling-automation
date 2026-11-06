@@ -10,6 +10,7 @@ from zipfile import ZipFile
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Border, Side, Font, PatternFill
+from openpyxl.utils.cell import get_column_letter
 
 from certificate_core import read_batches
 from client_intake import stage_new_client
@@ -64,20 +65,28 @@ class RegisterLayoutTests(unittest.TestCase):
                         {'item':'Monitor','quantity':2,'per_piece_weight':3},
                         {'item':'Printer','quantity':1,'per_piece_weight':8}]})
                 w=load_workbook(BytesIO(updated));s=w.active
-                expected = headers + ['Certificate Issued']
-                if plant == 1:
-                    expected += ['Per Pcs Weight in (KG)']
-                self.assertEqual([c.value for c in s[1]], expected)
+                final_headers = [c.value for c in s[1]]
+                for heading in headers:
+                    self.assertIn(heading, final_headers)
+                self.assertEqual(final_headers[-3:], ['COD No', 'COD Date', 'Certificate Issued'])
+                for heading in ('Comments', 'Transporter/Vehicle Details',
+                                'Docket No./Vehicle No', 'Weight Slip/Weight Scale'):
+                    self.assertIn(heading, final_headers)
                 self.assertEqual(batch['total_weight'],14);self.assertEqual(batch['issued'],'Ready')
                 self.assertEqual(batch['reference'],'REF-NEW')
-                self.assertEqual(s['B4'].number_format,'dd.mm.yyyy')
+                self.assertEqual(s['B4'].number_format,'dd/mm/yy')
                 self.assertEqual(s['C4'].font.name,'Calibri');self.assertFalse(s['C4'].font.bold)
                 self.assertIn('A4:A5',{str(a) for a in s.merged_cells.ranges})
                 self.assertEqual(s['E5'].border.bottom.style,'medium')
                 if plant==2:self.assertEqual(s['H4'].value,'=F4*G4')
                 else:
-                    self.assertEqual(s['G4'].value, '=F4*O4')
-                    self.assertEqual(s['O4'].value, 3)
+                    per_column = next(cell.column for cell in s[1]
+                                      if cell.value == 'Per Pcs Weight in (KG)')
+                    weight_column = next(cell.column for cell in s[1]
+                                         if cell.value == 'Weight (KG)')
+                    self.assertEqual(s.cell(4, weight_column).value,
+                                     f'=F4*{get_column_letter(per_column)}4')
+                    self.assertEqual(s.cell(4, per_column).value, 3)
                 w.close()
                 with ZipFile(BytesIO(updated)) as z:
                     styles=ET.fromstring(z.read('xl/styles.xml')); ns={'x':styles.tag.split('}')[0][1:]}
@@ -94,7 +103,9 @@ class RegisterLayoutTests(unittest.TestCase):
             session._persist(updated)
         self.assertEqual(batch['certificate_type'],'siemens')
         self.assertEqual(batch['reference'],'REF-01');self.assertEqual(batch['display_weight'],20)
-        w=load_workbook(path);self.assertEqual([c.value for c in w.active[1]],headers+['Certificate Issued']);w.close()
+        w=load_workbook(path);final_headers=[c.value for c in w.active[1]]
+        self.assertTrue(all(header in final_headers for header in headers))
+        self.assertEqual(final_headers[-3:],['COD No','COD Date','Certificate Issued']);w.close()
         self.assertEqual(read_batches(path)[0]['certificate_fields'],{'model_serial':'SERIAL-01'})
 
     def test_tracking_setup_is_idempotent_and_reuses_the_trailing_empty_column(self):
@@ -102,7 +113,11 @@ class RegisterLayoutTests(unittest.TestCase):
         w=load_workbook(path);w.active.cell(1,len(headers)+1).font=Font(name='Calibri');w.save(path);w.close()
         updated=add_tracking_column(path.read_bytes())
         self.assertEqual(add_tracking_column(updated),updated)
-        w=load_workbook(BytesIO(updated));self.assertEqual(w.active.max_column,len(headers)+1);w.close()
+        w=load_workbook(BytesIO(updated));final_headers=[c.value for c in w.active[1]]
+        self.assertEqual(final_headers[-3:],['COD No','COD Date','Certificate Issued'])
+        self.assertTrue(all(label in final_headers for label in
+                            ('Comments','Transporter/Vehicle Details','Docket No./Vehicle No','Weight Slip/Weight Scale')))
+        self.assertEqual(w.active.max_column, max(cell.column for cell in w.active[1] if cell.value));w.close()
 
     def test_real_quantity_labels_are_supported_without_extracting_arbitrary_text(self):
         from certificate_core import number

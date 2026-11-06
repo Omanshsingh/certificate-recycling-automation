@@ -684,6 +684,14 @@ def _validate_staged(root, manifest, stage):
     allowed_sources = {_identity(p) for p in configured if p is not None}
     allowed_sources.add(_identity(root / "Data" / "Custom Certificates.json"))
     for relative in entries:
+        if relative.startswith('Data/Entry Deletions/') and relative.endswith('.json'):
+            deletion = read_json(relative)
+            identifier = deletion.get('id')
+            if (not isinstance(identifier,str) or not re.fullmatch(r'[a-f0-9]{32}',identifier)
+                    or relative != f'Data/Entry Deletions/{identifier}.json'
+                    or deletion.get('state') not in {'complete','rolled_back'}):
+                raise BackupError('Recover the interrupted entry deletion before backing up or restoring it.')
+    for relative in entries:
         if not relative.startswith("Data/Issuance History/") or not relative.endswith(".json"):
             continue
         journal = read_json(relative)
@@ -752,7 +760,8 @@ def _active_restore_file(relative):
             ((lower[0] == "certificates" or lower[:2] == ["output", "certificates"])
              and Path(relative).suffix.casefold() == ".pdf"
              or lower[:2] == ["data", "issuance history"] and Path(relative).suffix.casefold() == ".json"
-             or lower[:2] in (["data", "issuance recovery"], ["data", "working drafts"])
+             or lower[:2] in (["data", "issuance recovery"], ["data", "working drafts"],
+                              ["data", "entry deletions"], ["data", "entry deletion recovery"])
              or lower == ["data", "custom certificates.json"]))
 
 
@@ -806,6 +815,10 @@ def _merge_reservations(root, manifest, stage, targets, recovery):
             for field in ("cods", "references"):
                 old[field] = sorted(set(old[field]) | set(current[field]))
     codes = {v for e in observed["entries"] for v in e["cods"]}
+    for path in (root/'Data'/'Entry Deletions').glob('*.json'):
+        deletion = json.loads(_safe_path(path).read_text(encoding='utf-8'))
+        if deletion.get('state') == 'complete':
+            codes.update(deletion.get('cods', []))
     references = {v for e in observed["entries"] for v in e["references"]}
     # A committed receipt can outlive a missing PDF or an unfinished inventory update.
     history = _safe_path(root / "Data" / "Issuance History")

@@ -153,7 +153,7 @@ class InwardOrderingTests(unittest.TestCase):
         staged, batch = stage_certificate_details(session, {'case_id': 'late', 'reference': 'preview'}, validate_cells=False)
         self.assertEqual(batch['source_row'], 2)
         self.assertEqual([row['case_id'] for row in read_batches(BytesIO(staged))], ['late', 'early', 'same'])
-        self.assertEqual(read_batches(BytesIO(session.data))[0]['reference'], '')
+        self.assertEqual(read_batches(BytesIO(session.data))[0]['reference'], '=H4')
 
     def test_dynamic_formula_cannot_keep_a_hidden_reference_to_the_old_row(self):
         book = load_workbook(BytesIO(self.fixture()))

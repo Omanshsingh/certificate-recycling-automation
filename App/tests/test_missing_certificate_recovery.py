@@ -174,7 +174,7 @@ class MissingCertificateRecoveryTests(unittest.TestCase):
         writer.add_blank_page(width=612, height=792)
         with manual_pdf.open("wb") as stream:
             writer.write(stream)
-        self.assertEqual(filename, "CUSTOM-077_Independent Client Ltd_Pune_1.pdf")
+        self.assertEqual(filename, "CUSTOM-077_Independent Client Ltd_Pune.pdf")
 
         review = self.check()
 
@@ -207,7 +207,7 @@ class MissingCertificateRecoveryTests(unittest.TestCase):
         self.source(status="Generated")
         batch = self.source_batch()
         current_name = runner.certificate_filename(batch, 1, COD)
-        legacy_name = current_name.replace("Independent Client Ltd", "Independent_Client_Ltd")
+        legacy_name = current_name.replace("Independent Client Ltd", "Independent_Client_Ltd").replace('.pdf', '_1.pdf')
         manual_pdf = self.folder / legacy_name
         writer = PdfWriter()
         writer.add_blank_page(width=612, height=792)

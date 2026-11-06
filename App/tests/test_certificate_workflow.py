@@ -8,12 +8,13 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
-from zipfile import ZipFile
+from zipfile import ZipFile, BadZipFile
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.formatting.rule import FormulaRule
 from openpyxl.styles import PatternFill
 from openpyxl.worksheet.datavalidation import DataValidation
+from openpyxl.utils.cell import get_column_letter
 from pypdf import PdfReader, PdfWriter
 
 from certificate_core import (
@@ -54,7 +55,7 @@ def make_workbook(path, clients):
             item.get("quantity", 2),
             item.get("per_piece_weight", 3.5),
             item.get("weight", 7.0),
-            item.get("form6", f"FORM6-{index}"),
+            item.get("form6", f"FORM6-{'P2-' if '2' in Path(path).stem else ''}{index}"),
             item.get("reference", f"REF-{index}"),
             item.get("cod", ""),
             item.get("cod_date"),
@@ -64,6 +65,10 @@ def make_workbook(path, clients):
         status_validation.add(f"M{index}")
     book.save(path)
     book.close()
+
+
+def column_for(sheet, heading):
+    return next(cell.column for cell in sheet[1] if cell.value == heading)
 
 
 class AutomationTestBase(unittest.TestCase):
@@ -90,9 +95,21 @@ class AutomationTestBase(unittest.TestCase):
 
     def execute(self, *, check_only=False, selected=None, limit=None, custom_cod=None,
                 allow_warnings=False, plants=None):
+        # Act as the operator choosing the first COD in an otherwise empty
+        # disposable workspace. Continued numbering remains automatic.
+        from run_certificates import numbering_plan
+        starting_cod=None
+        if not custom_cod:
+            try:
+                batches=[batch for path in self.paths for batch in read_batches(path)]
+                if numbering_plan(batches,load_settings(self.base),self.base/'Certificates')['needs_start']:
+                    starting_cod='0001'
+            except (OSError,ValueError,BadZipFile):
+                pass
         return run(self.paths, self.base, as_of=AS_OF, check_only=check_only,
                    selected=selected, limit=limit, custom_cod=custom_cod,
-                   allow_warnings=allow_warnings, plants=plants, progress=lambda _: None)
+                   allow_warnings=allow_warnings, plants=plants, progress=lambda _: None,
+                   starting_cod=starting_cod)
 
     def results(self):
         return json.loads((self.base / "Data" / "Reports" / "Latest Results.json").read_text(encoding="utf-8"))
@@ -406,8 +423,11 @@ class CertificateWorkflowTests(AutomationTestBase):
             sheet = book["Inward Register"]
             first_row = saved_plant1['P1-1']['source_row']
             custom_row = saved_plant1['P1-2']['source_row']
-            self.assertEqual((sheet.cell(first_row, 11).value, sheet.cell(first_row, 13).value), ("0078", "Generated"))
-            self.assertEqual((sheet.cell(custom_row, 11).value, sheet.cell(custom_row, 12).value.date(), sheet.cell(custom_row, 13).value),
+            cod_column = column_for(sheet, "COD No")
+            date_column = column_for(sheet, "COD Date")
+            status_column = column_for(sheet, "Certificate Issued")
+            self.assertEqual((sheet.cell(first_row, cod_column).value, sheet.cell(first_row, status_column).value), ("0078", "Generated"))
+            self.assertEqual((sheet.cell(custom_row, cod_column).value, sheet.cell(custom_row, date_column).value.date(), sheet.cell(custom_row, status_column).value),
                              ("SPECIAL/REF-0077", date(2026, 9, 26), "Generated"))
         finally:
             book.close()
@@ -426,9 +446,9 @@ class CertificateWorkflowTests(AutomationTestBase):
         book = load_workbook(self.plant1)
         sheet = book["Inward Register"]
         sheet["C2"] = "Updated Client Name Ltd"
-        sheet["K2"] = "USER-COD-1"
-        sheet["L2"] = date(2026, 9, 28)
-        sheet["M2"] = "Ready"
+        sheet.cell(2, column_for(sheet, "COD No"), "USER-COD-1")
+        sheet.cell(2, column_for(sheet, "COD Date"), date(2026, 9, 28))
+        sheet.cell(2, column_for(sheet, "Certificate Issued"), "Ready")
         book.save(self.plant1)
         book.close()
 
@@ -541,14 +561,15 @@ class CertificateWorkflowTests(AutomationTestBase):
         self.assertFalse(list((self.base / "Certificates").rglob("*.pdf")))
         self.assertTrue(all("unique COD" in row["detail"] for row in self.results()["rows"]))
 
-    def test_reference_is_optional_but_form6_warning_can_be_accepted(self):
+    def test_reference_is_required_even_when_warnings_are_accepted(self):
         make_workbook(self.plant1, [{"sn": "MISSING-REF", "reference": "", "age": 27}])
         make_workbook(self.plant2, [{"sn": "N-A", "status": "N/A"}])
         created, review, _ = self.execute()
-        self.assertEqual((created, review), (1, 0))
+        self.assertEqual((created, review), (0, 1))
+        self.assertEqual(self.execute(allow_warnings=True)[0], 0)
         row = next(item for item in self.results()["rows"] if item["sn"] == "MISSING-REF")
-        self.assertNotIn("reference", row["detail"].casefold())
-        self.assertEqual(read_batches(self.plant1)[0]["issued"], "Generated")
+        self.assertIn("reference", row["detail"].casefold())
+        self.assertEqual(read_batches(self.plant1)[0]["issued"], "Ready")
 
     def test_missing_form6_blocks_generation_while_inward_stays_ready_for_entry(self):
         make_workbook(self.plant1, [{"sn": "WARN-1", "form6": "", "age": 27}])
@@ -586,7 +607,7 @@ class CertificateWorkflowTests(AutomationTestBase):
                 "supplier": "Entered From App Ltd", "location": "Pune",
                 "item": "Servers", "quantity": "2", "per_piece_weight": "5",
                 "weight": "10", "certificate_weight": "8", "form6": "FORM6-FORM",
-                "reference": "", "cod_no": "", "cod_date": "",
+                "reference": "REF-FORM", "cod_no": "", "cod_date": "",
             },
         )
         self.assertEqual((batch["case_id"], batch["issued"], batch["form6"]),
@@ -680,7 +701,8 @@ class ReminderAndExcelTests(AutomationTestBase):
     def test_legacy_labels_normalize_to_canonical_values_and_alert_never_becomes_ready(self):
         for source, expected in (("Created", "generated"), ("Sent", "completed"),
                                  ("Check Details", "alert"), ("Working Draft", "alert"),
-                                 ("Generated Manual", "generated_manual")):
+                                 ("Generated Manual", "generated_manual"),
+                                 ("Generated Externally", "generated_manual")):
             with self.subTest(source=source):
                 self.assertEqual(status_value(source), expected)
 
@@ -699,10 +721,13 @@ class ReminderAndExcelTests(AutomationTestBase):
         book = load_workbook(self.plant1, data_only=False)
         try:
             sheet = book["Inward Register"]
-            self.assertEqual([sheet.cell(row, 13).value for row in range(2, 9)],
-                             ["Generated", "Completed", "Ready", "Ready", "Generated Manual", "Ready", "N/A"])
-            validation = next(item for item in sheet.data_validations.dataValidation if "M2:M10000" in str(item.sqref))
-            self.assertIn("Generated Manual", validation.formula1)
+            status_column = column_for(sheet, "Certificate Issued")
+            self.assertEqual([sheet.cell(row, status_column).value for row in range(2, 9)],
+                             ["Generated", "Completed", "Ready", "Ready", "Generated Externally", "Ready", "N/A"])
+            status_letter = get_column_letter(status_column)
+            validation = next(item for item in sheet.data_validations.dataValidation if f"{status_letter}2:{status_letter}10000" in str(item.sqref))
+            self.assertIn("Generated Externally", validation.formula1)
+            self.assertNotIn("Generated Manual", validation.formula1)
             self.assertNotIn("Working Draft", validation.formula1)
             self.assertNotIn("Created", validation.formula1)
             self.assertNotIn("Sent", validation.formula1)
@@ -726,7 +751,7 @@ class ReminderAndExcelTests(AutomationTestBase):
         book = load_workbook(self.plant1)
         sheet = book["Inward Register"]
         legacy_fill = PatternFill(fill_type="solid", fgColor="FF000000")
-        for value in ("READY", "ALERT", "N/A", "BLANK", "GENERATED", "GENERATED MANUAL", "COMPLETED"):
+        for value in ("READY", "ALERT", "N/A", "BLANK", "GENERATED", "GENERATED MANUAL", "GENERATED EXTERNALLY", "COMPLETED"):
             sheet.conditional_formatting.add(
                 "M2:M1000",
                 FormulaRule(formula=[f'UPPER(TRIM($M2))="{value}"'], fill=legacy_fill),
@@ -770,9 +795,12 @@ class ReminderAndExcelTests(AutomationTestBase):
         book = load_workbook(self.plant1, data_only=False)
         try:
             sheet = book["Inward Register"]
-            validations = [item for item in sheet.data_validations.dataValidation if "M2:M10000" in str(item.sqref)]
+            status_column = column_for(sheet, "Certificate Issued")
+            status_letter = get_column_letter(status_column)
+            validations = [item for item in sheet.data_validations.dataValidation
+                           if f"{status_letter}2:{status_letter}10000" in str(item.sqref)]
             self.assertEqual(len(validations), 1)
-            self.assertIn("Ready,Alert,N/A,Generated,Generated Manual,Completed", validations[0].formula1)
+            self.assertIn("Ready,Alert,N/A,Generated,Generated Externally,Completed", validations[0].formula1)
             self.assertTrue(validations[0].formula1.startswith('",Ready,Alert'))
             self.assertNotIn("Blank", validations[0].formula1)
             self.assertTrue(validations[0].allowBlank)
@@ -791,11 +819,12 @@ class ReminderAndExcelTests(AutomationTestBase):
                                      "Legacy duplicate reminder rules must be removed.")
                     if "TODAY()-INT($B2)>=25" in formula:
                         matching.append((str(region.sqref), rule))
-                    if ("M2:M10000" in str(region.sqref) and "$M2" in formula
+                    if (f"{status_letter}2:{status_letter}10000" in str(region.sqref)
+                            and f"${status_letter}2" in formula
                             and any(f'"{value}"' in formula for value in
-                                    ("READY", "ALERT", "N/A", "BLANK", "GENERATED", "GENERATED MANUAL", "COMPLETED"))):
+                                    ("READY", "ALERT", "N/A", "BLANK", "GENERATED", "GENERATED EXTERNALLY", "COMPLETED"))):
                         status_rule_count += 1
-                        for label in ("READY", "ALERT", "N/A", "BLANK", "GENERATED", "GENERATED MANUAL", "COMPLETED"):
+                        for label in ("READY", "ALERT", "N/A", "BLANK", "GENERATED", "GENERATED EXTERNALLY", "COMPLETED"):
                             if f'"{label}"' in formula or (label == "N/A" and '"N/A"' in formula):
                                 dxf = book._differential_styles.styles[rule.dxfId]
                                 status_colors[label] = dxf.fill.fgColor.rgb
@@ -806,7 +835,8 @@ class ReminderAndExcelTests(AutomationTestBase):
             self.assertEqual(status_rule_count, 7, "Only one authoritative color rule per status should remain.")
             self.assertEqual(len(priorities), len(set(priorities)), "Excel rule priorities must be unique.")
             self.assertTrue(unrelated_rule_kept, "Formatting in unrelated user-owned cells must be preserved.")
-            self.assertIn('AND($A2<>"",OR($M2="",UPPER(TRIM($M2))="BLANK"))', status_formulas["BLANK"])
+            self.assertIn(f'AND($A2<>"",OR(${status_letter}2="",UPPER(TRIM(${status_letter}2))="BLANK"))',
+                          status_formulas["BLANK"])
             self.assertEqual(matching[0][0], "C2:C10000")
             self.assertNotIn("A2:A10000", matching[0][0])
             self.assertNotIn("J2:J10000", matching[0][0])
@@ -852,9 +882,9 @@ class ReminderAndExcelTests(AutomationTestBase):
             self.assertEqual(status_colors["N/A"], "FFFFFFFF")
             self.assertEqual(status_colors["BLANK"], "FFFFFFFF")
             self.assertEqual(status_colors["GENERATED"], "FFFFE699")
-            self.assertEqual(status_colors["GENERATED MANUAL"], "FFDDEBF7")
+            self.assertEqual(status_colors["GENERATED EXTERNALLY"], "FFDDEBF7")
             self.assertEqual(status_colors["COMPLETED"], "FFFFE699")
-            self.assertEqual(sheet["M2"].value, "Generated")
+            self.assertEqual(sheet.cell(2, column_for(sheet, "Certificate Issued")).value, "Generated")
         finally:
             book.close()
         backups = list((self.base / "Data" / "Workbook Backups").glob("Plant 1_*.xlsx"))
@@ -897,8 +927,11 @@ class ReminderAndExcelTests(AutomationTestBase):
         make_workbook(self.plant2, [{"sn": "NA-ROW", "status": "N/A"}])
         self.execute(check_only=True)
 
-        previous_formula = '<formula>AND($A2&lt;&gt;"",OR($M2="",UPPER(TRIM($M2))="BLANK"))</formula>'
-        legacy_formula = '<formula>OR($M2="",UPPER(TRIM($M2))="BLANK")</formula>'
+        normalized = load_workbook(self.plant1, read_only=True)
+        status_letter = get_column_letter(column_for(normalized["Inward Register"], "Certificate Issued"))
+        normalized.close()
+        previous_formula = f'<formula>AND($A2&lt;&gt;"",OR(${status_letter}2="",UPPER(TRIM(${status_letter}2))="BLANK"))</formula>'
+        legacy_formula = f'<formula>OR(${status_letter}2="",UPPER(TRIM(${status_letter}2))="BLANK")</formula>'
         with ZipFile(self.plant1) as source:
             member = _sheet_member(source, "Inward Register")
             xml = source.read(member).decode("utf-8")

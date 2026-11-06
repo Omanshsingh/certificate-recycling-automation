@@ -8,15 +8,16 @@ from pypdf import PdfReader, PdfWriter
 from reportlab.pdfgen import canvas
 
 
-SPEC = {'id': 'destruction', 'name': 'Secured Data Destruction', 'default_company': '', 'fields': [
+SPEC = {'id': 'destruction', 'name': 'Data Destruction', 'default_company': '', 'fields': [
     {'key': 'destruction_date', 'label': 'Date devices were destroyed', 'type': 'date',
-     'default': '', 'group': 'details', 'multiline': False},
+     'default': '', 'group': 'details', 'multiline': False,
+     'help': 'The actual destruction date printed on page 1. Receipt dates are entered separately below.'},
     {'key': 'device_receipts', 'label': 'Device receipts', 'type': 'receipts',
      'default': '', 'group': 'details', 'multiline': True},
 ]}
 
 
-def receipts(value):
+def receipts(value, *, maximum=9):
     from certificate_core import parse_date
     if not value:
         return []
@@ -24,8 +25,8 @@ def receipts(value):
         entries = json.loads(value)
     except (TypeError, ValueError) as exc:
         raise ValueError('Enter a received date and whole device count for each receipt.') from exc
-    if not isinstance(entries, list) or len(entries) > 100:
-        raise ValueError('Enter no more than 100 device receipts.')
+    if not isinstance(entries, list) or len(entries) > maximum:
+        raise ValueError(f'Only {maximum} device rows fit on the HDD certificate. Remove the extra rows.')
     result = []
     for index, entry in enumerate(entries, 1):
         if not isinstance(entry, dict):
@@ -71,16 +72,16 @@ def layout_warnings(batch):
     warnings = []
     for key, width in [('supplier', 590), ('location', 153)]:
         try:
-            fitted_text(str(batch.get(key) or ''), width, minimum=8)
+            fitted_text(str(batch.get(key) or '').upper(), width, minimum=8)
         except ValueError:
             warnings.append(f'Shorten the {"company name" if key == "supplier" else "city/location"} to fit the data destruction certificate.')
     return warnings
 
 
-def fitted_text(value, width, minimum=8, preferred=13):
+def fitted_text(value, width, minimum=8, preferred=14, bold=True):
     from certificate_templates import font_name
     from reportlab.pdfbase import pdfmetrics
-    font = font_name({'font': 'Calibri'})
+    font = font_name({'font': 'Calibri', 'bold': -1 if bold else 0})
     value = ' '.join(str(value).split())
     size = preferred
     while size > minimum and pdfmetrics.stringWidth(value, font, size) > width:
@@ -104,6 +105,9 @@ def make_certificate(batch, cod, issued_date, destination):
     writer = PdfWriter()
 
     def page(index, draw):
+        # A repeated details page needs independent content/resources. Reusing
+        # pypdf's clone map makes later overlays appear on earlier pages too.
+        writer.reset_translation(template)
         writer.add_page(template.pages[index])
         overlay = BytesIO()
         pdf = canvas.Canvas(overlay, pagesize=(960, 540))
@@ -111,45 +115,39 @@ def make_certificate(batch, cod, issued_date, destination):
         pdf.save()
         writer.pages[-1].merge_page(PdfReader(overlay).pages[0])
 
-    def text(pdf, value, left, baseline, width, preferred=13):
-        font, size, value = fitted_text(value, width, preferred=preferred)
+    def text(pdf, value, left, baseline, width, preferred=14, bold=True):
+        font, size, value = fitted_text(value, width, preferred=preferred, bold=bold)
         pdf.setFont(font, size)
         pdf.setFillColorRGB(0, 0, 0)
         pdf.drawCentredString(left + width / 2, 540 - baseline, value)
 
     def front(pdf):
-        text(pdf, batch.get('supplier', '').upper(), 184, 264, 590)
-        text(pdf, batch.get('location', ''), 204, 298, 153, 11)
-        text(pdf, destroyed.strftime('%d.%m.%Y') if destroyed else '', 242, 332, 127, 11)
-        text(pdf, cod, 487, 332, 90, 11)
-        text(pdf, issued_date.strftime('%d.%m.%Y'), 619, 332, 115, 11)
+        text(pdf, batch.get('supplier', '').upper(), 184, 258, 590)
+        text(pdf, str(batch.get('location') or '').upper(), 204, 295, 153)
+        text(pdf, destroyed.strftime('%d/%m/%Y') if destroyed else '', 242, 332, 127)
+        text(pdf, cod, 487, 332, 90)
+        text(pdf, issued_date.strftime('%d/%m/%Y'), 619, 332, 115)
 
     page(0, front)
     groups = [rows[index:index + 9] for index in range(0, len(rows), 9)] or [[]]
     for index, group in enumerate(groups):
         def details(pdf):
-            # A searchable identifier ties every details page to its certificate.
-            text(pdf, f'Certificate No. {cod}   |   Details {index + 1} of {len(groups)}', 310, 25, 340, 9)
             for row_index, (received, count) in enumerate(group):
                 baseline = 99 + row_index * 20.65
-                text(pdf, received.strftime('%d.%m.%Y'), 314, baseline, 165, 11)
-                text(pdf, str(count), 482, baseline, 165, 11)
-            text(pdf, str(sum(count for _, count in group)) if group else '', 482, 283, 165, 11)
+                text(pdf, received.strftime('%d/%m/%Y'), 314, baseline, 165)
+                text(pdf, str(count), 482, baseline, 165)
+            text(pdf, str(sum(count for _, count in group)) if group else '', 482, 283, 165)
             if len(groups) > 1:
-                text(pdf, f'Page subtotal above. Total devices: {sum(count for _, count in rows)}', 310, 307, 340, 10)
+                text(pdf, f'Page subtotal above. Total devices: {sum(count for _, count in rows)}', 310, 307, 340, 10, bold=False)
         page(1, details)
     annexure = fields.get('_annexure')
     if annexure:
         from app_paths import DATA_ROOT
-        attachment = Path(batch.get('_data_root', DATA_ROOT)) / 'Data' / 'Attachments' / f'{annexure}.pdf'
-        if not attachment.is_file():
-            raise ValueError('The attached annexure is missing. Choose its PDF again.')
-        attached = PdfReader(attachment)
-        if attached.is_encrypted:
-            raise ValueError('Choose an unlocked annexure PDF.')
-        for attached_page in attached.pages:
-            writer.add_page(attached_page)
-    writer.add_metadata({'/Title': f'Secured Data Destruction - {cod}', '/Subject': 'destruction'})
+        from pdf_attachments import append_attachment
+        append_attachment(writer, batch.get('_data_root', DATA_ROOT), annexure)
+    writer.add_metadata({'/Title': f'Secured Data Destruction - {cod}', '/Subject': 'destruction',
+                         '/CertificateDate': issued_date.isoformat(),
+                         '/CertificatePlant': str(batch.get('source_id') or '')})
     destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     with destination.open('wb') as stream:
@@ -157,34 +155,57 @@ def make_certificate(batch, cod, issued_date, destination):
     return destination
 
 
-def request_for_inward(root, plant, case_id, expected_revision=None):
+def request_for_inward(root, plant, case_id, expected_revision=None, *, needed=True, confirmed=False, record_id=None):
     """Save an idempotent additional request without writing to the inward workbook."""
     from certificate_core import read_batches
-    from certificate_drafts import read_register, save_draft
-    from workflow_support import load_settings
+    from certificate_drafts import read_register, save_draft, write_register, _manual_record_issued
+    from workflow_support import load_settings, run_lock
     from workspace_review import require_revision
     if expected_revision is not None:
         require_revision(root, expected_revision)
-    if plant not in {'plant1', 'plant2'} or not str(case_id or '').strip():
+    if not isinstance(needed, bool):
+        raise ValueError('Choose whether Data Destruction is needed.')
+    if (plant not in {'plant1', 'plant2'} and not record_id) or (not record_id and not str(case_id or '').strip()):
         raise ValueError('Choose an inward client first.')
     case_id = str(case_id).strip()
-    paths = load_settings(root)['workbook_paths']
-    path = paths[int(plant[-1]) - 1]
-    if not path or not Path(path).is_file():
-        raise ValueError('Connect this plant workbook and refresh before adding its data destruction request.')
-    matches = [batch for batch in read_batches(Path(path))
-               if str(batch['case_id']).strip().casefold() == case_id.casefold()]
-    if len(matches) != 1:
-        raise ValueError('The inward Serial Number is missing or repeated. Correct Excel and refresh.')
-    source = matches[0]
-    link = {'plant': plant, 'case_id': str(source['case_id'])}
+    if record_id:
+        records = read_register(root)['records']
+        record = next((entry for entry in records if entry['id'] == record_id and entry['plant'] == plant
+                       and entry.get('removed_inward')), None)
+        if not record:
+            raise ValueError('The linked local certificate was not found. Refresh and try again.')
+        source = record['details']
+        link = {'plant': plant, 'case_id': str(record['removed_inward']['case_id']), 'record_id': record_id}
+    else:
+        paths = load_settings(root)['workbook_paths']
+        path = paths[int(plant[-1]) - 1]
+        if not path or not Path(path).is_file():
+            raise ValueError('Connect this plant workbook and refresh before adding its data destruction request.')
+        matches = [batch for batch in read_batches(Path(path))
+                   if str(batch['case_id']).strip().casefold() == case_id.casefold()]
+        if len(matches) != 1:
+            raise ValueError('The inward Serial Number is missing or repeated. Correct Excel and refresh.')
+        source = matches[0]
+        link = {'plant': plant, 'case_id': str(source['case_id'])}
     for record in read_register(root)['records']:
         if record['details'].get('destruction_source') == link:
+            if record.get('destruction_requested', True) != needed:
+                with run_lock(root):
+                    if expected_revision is not None:
+                        require_revision(root, expected_revision)
+                    data = read_register(root)
+                    current = next(item for item in data['records'] if item['id'] == record['id'])
+                    if not needed and _manual_record_issued(root, current) and confirmed is not True:
+                        raise ValueError('An HDD certificate already exists. Confirm removing its request; its PDF and number will be kept.')
+                    current['destruction_requested'] = needed
+                    write_register(root, data)
             return record['id']
+    if not needed:
+        return None
     from certificate_core import parse_date
     received = parse_date(source.get('inward_date'))
     details = dict(source, certificate_type='destruction', certificate_fields={
         'device_receipts': json.dumps([{'date': received.isoformat() if received else '', 'count': ''}])},
-                   destruction_source=link, cod_no='', cod_date='', items=[])
+                   destruction_source=link, cod_no='', cod_date='', reference='', items=[])
     details.pop('certificate_weight', None)
     return save_draft(root, plant, details, expected_revision=expected_revision)

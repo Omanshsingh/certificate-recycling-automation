@@ -2,6 +2,8 @@
 from datetime import date
 import json
 from pathlib import Path
+from zipfile import ZipFile
+import xml.etree.ElementTree as ET
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -31,7 +33,7 @@ class DestructionTests(unittest.TestCase):
 
     def details(self, count=12):
         return {'certificate_type': 'destruction', 'supplier': 'Example International Ltd',
-                'location': 'London, UK', 'certificate_fields': {'destruction_date': '2026-10-16',
+                'location': 'London, UK', 'reference':'REF-HDD-TEST', 'certificate_fields': {'destruction_date': '2026-10-16',
                 'device_receipts': json.dumps([{'date': '2026-10-01', 'count': str(count)}])}}
 
     def test_request_is_idempotent_and_does_not_mutate_either_inward(self):
@@ -49,12 +51,15 @@ class DestructionTests(unittest.TestCase):
         result = generate_draft(self.root, 'plant2', self.details(), as_of=AS_OF)
         self.assertEqual(result['created'], 1)
         self.assertEqual(result['certificate_no'], '0303')
+        self.assertEqual(result['relative_path'], 'Auto Generated/0303_Example International Ltd_London, UK_HDD.pdf')
         path = self.root / 'Certificates' / result['relative_path']
         pdf = PdfReader(path)
         self.assertEqual(len(pdf.pages), 2)
         self.assertIn('EXAMPLE INTERNATIONAL LTD', pdf.pages[0].extract_text())
-        self.assertIn('16.10.2026', pdf.pages[0].extract_text())
+        self.assertIn('16/10/2026', pdf.pages[0].extract_text())
         self.assertIn('12', pdf.pages[1].extract_text())
+        self.assertEqual(pdf.metadata['/CertificateDate'],AS_OF.isoformat())
+        self.assertEqual(pdf.metadata['/CertificatePlant'],'')
         self.assertTrue(manual_rows(self.root)[0]['destruction_pending'])
         complete_draft(self.root, result['record_id'])
         self.assertFalse(manual_rows(self.root)[0]['destruction_pending'])
@@ -62,7 +67,53 @@ class DestructionTests(unittest.TestCase):
         reconcile_manual(self.root)
         self.assertTrue(manual_rows(self.root)[0]['destruction_pending'])
 
-    def test_linked_issuance_keeps_recycling_cod_status_and_workbook_bytes(self):
+    def test_request_can_be_removed_and_restored_without_losing_its_details_or_changing_excel(self):
+        before = [path.read_bytes() for path in self.paths]
+        record_id = request_for_inward(self.root, 'plant1', 'CLIENT1')
+        details = read_register(self.root)['records'][0]['details']
+        details['certificate_fields'] = self.details()['certificate_fields']
+        save_draft(self.root, 'plant1', details, record_id)
+        request_for_inward(self.root, 'plant1', 'CLIENT1', workspace_revision(self.root), needed=False)
+        self.assertEqual(manual_rows(self.root), [])
+        self.assertEqual(len(read_register(self.root)['records']), 1)
+        self.assertEqual(request_for_inward(self.root, 'plant1', 'CLIENT1', workspace_revision(self.root)), record_id)
+        restored = manual_rows(self.root)[0]
+        self.assertTrue(restored['destruction_pending'])
+        self.assertEqual(restored['certificate_fields'], details['certificate_fields'])
+        self.assertEqual(before, [path.read_bytes() for path in self.paths])
+
+    def test_removing_an_issued_request_requires_confirmation_and_keeps_pdf_number_and_history(self):
+        record_id = request_for_inward(self.root, 'plant1', 'CLIENT1')
+        details = read_register(self.root)['records'][0]['details']
+        details['certificate_fields'] = self.details()['certificate_fields']
+        result = generate_draft(self.root, 'plant1', details, record_id, as_of=AS_OF)
+        pdf_path = self.root / 'Certificates' / result['relative_path']
+        before = pdf_path.read_bytes()
+        excel = [path.read_bytes() for path in self.paths]
+        with self.assertRaisesRegex(ValueError, 'Confirm removing'):
+            request_for_inward(self.root, 'plant1', 'CLIENT1', workspace_revision(self.root), needed=False)
+        self.assertTrue(manual_rows(self.root)[0]['destruction_pending'])
+        request_for_inward(self.root, 'plant1', 'CLIENT1', workspace_revision(self.root), needed=False, confirmed=True)
+        row = manual_rows(self.root)[0]
+        self.assertFalse(row['destruction_requested'])
+        self.assertFalse(row['destruction_pending'])
+        self.assertEqual(row['certificate_no'], result['certificate_no'])
+        self.assertEqual(pdf_path.read_bytes(), before)
+        self.assertEqual(excel, [path.read_bytes() for path in self.paths])
+        self.assertEqual(row['record_id'], record_id)
+        pdf_path.unlink()
+        reconcile_manual(self.root)
+        self.assertEqual(manual_rows(self.root), [])
+
+    def test_request_removal_rejects_a_stale_review(self):
+        request_for_inward(self.root, 'plant1', 'CLIENT1')
+        revision = workspace_revision(self.root)
+        request_for_inward(self.root, 'plant2', 'CLIENT2')
+        with self.assertRaisesRegex(ValueError, 'files changed'):
+            request_for_inward(self.root, 'plant1', 'CLIENT1', revision, needed=False)
+        self.assertTrue(all(row['destruction_pending'] for row in manual_rows(self.root)))
+
+    def test_linked_issuance_writes_hdd_below_recycling_and_keeps_other_plant(self):
         before = [path.read_bytes() for path in self.paths]
         recycling = self.root / 'Certificates' / 'Auto Generated' / '0301_Independent Client Ltd_Pune.pdf'
         make_template_certificate({'certificate_type':'standard', 'supplier':'Independent Client Ltd',
@@ -74,9 +125,22 @@ class DestructionTests(unittest.TestCase):
         details = read_register(self.root)['records'][0]['details']
         details['certificate_fields'] = self.details()['certificate_fields']
         result = generate_draft(self.root, 'plant1', details, record, as_of=AS_OF)
+        self.assertFalse(result['requires_confirmation'])
         self.assertEqual(result['created'], 1)
         self.assertEqual(result['certificate_no'], '0303')
-        self.assertEqual(before, [path.read_bytes() for path in self.paths])
+        self.assertNotEqual(before[0],self.paths[0].read_bytes())
+        self.assertEqual(before[1],self.paths[1].read_bytes())
+        from certificate_core import read_batches
+        from openpyxl import load_workbook
+        inward=read_batches(self.paths[0])[0]
+        self.assertEqual(inward['cod_no'],'0301');self.assertEqual(inward['issued'],'Completed')
+        self.assertEqual(inward['hdd_cod_no'],'0303')
+        book=load_workbook(self.paths[0]);sheet=book.active
+        from certificate_core import select_register
+        _,_,cols=select_register(book)
+        self.assertEqual(sheet.cell(3,cols['cod_no']+1).value,'0303')
+        self.assertEqual(sheet.cell(3,cols['cod_date']+1).number_format,'dd/mm/yy')
+        self.assertEqual(sheet.cell(3,cols['cod_no']+1).alignment.vertical,'top');book.close()
         self.assertEqual(recycling_before, recycling.read_bytes())
         # PDF-only corrections cannot detach the original inward.
         details.pop('destruction_source')
@@ -99,19 +163,25 @@ class DestructionTests(unittest.TestCase):
         details['certificate_fields']['destruction_date'] = '2026-09-01'
         self.assertTrue(any('before' in issue for issue in content_issues(details, AS_OF)))
 
-    def test_more_than_nine_receipts_continue_without_dropping_devices(self):
+    def test_only_nine_receipts_fit_and_no_certificate_number_is_added_on_page_two(self):
         details = self.details()
         details['certificate_fields']['device_receipts'] = json.dumps([
-            {'date': '2026-10-01', 'count': str(i)} for i in range(1, 12)])
-        path = self.root / 'continuation.pdf'
-        make_template_certificate(details, '0303', AS_OF, path)
-        pdf = PdfReader(path)
-        self.assertEqual(len(pdf.pages), 3)
-        self.assertIn('Total devices: 66', pdf.pages[2].extract_text())
-        self.assertIn('Details 2 of 2', pdf.pages[2].extract_text())
+            {'date':'2026-10-01','count':str(i)} for i in range(1,10)])
+        path = self.root / 'nine-rows.pdf'
+        make_template_certificate(details,'0303',AS_OF,path)
+        pdf=PdfReader(path)
+        self.assertEqual(len(pdf.pages),2)
+        second=pdf.pages[1].extract_text()
+        self.assertNotIn('Certificate No.',second)
+        self.assertNotIn('0303',second)
+        self.assertEqual([line.strip() for line in second.splitlines() if line.strip().isdigit()],[*[str(i) for i in range(1,10)],'45'])
+        details['certificate_fields']['device_receipts'] = json.dumps([
+            {'date':'2026-10-01','count':'1'} for _ in range(10)])
+        with self.assertRaisesRegex(ValueError,'Only 9'):
+            generate_draft(self.root,'plant1',details,confirmed=True,as_of=AS_OF)
 
     def test_cannot_replace_recycling_or_move_link(self):
-        with self.assertRaisesRegex(ValueError, 'additional certificate'):
+        with self.assertRaisesRegex(ValueError, 'Review & edit.*Data Destruction needed'):
             web_app.workbook_form({}, self.details(), self.paths)
         record = request_for_inward(self.root, 'plant1', 'CLIENT1')
         details = self.details()
@@ -128,6 +198,55 @@ class DestructionTests(unittest.TestCase):
             response = web_app.preview_certificate({'source_kind':'manual', 'plant':'plant1', 'details':self.details()})
         self.assertEqual(len(response['preview_detail_images']), 1)
         self.assertFalse(read_register(self.root)['records'])
+
+    def test_filled_reference_uses_bold_values_slash_dates_and_padded_cod(self):
+        details = self.details(272)
+        details.update(supplier='Duck Creek Technologies India LLP',location='Mumbai')
+        details['certificate_fields'] = {'destruction_date':'2026-09-09',
+            'device_receipts':json.dumps([{'date':'2026-09-09','count':'272'}])}
+        path = self.root / 'reference-preview.pdf'
+        make_template_certificate(details,'0172',date(2026,10,8),path)
+        pdf = PdfReader(path)
+        front = pdf.pages[0].extract_text()
+        self.assertIn('DUCK CREEK TECHNOLOGIES INDIA LLP',front)
+        self.assertIn('MUMBAI',front)
+        self.assertIn('0172',front)
+        self.assertIn('09/09/2026',front)
+        self.assertIn('08/10/2026',front)
+        self.assertNotIn('08.10.2026',front)
+        self.assertEqual(pdf.pages[1].extract_text().count('272'),2)
+        fonts=[]
+        def visit(text, cm, tm, font, size):
+            if text.strip(): fonts.append((str(font.get('/BaseFont','')),size))
+        pdf.pages[0].extract_text(visitor_text=visit)
+        self.assertTrue(all('Bold' in font and size == 14 for font,size in fonts))
+        self.assertFalse((self.root/'Data'/'Issuance History').exists())
+
+    def test_receipt_dates_destruction_date_and_issue_date_remain_independent(self):
+        details=self.details()
+        details['certificate_fields']={'destruction_date':'2026-09-15',
+            'device_receipts':json.dumps([{'date':'2026-09-01','count':'50'},{'date':'2026-09-09','count':'222'}])}
+        path=self.root/'separate-dates.pdf'
+        make_template_certificate(details,'0303',date(2026,10,8),path)
+        pdf=PdfReader(path)
+        self.assertIn('15/09/2026',pdf.pages[0].extract_text())
+        self.assertIn('08/10/2026',pdf.pages[0].extract_text())
+        text=pdf.pages[1].extract_text()
+        for value in ('01/09/2026','09/09/2026','50','222','272'): self.assertIn(value,text)
+
+    def test_templates_are_blank_and_use_only_the_supplied_backgrounds(self):
+        from certificate_templates import TEMPLATE_ROOT
+        pdf=PdfReader(TEMPLATE_ROOT/'destruction.pdf')
+        self.assertEqual(len(pdf.pages),2)
+        for page in pdf.pages:
+            self.assertEqual(len(page.images),1)
+            self.assertFalse(page.extract_text().strip())
+            self.assertEqual((float(page.mediabox.width),float(page.mediabox.height)),(960,540))
+        with ZipFile(TEMPLATE_ROOT/'destruction.pptx') as archive:
+            for name in archive.namelist():
+                if name.startswith('ppt/slides/slide') and name.endswith('.xml'):
+                    root=ET.fromstring(archive.read(name))
+                    self.assertFalse(any((text.text or '').strip() for text in root.iter('{http://schemas.openxmlformats.org/drawingml/2006/main}t')))
 
 
 if __name__ == '__main__':

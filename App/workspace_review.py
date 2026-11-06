@@ -10,11 +10,12 @@ from workflow_support import load_settings
 _SECRET = secrets.token_bytes(32)
 
 
-def workspace_revision(root, file_overrides=None):
+def workspace_revision(root, file_overrides=None, *, force=False):
     root = Path(root).resolve()
     settings = load_settings(root)
     paths = [root / 'settings.local.json', root / 'Data' / 'Custom Certificates.json',
-             root / 'Data' / 'Certificate Inventory.json', root / 'Data' / 'History Reset.json']
+             root / 'Data' / 'Certificate Inventory.json', root / 'Data' / 'History Reset.json',
+             root / 'Data' / 'Certificate Folder Moves.json']
     paths.extend(Path(value).resolve() for value in settings.get('workbook_paths', []) if value)
     for folder in (root / 'Certificates', root / 'Data' / 'Attachments', root / 'App' / 'templates' / 'certificate-types'):
         paths.extend(path for path in sorted(folder.rglob('*')) if path.is_file() and not path.name.startswith('.'))
@@ -25,8 +26,9 @@ def workspace_revision(root, file_overrides=None):
             result.update(hashlib.sha256(file_overrides[str(path.resolve())]).digest())
             continue
         try:
-            with path.open('rb') as stream:
-                result.update(hashlib.file_digest(stream, 'sha256').digest())
+            from file_fingerprints import fingerprint
+            digest, _ = fingerprint(path, force=force)
+            result.update(bytes.fromhex(digest))
         except FileNotFoundError:
             result.update(b'missing')
         except OSError as exc:
@@ -35,7 +37,7 @@ def workspace_revision(root, file_overrides=None):
 
 
 def require_revision(root, expected, file_overrides=None):
-    if not isinstance(expected, str) or not expected or not hmac.compare_digest(workspace_revision(root, file_overrides), expected):
+    if not isinstance(expected, str) or not expected or not hmac.compare_digest(workspace_revision(root, file_overrides, force=True), expected):
         raise ValueError('The files changed since you opened these details. Refresh Excel and review the current details before saving. Your entered details have not been saved.')
 
 

@@ -17,12 +17,12 @@ from certificate_core import read_batches
 HEADERS = (
     "SN", "Inward Date", "Supplier Name", "Location", "Item",
     "Quantity in Pcs", "Per Pcs Weight in (KG)", "Weight (KG)",
-    "Form 6 No", "Total Weight in KG",
+    "Form 6 No", "Total Weight in KG", "Reference No.",
     "Comments", "Transporter/Vehicle Details", "Docket No./Vehicle No",
-    "Weight Slip/Weight Scale", "Reference No.", "COD No", "COD Date",
+    "Weight Slip/Weight Scale", "COD No", "COD Date",
     "Certificate Issued",
 )
-WIDTHS = (8, 13, 22, 18, 19, 13, 15, 13, 14, 15, 18, 23, 18, 18, 16, 12, 13, 18)
+WIDTHS = (8, 13, 22, 18, 19, 13, 15, 13, 14, 15, 16, 18, 26, 24, 24, 12, 13, 18)
 
 
 def plant_workbook_bytes(plant: str) -> bytes:
@@ -63,7 +63,7 @@ def plant_workbook_bytes(plant: str) -> bytes:
         for column in range(1, len(HEADERS) + 1):
             cell = sheet.cell(row, column)
             cell.font = Font(name="Calibri", size=11, color=black)
-            cell.alignment = Alignment(horizontal="center", vertical="center",
+            cell.alignment = Alignment(horizontal="left", vertical="top",
                                       wrap_text=True)
             cell.border = Border(
                 left=medium if column == 1 else thin,
@@ -72,12 +72,12 @@ def plant_workbook_bytes(plant: str) -> bytes:
                 bottom=medium,
             )
             if column in {2, 17}:
-                cell.number_format = "dd.mm.yyyy"
+                cell.number_format = "dd/mm/yy"
             if column in {6, 7, 8, 10}:
                 cell.number_format = "0.00"
 
     status_validation = DataValidation(
-        type="list", formula1='",Ready,Alert,Generated,Generated Manual,Completed,N/A"',
+        type="list", formula1='",Ready,Alert,Generated,Generated Externally,Completed,N/A"',
         allow_blank=True,
     )
     status_validation.errorTitle = "Choose a listed status"
@@ -89,7 +89,7 @@ def plant_workbook_bytes(plant: str) -> bytes:
         ("READY", "FFB6D7A8", "FF006100"),
         ("ALERT", "FFC00000", "FFFFFFFF"),
         ("GENERATED", "FFFFE699", "FF7F6000"),
-        ("GENERATED MANUAL", "FFDDEBF7", "FF1F4E78"),
+        ("GENERATED EXTERNALLY", "FFDDEBF7", "FF1F4E78"),
         ("COMPLETED", "FFFFE699", "FF7F6000"),
         ("N/A", "FFFFFFFF", "FF000000"),
     ):

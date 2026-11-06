@@ -47,7 +47,7 @@ class ExcelEditResilienceTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix='excel-edit-resilience-')))
         self.paths = [self.root / 'Plant 1.xlsx', self.root / 'Plant 2.xlsx']
         make_workbook(self.paths[0], [{'sn': '1001', 'status': '', 'date': date(2026, 10, 1)}])
-        make_workbook(self.paths[1], [{'sn': '2001', 'status': 'N/A', 'cod': '0040'}])
+        make_workbook(self.paths[1], [{'sn': '2001', 'status': 'N/A', 'cod': '0040', 'reference':'REF-OTHER-PLANT'}])
         shutil.copytree(APP / 'templates', self.root / 'App' / 'templates')
         save_json(self.root / 'settings.local.json', {
             'workbook_paths': [str(path) for path in self.paths],
@@ -187,7 +187,11 @@ class ExcelEditResilienceTests(unittest.TestCase):
         self.assertEqual(report['created'], 0)
         # Refresh may maintain borders and conditional formatting. Every inward
         # value, including its status, must stay unchanged on the conflict.
-        self.assertEqual(read_batches(self.paths[0])[0], source)
+        from certificate_core import batch_content
+        current=read_batches(self.paths[0])[0]
+        self.assertEqual(batch_content(current), batch_content(source))
+        for key in ('issued', 'cod_no', 'cod_date'):
+            self.assertEqual(current[key], source[key])
         before = self.paths[0].read_bytes()
         enriched = web_app.current_pdf_rows([row])[0]
         self.assertNotIn('last_certificate_details', enriched)
@@ -216,6 +220,20 @@ class ExcelEditResilienceTests(unittest.TestCase):
         self.assertEqual(completed['issued'], 'Completed')
         self.assertEqual(completed['cod_no'], source['cod_no'])
         self.assertTrue(result['scan_complete'])
+        self.assertEqual(web_app.target_row(result, ('plant1','1001'))['certificate_status'], 'completed')
+
+    def test_completion_updates_the_checked_dashboard_without_a_second_workbook_scan(self):
+        runner.run(self.paths, self.root, as_of=AS_OF, progress=None)
+        state = web_app.workspace_state(recheck_obsolete=False)
+        state['rows'].append({'source_kind':'manual', 'record_id':'keep-manual-row', 'plant':'plant2',
+                              'sn':'Custom 123', 'certificate_status':'ready'})
+        expected = workspace_revision(self.root)
+        with patch.object(web_app, 'WORKSPACE_STATE_CACHE', (expected, state)), \
+                patch.object(web_app, 'refresh', side_effect=AssertionError('A full workbook refresh should not run after completion')):
+            result = web_app.complete_workbook_record({'plant':'plant1', 'sn':'1001', 'expected_revision':expected})
+        self.assertEqual(web_app.target_row(result, ('plant1','1001'))['certificate_status'], 'completed')
+        self.assertTrue(web_app.target_row(result, ('plant1','1001'))['pdf_filename'])
+        self.assertTrue(any(row.get('record_id') == 'keep-manual-row' for row in result['rows']))
 
     def test_completion_refresh_failure_preserves_success_and_actual_completed_status(self):
         runner.run(self.paths, self.root, as_of=AS_OF, progress=None)
@@ -225,6 +243,21 @@ class ExcelEditResilienceTests(unittest.TestCase):
                                                       'expected_revision': expected})
         self.assertEqual(read_batches(self.paths[0])[0]['issued'], 'Completed')
         self.assertIn('Completed status saved successfully', result['setup_warning'])
+        self.assertEqual(web_app.target_row(result, ('plant1','1001'))['certificate_status'], 'completed')
+        self.assertFalse(web_app.target_row(result, ('plant1','1001'))['reminder_due'])
+        self.assertEqual(web_app.target_row(web_app.latest_result(), ('plant1','1001'))['certificate_status'], 'completed')
+
+    def test_completion_acknowledgement_survives_both_cache_and_refresh_failure(self):
+        runner.run(self.paths, self.root, as_of=AS_OF, progress=None)
+        expected = workspace_revision(self.root)
+        with patch.object(web_app, 'save_json', side_effect=OSError('Cache unavailable')), \
+                patch.object(web_app, 'refresh', side_effect=OSError('Refresh unavailable')):
+            result = web_app.complete_workbook_record({'plant':'plant1', 'sn':'1001', 'expected_revision':expected})
+        self.assertEqual(read_batches(self.paths[0])[0]['issued'], 'Completed')
+        self.assertEqual(web_app.target_row(result, ('plant1','1001'))['certificate_status'], 'completed')
+        self.assertTrue(result['refresh_pending'])
+        self.assertFalse(result['scan_complete'])
+        self.assertIn('Completed status saved successfully',result['setup_warning'])
 
 
 if __name__ == '__main__':

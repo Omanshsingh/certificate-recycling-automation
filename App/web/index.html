@@ -6,6 +6,8 @@
   <meta name="theme-color" content="#f5f5f5">
   <title>Certificates · Ecoreco</title>
   <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/analytics.css">
+  <script src="/analytics.js" defer></script>
   <script src="/app.js" defer></script>
 </head>
 <body>
@@ -31,7 +33,28 @@
         </div>
       </section>
 
-      <nav class="workspace-tabs" aria-label="Certificate workspace"><button type="button" id="view-records" aria-pressed="true" aria-controls="records-workspace">Companies</button><button type="button" id="view-files" aria-pressed="false" aria-controls="folder-inventory">Saved certificates <span id="saved-total">0</span></button><button type="button" class="text-button workspace-help" id="open-help" aria-haspopup="dialog">How to use</button></nav>
+      <nav class="workspace-tabs" aria-label="Certificate workspace"><button type="button" id="view-analytics" aria-pressed="false" aria-controls="analytics-workspace">Dashboard</button><button type="button" id="view-records" aria-pressed="true" aria-controls="records-workspace">Companies</button><button type="button" id="view-files" aria-pressed="false" aria-controls="folder-inventory">Saved certificates <span id="saved-total">0</span></button></nav>
+      <section id="analytics-workspace" class="analytics" aria-label="Certificate dashboard" hidden>
+        <div class="analytics-toolbar"><div><h2>Certificate activity</h2><p id="analytics-range"></p></div><div class="analytics-filters"><label><span class="visually-hidden">Plant</span><select id="analytics-plant"><option value="all">All records</option><option value="plant1">Plant 1</option><option value="plant2">Plant 2</option></select></label><label><span class="visually-hidden">Dates</span><select id="analytics-period"><option value="today">Today</option><option value="week">Last 7 days</option><option value="month" selected>This month</option><option value="quarter">Last 90 days</option></select></label></div></div>
+        <div id="analytics-message" class="analytics-message" role="status" aria-live="polite">Loading dashboard…</div>
+        <div id="analytics-content" hidden>
+          <div class="analytics-numbers">
+            <article class="analytics-number-card analytics-main-card"><h3 id="analytics-created-label">Certificates created this month</h3><strong id="analytics-created">0</strong><p id="analytics-comparison"></p></article>
+            <article class="analytics-number-card"><h3>Certificates created today</h3><strong id="analytics-today">0</strong><p><b id="analytics-week">0</b> this week <span class="analytics-separator">·</span> Mon–today</p></article>
+            <article class="analytics-number-card"><h3>Client entries</h3><strong id="analytics-received">0</strong><p id="analytics-received-period">This month · By received date</p></article>
+            <article class="analytics-number-card"><h3>Typical time to create</h3><strong class="analytics-time" id="analytics-turnaround">—</strong><p>From inward to PDF <span id="analytics-time-sample"></span></p></article>
+          </div>
+          <div class="analytics-chart-row">
+            <section class="analytics-panel analytics-trend"><div class="analytics-panel-heading"><h2>Certificates created</h2><span>Each day</span></div><div id="analytics-chart" class="analytics-chart" tabindex="0" role="group" aria-label="Certificates created each day. Use left and right arrow keys to read each date."></div><p id="analytics-chart-detail" class="analytics-chart-detail" aria-live="polite"></p></section>
+            <section class="analytics-panel analytics-types"><div class="analytics-panel-heading"><h2>What was created</h2><span id="analytics-type-total"></span></div><div id="analytics-types" class="analytics-bars"></div></section>
+          </div>
+          <div class="analytics-bottom-row">
+            <section class="analytics-panel"><div class="analytics-panel-heading"><h2>By plant</h2><span>Certificates created</span></div><div id="analytics-plants" class="analytics-plants"></div><p id="analytics-unassigned" class="analytics-unassigned" hidden></p></section>
+            <section class="analytics-panel"><div class="analytics-panel-heading"><h2>Needs attention</h2><span>All dates</span></div><div class="analytics-queue" id="analytics-queue"></div><button type="button" id="analytics-overdue" class="analytics-overdue"><span><strong id="analytics-overdue-count">0</strong> waiting over 30 days</span><span aria-hidden="true">View →</span></button></section>
+          </div>
+          <p id="analytics-updated" class="analytics-updated" role="status"></p>
+        </div>
+      </section>
       <section id="records-workspace" aria-label="Companies and certificates">
       <p class="form-hint" id="workbook-maintenance-note" role="status" hidden></p>
       <section class="workbook-issues" id="workbook-issues" aria-label="Excel files need attention" hidden>
@@ -48,29 +71,34 @@
         <div class="toolbar">
           <label class="search-box"><span class="search-icon">⌕</span><input id="search" type="search" aria-label="Find a company" placeholder="Find a company or certificate number" autocomplete="off"></label>
           <div class="toolbar-filters">
-            <label class="select-wrap"><span class="visually-hidden">Plant filter</span><select id="plant-filter"><option value="all">All plants</option><option value="plant1">Plant 1</option><option value="plant2">Plant 2</option></select><span class="select-chevron">⌄</span></label>
+            <label class="select-wrap"><span class="visually-hidden">Plant filter</span><select id="plant-filter"><option value="all">All records</option><option value="plant1">Plant 1</option><option value="plant2">Plant 2</option><option value="local">App only (no plant)</option></select><span class="select-chevron">⌄</span></label>
+            <button type="button" class="button button-quiet filter-toggle" id="open-record-filters" popovertarget="more-filters" aria-label="Filters" title="Filters" aria-expanded="false" aria-controls="more-filters"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 5h18l-7 8v6l-4 2v-8z"/></svg><span class="filter-active-count" id="record-filter-count" hidden></span></button>
           </div>
         </div>
         <div class="quick-views" id="status-filters" aria-label="Status filters">
-          <button type="button" data-quick-status="all" aria-pressed="true">All <span class="status-count" id="count-all">—</span></button>
+          <button type="button" data-quick-status="all" aria-pressed="true">All statuses <span class="status-count" id="count-all">—</span></button>
           <button type="button" data-quick-status="ready" aria-pressed="false">Ready <span class="status-count" id="count-ready">—</span></button>
           <button type="button" data-quick-status="needs_attention" aria-pressed="false">Needs attention <span class="status-count" id="count-attention">—</span></button>
           <button type="button" data-filter-status="generated" aria-pressed="false">Generated <span class="status-count" id="count-generated">—</span></button>
-          <button type="button" data-filter-status="generated_manual" aria-pressed="false">Generated Manual <span class="status-count" id="count-generated-manual">—</span></button>
+          <button type="button" data-filter-status="generated_manual" aria-pressed="false">Generated Externally <span class="status-count" id="count-generated-externally">—</span></button>
           <button type="button" data-filter-status="completed" aria-pressed="false">Completed <span class="status-count" id="count-completed">—</span></button>
           <button type="button" data-filter-status="blank" aria-pressed="false">No status selected <span class="status-count" id="count-blank">—</span></button>
           <button type="button" data-filter-status="na" aria-pressed="false">N/A <span class="status-count" id="count-na">—</span></button>
+          <button type="button" data-quick-status="details_to_finish" aria-pressed="false">Details to finish <span class="status-count" id="count-details-to-finish">—</span></button>
           <span id="count-overdue" hidden></span>
         </div>
+        <label class="attention-only-filter" id="attention-status-filter" hidden><input type="checkbox" id="attention-only"><span>Only show rows with “Needs attention” in Status</span></label>
         <input type="hidden" id="status-filter" value="all">
-        <div class="extra-filters" id="more-filters"><h3 class="filter-section-title">More filters</h3><div class="filter-fields">
-          <label class="field"><span>Certificate type</span><select id="template-filter" aria-label="Certificate type"><option value="all">All types</option><option value="standard">Standard</option><option value="sita">Sita International</option><option value="siemens">Siemens Medical</option><option value="destruction">Secured Data Destruction</option></select></label>
-          <button type="button" class="text-button" id="clear-filters">Clear filters</button>
-        </div></div>
+        <div class="record-filter-popover" id="more-filters" popover="auto" role="region" aria-label="Company filters"><div class="record-filter-heading"><h3>Filters</h3><button type="button" class="icon-button" popovertarget="more-filters" popovertargetaction="hide" aria-label="Close filters">×</button></div><div class="filter-fields">
+          <label class="field"><span>Certificate type</span><select id="template-filter" aria-label="Certificate type"><option value="all">All types</option><option value="standard">Recycling</option><option value="destruction">Data Destruction</option><option value="siemens">Medical</option><option value="sita">International</option></select></label>
+          <label class="field"><span>Find SN</span><input type="search" id="serial-filter" placeholder="Enter serial number"></label>
+          <label class="field"><span>Received date</span><input type="text" data-date-input="true" inputmode="numeric" placeholder="DD/MM/YY" id="received-date-filter"></label>
+          <label class="field"><span>Sort by</span><select id="company-sort"><option value="received-oldest">Received date: oldest first</option><option value="received-newest">Received date: newest first</option><option value="serial">Serial number</option><option value="company">Company A–Z</option></select></label>
+        </div><div class="record-filter-footer"><button type="button" class="text-button" id="clear-filters">Clear filters</button><button type="button" class="button button-primary" popovertarget="more-filters" popovertargetaction="hide">Done</button></div></div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Company</th><th>Plant</th><th>Received</th><th>Status</th><th>Next step</th></tr></thead>
-            <tbody id="queue-body"><tr><td colspan="5"><div class="loading-state"><span class="spinner"></span>Reading Excel…</div></td></tr></tbody>
+            <thead><tr><th>SN</th><th>Company</th><th>Plant</th><th>Received</th><th>Status</th><th>Next step</th></tr></thead>
+            <tbody id="queue-body"><tr><td colspan="6"><div class="loading-state"><span class="spinner"></span>Reading Excel…</div></td></tr></tbody>
           </table>
         </div>
         <footer class="table-footer"><span id="visible-count">—</span><div class="page-controls" id="page-controls" hidden><button type="button" class="button button-quiet" id="previous-page">Previous</button><span id="page-count"></span><button type="button" class="button button-quiet" id="next-page">Next</button></div><button class="text-button" id="reset-record-filters" hidden>Clear search &amp; filters</button></footer>
@@ -79,7 +107,7 @@
       <section class="folder-inventory" id="folder-inventory" aria-label="Saved certificates" hidden>
         <div class="files-heading"><h2 id="folder-inventory-summary">Saved certificates</h2></div>
         <p id="folder-inventory-note">PDFs currently in your certificate folder.</p>
-        <div class="files-toolbar"><label class="search-box"><span class="search-icon" aria-hidden="true">⌕</span><input type="search" id="saved-file-search" aria-label="Find a saved PDF" placeholder="Search company, certificate number or reference"></label><label class="select-wrap"><span class="visually-hidden">Saved PDF plant</span><select id="saved-plant-filter"><option value="all">All plants</option><option value="plant1">Plant 1</option><option value="plant2">Plant 2</option><option value="unknown">Plant not identified</option></select><span class="select-chevron" aria-hidden="true">⌄</span></label><label class="select-wrap"><span class="visually-hidden">PDF order</span><select id="saved-file-sort"><option value="newest">Newest first</option><option value="company">Company A–Z</option><option value="number">Certificate number</option></select><span class="select-chevron" aria-hidden="true">⌄</span></label></div>
+        <div class="files-toolbar"><label class="search-box"><span class="search-icon" aria-hidden="true">⌕</span><input type="search" id="saved-file-search" aria-label="Find a saved PDF" placeholder="Search company, certificate number or reference"></label><label class="select-wrap"><span class="visually-hidden">Saved PDF plant</span><select id="saved-plant-filter"><option value="all">All records</option><option value="plant1">Plant 1</option><option value="plant2">Plant 2</option><option value="local">App only (no plant)</option><option value="unknown">Plant not identified</option></select><span class="select-chevron" aria-hidden="true">⌄</span></label><label class="select-wrap"><span class="visually-hidden">Certificate type</span><select id="saved-template-filter" aria-label="Certificate type"><option value="all">All types</option><option value="standard">Recycling</option><option value="destruction">Data Destruction</option><option value="siemens">Medical</option><option value="sita">International</option></select><span class="select-chevron" aria-hidden="true">⌄</span></label><label class="select-wrap"><span class="visually-hidden">PDF order</span><select id="saved-file-sort"><option value="newest">Newest first</option><option value="company">Company A–Z</option><option value="number">Certificate number</option></select><span class="select-chevron" aria-hidden="true">⌄</span></label></div>
         <div id="folder-inventory-warnings" role="status"></div>
         <ul class="saved-files" id="folder-inventory-files"></ul>
         <div class="saved-files-footer">
@@ -92,23 +120,27 @@
     </main>
   </div>
 
-  <dialog class="modal" id="help-modal" aria-labelledby="help-title"><div class="modal-header"><div><h2 id="help-title">Three simple steps</h2><p>You usually do not need to change any settings.</p></div><button type="button" class="icon-button" data-close="help-modal" aria-label="Close help">×</button></div><ol class="quick-help"><li><strong>Find the company.</strong> Search its name or certificate number. Choose the plant if needed.</li><li><strong>Check the preview.</strong> Details come from Excel. Choose the certificate type on this page; Excel details stay locked for first generation.</li><li><strong>Create PDF.</strong> The app chooses the COD, saves the PDF and updates the correct record.</li></ol><p class="dialog-note">Company not in Excel? Choose New certificate. Saved certificates opens certificates already in your folder. After generating, Edit certificate opens corrections directly. Choose whether to update Excel when saving. For a requested data destruction certificate, use Data destruction beside the inward. For clients without an inward, choose New certificate and Secured Data Destruction. After sending a PDF yourself, mark it Completed.</p><div class="modal-footer"><button type="button" class="button button-primary" data-close="help-modal">Got it</button></div></dialog>
-
   <dialog class="modal" id="connection-modal" aria-labelledby="connection-title"><div class="modal-header"><div><h2 id="connection-title">Connection lost</h2><p>Your edits and saved files are kept. The app is not responding.</p></div></div><p class="dialog-note">Check the connection, or reopen Prepare Certificates. Before repeating a creation, check Saved certificates: the PDF may already have been saved.</p><div class="modal-footer"><div><button type="button" class="button button-quiet" data-close="connection-modal">Return to my edits</button><button type="button" class="button button-primary" id="dialog-reconnect">Check connection</button></div></div></dialog>
 
   <dialog class="modal" id="bulk-generation-modal" aria-labelledby="bulk-title">
     <div class="modal-header"><div><h2 id="bulk-title">Create several certificates</h2><p id="bulk-description"></p></div><button type="button" class="icon-button" data-close="bulk-generation-modal" aria-label="Close">×</button></div>
+    <div class="bulk-content">
+    <div class="bulk-search"><label class="search-box"><span class="search-icon" aria-hidden="true">⌕</span><input type="search" id="bulk-search" aria-label="Find clients to create certificates" placeholder="Search company, SN, reference or city" autocomplete="off"></label><button type="button" class="text-button" id="bulk-clear-search" hidden>Clear search</button></div>
     <div class="settings-fields" id="bulk-numbering">
       <label class="field" id="bulk-start-field" hidden><span>Starting COD number</span><input id="bulk-start-cod" type="text" inputmode="numeric" pattern="[0-9]{1,12}" maxlength="12" autocomplete="off" aria-describedby="bulk-cod-hint"><small id="bulk-cod-hint">No previous COD found. Enter the number to start from.</small></label>
       <p class="dialog-note" id="bulk-next-cod" hidden></p>
     </div>
-    <ul class="batch-rules"><li>Creates all Ready Excel rows in the selected plant, not just search results.</li><li>Empty statuses and N/A rows are skipped.</li><li>You will review any warnings before creation.</li></ul><details class="dialog-extras"><summary>Which filters apply?</summary><p>Only the plant selection applies. Search, status and certificate-type filters do not narrow this batch. Ready rows with warnings are included, but require your confirmation.</p></details>
-    <div class="modal-footer"><div><button type="button" class="button button-quiet" data-close="bulk-generation-modal">Cancel</button><button type="button" class="button button-primary" id="generate-all">Create Ready PDFs <span id="generate-count"></span></button></div></div>
+    <div class="bulk-list-heading"><label class="bulk-select"><input type="checkbox" id="bulk-select-all"><span id="bulk-select-label">Select all</span></label><span id="bulk-visible-count" role="status" aria-live="polite"></span></div>
+    <div id="bulk-choices" class="bulk-choices" aria-label="Choose certificates"></div>
+    <div class="bulk-empty" id="bulk-empty" hidden><strong>No clients found</strong><p>Try another name, SN, reference or city.</p></div>
+    </div>
+    <div class="modal-footer"><div class="bulk-selection-copy"><strong id="bulk-selected-count" role="status" aria-live="polite">0 selected</strong><span id="bulk-selection-note">Only checked clients will get a PDF.</span></div><div><button type="button" class="button button-quiet" data-close="bulk-generation-modal">Cancel</button><button type="button" class="button button-primary" id="generate-all" disabled>Create PDFs <span id="generate-count"></span></button></div></div>
   </dialog>
 
   <dialog class="modal saved-file-modal" id="saved-file-modal">
     <div class="modal-header"><div><h2>PDF file details</h2><p id="saved-file-name"></p></div><button type="button" class="icon-button" data-close="saved-file-modal" aria-label="Close">×</button></div>
     <dl class="saved-file-facts" id="saved-file-facts"></dl>
+    <section class="saved-type-choice" id="saved-type-choice" hidden><label class="field"><span>Choose the certificate type</span><select id="saved-type-select"><option value="">Choose a type</option><option value="standard">Recycling</option><option value="destruction">Data Destruction</option><option value="siemens">Medical</option><option value="sita">International</option></select></label><button type="button" class="button button-quiet" id="save-saved-type">Save type</button><p id="saved-type-status" role="status" aria-live="polite"></p></section>
     <ul class="issue-list saved-file-warnings" id="saved-file-warnings" aria-label="File issues" hidden></ul>
     <div class="modal-footer"><div><button type="button" class="button button-quiet" data-close="saved-file-modal">Close</button><button type="button" class="button button-quiet" id="saved-file-excel" hidden>Open in Excel</button><button type="button" class="button button-primary" id="saved-file-open" hidden>Open PDF</button></div></div>
   </dialog>
@@ -125,9 +157,15 @@
       <p class="details-error" id="details-error" role="alert" hidden></p>
       <div class="editor-workspace">
       <section class="editor-fields" id="editor-fields" aria-label="Edit certificate details">
-      <div class="editor-fields-heading"><h3 class="editor-step" id="editor-mode-title">Check the certificate</h3><button type="button" class="button button-quiet" id="edit-pdf-details" aria-pressed="false">✎ Edit PDF details</button><button type="button" id="finish-editing" hidden>Check preview</button><button type="button" id="change-details" hidden>Change details</button></div>
-      <div class="form-grid">
-        <label class="field"><span>Certificate type</span><select name="certificate_type"><option value="standard">Standard</option><option value="sita">Sita International</option><option value="siemens">Siemens Medical</option><option value="destruction">Secured Data Destruction</option></select></label>
+      <div class="editor-fields-heading"><h3 class="editor-step" id="editor-mode-title">Check the certificate</h3><button type="button" class="button button-quiet" id="edit-pdf-details" aria-pressed="false">✎ Edit details</button><button type="button" id="finish-editing" hidden>Check preview</button><button type="button" id="change-details" hidden>Change details</button></div>
+      <section class="editor-checks" id="editor-checks" hidden><h4 class="issue-heading" id="preview-warnings-title" hidden></h4><ul class="preview-warnings" id="preview-warnings" aria-label="Things to check before creating" hidden></ul></section>
+      <div class="certificate-selector">
+        <label class="field"><span>Certificate type</span><select name="certificate_type"><option value="standard">Recycling</option><option value="destruction">Data Destruction</option><option value="siemens">Medical</option><option value="sita">International</option></select></label>
+        <p class="certificate-selection-status" id="certificate-selection-status" role="status" aria-live="polite"></p>
+      <section class="destruction-choice" id="destruction-needed-card" aria-label="Data Destruction request" hidden>
+        <label class="destruction-choice-label" for="destruction-needed"><input id="destruction-needed" name="data_destruction_needed" type="checkbox"><span><strong id="destruction-needed-label">Data Destruction also needed</strong></span></label>
+        <div class="destruction-choice-footer"><p id="destruction-choice-status" role="status" aria-live="polite"></p><button type="button" class="button button-quiet" id="open-companion-certificate" hidden>Open Data Destruction (HDD)</button></div>
+      </section>
       </div>
       <div class="form-grid" id="single-start-cod-section" hidden>
         <label class="field"><span>Starting COD number</span><input name="starting_cod" id="single-start-cod" type="text" inputmode="numeric" pattern="[0-9]{1,12}" maxlength="12" placeholder="e.g. 0302" autocomplete="off" aria-describedby="single-start-cod-hint"><small id="single-start-cod-hint">No previous COD found. Enter the number to start from.</small></label>
@@ -135,7 +173,7 @@
       <section class="editor-summary" id="editor-summary" aria-label="Details from Excel" hidden>
         <dl class="editor-facts" id="editor-facts"></dl>
         <div class="editor-materials" id="editor-materials"></div>
-        <p class="form-hint" id="editor-summary-note">Excel details are read-only for first generation. The preview COD number is not reserved until you generate.</p>
+        <p class="form-hint" id="editor-summary-note">Review the details and choose whether to update Excel when saving.</p>
         <p class="form-hint" id="editor-source-note" hidden></p>
       </section>
       <div class="form-grid template-editor" id="template-editor"></div>
@@ -143,11 +181,11 @@
         <section class="form-disclosure" id="record-options"><h3>Where details are saved</h3><div class="form-grid">
         <label class="field field-half"><span>Save details in</span><select name="source_kind"><option value="workbook">Plant Excel</option><option value="manual">This app only (no Excel row)</option></select></label>
         <label class="field field-half"><span id="details-plant-label">Plant workbook <b>*</b></span><div class="field-inline"><select name="plant" required><option value="plant1">Plant 1</option><option value="plant2">Plant 2</option></select><button type="button" class="browse-button" id="pick-workbook">Choose in Explorer</button></div></label>
-        <label class="field field-half"><span>Serial Number <b id="case-required">*</b><small id="case-optional" hidden>Optional</small></span><input name="case_id" required maxlength="100" placeholder="e.g. 4018"><small id="case-id-hint"></small></label>
+        <label class="field field-half"><span>SN <b id="case-required">*</b><small id="case-optional" hidden>Optional</small></span><input name="case_id" required maxlength="100" placeholder="e.g. 4018"><small id="case-id-hint"></small></label>
         </div></section>
         <label class="field"><span>Company name</span><input name="supplier" maxlength="500" placeholder="Company name"></label>
         <label class="field field-half"><span>City</span><input name="location" maxlength="500" placeholder="City"></label>
-        <label class="field field-half"><span>Date material was received</span><input name="inward_date" type="date"></label>
+        <label class="field field-half"><span>Date material was received</span><input name="inward_date" type="text" data-date-input="true" inputmode="numeric" placeholder="DD/MM/YY"></label>
         <div id="edit-scope-field" hidden><input type="hidden" name="edit_scope" value="certificate_only"><small id="edit-scope-hint"></small></div>
         <section class="weight-section" id="weight-options"><h3 id="weight-options-title">Certificate Weight</h3><p id="current-weight" class="current-weight" hidden></p>
         <div id="certificate-weight-choice" hidden><input name="use_certificate_weight" type="checkbox" hidden></div>
@@ -160,26 +198,40 @@
         <button type="button" class="button button-quiet add-material" id="add-material">+ Add another material</button>
         </section>
         <label class="field field-half"><span>Form 6 No. <small id="form6-hint">Expected</small></span><input name="form6" maxlength="100" placeholder="Manifest number"></label>
-        <label class="field field-half"><span>Reference No. <small>Optional</small></span><input name="reference" maxlength="100" placeholder="Reference number"></label>
+        <label class="field field-half"><span>Reference No. <b>*</b></span><input name="reference" required pattern=".*\S.*" maxlength="100" placeholder="Enter reference manually"><small>Required before creating a certificate. The same reference can be used again. It is never generated automatically.</small></label>
         <section class="form-disclosure"><h3>Certificate number and date</h3><div class="form-grid">
-        <label class="field field-half"><span>Certificate number (COD)</span><input name="cod_no" maxlength="100" placeholder="Assigned automatically" readonly></label>
-        <label class="field field-half"><span>Certificate date</span><input name="cod_date" type="date" readonly></label>
+        <label class="field field-half"><span id="certificate-number-label">Certificate number (COD)</span><input name="cod_no" maxlength="100" placeholder="Assigned automatically" readonly></label>
+        <label class="field field-half"><span>Certificate date</span><input name="cod_date" type="text" data-date-input="true" inputmode="numeric" placeholder="DD/MM/YY" readonly></label>
         </div></section>
       </div>
+      <section class="editor-inward-details" id="editor-inward-details" aria-label="Inward details" hidden>
+        <h3>Inward details</h3>
+        <div class="form-grid">
+          <label class="field field-half"><span>Comments</span><textarea name="comments" rows="3" maxlength="1000"></textarea></label>
+          <label class="field field-half"><span>Transporter / vehicle details</span><input name="transporter_details" maxlength="1000"></label>
+          <label class="field field-half"><span>Docket no. / vehicle no.</span><input name="docket_vehicle_no" maxlength="500"></label>
+          <label class="field field-half"><span>Weight slip / scale weight</span><input name="weight_slip_scale" maxlength="500"></label>
+        </div>
+      </section>
       <p class="form-hint" id="edit-items-hint" hidden></p>
       <section class="annexure-section" aria-label="Certificate annexure"><div><p>Attach a PDF list (optional)</p><p id="annexure-name" hidden></p></div><div class="annexure-actions"><button type="button" class="button button-quiet" id="pick-annexure">Choose PDF list</button><button type="button" class="button button-quiet" id="remove-annexure" hidden>Remove list</button></div></section>
       <p class="form-hint" id="template-status" role="status" hidden></p>
-      <p class="autosave-note" id="working-draft-status" role="status">Edits are saved automatically on this computer. Excel changes only when you create the PDF.</p><details class="form-disclosure" id="draft-options" hidden><summary>Save for later</summary><p>Keep this certificate in the company list without creating a PDF yet.</p><div class="draft-actions"><button type="button" class="button button-quiet" id="keep-working-draft" hidden>Keep these edits</button><button type="button" class="button button-quiet" id="save-draft" hidden>Save for later</button></div></details>
+      <p class="autosave-note" id="working-draft-status" role="status">Edits are saved on this computer. You will be asked before Excel is updated.</p><details class="form-disclosure" id="draft-options" hidden><summary>Save for later</summary><p>Keep this certificate in the company list without creating a PDF yet.</p><div class="draft-actions"><button type="button" class="button button-quiet" id="keep-working-draft" hidden>Keep these edits</button><button type="button" class="button button-quiet" id="save-draft" hidden>Save for later</button></div></details>
       </section>
       <aside class="editor-review" aria-label="Review changes and preview">
       <section class="certificate-preview" aria-label="Certificate PDF preview">
         <div class="preview-heading"><div><h3>Certificate preview</h3><p id="preview-status" role="status" aria-live="polite">Preview your certificate before creating the final PDF.</p></div><button type="button" class="button button-quiet" id="preview-details">Preview PDF</button></div>
         <p class="preview-number" id="preview-number" hidden></p>
-        <h4 class="issue-heading" id="preview-warnings-title" hidden></h4>
-        <ul class="preview-warnings" id="preview-warnings" aria-label="Things to check before creating" hidden></ul>
         <div id="preview-document" hidden>
           <img id="preview-image" alt="First page of the certificate showing the company, certificate details and printed weight" hidden>
           <div id="preview-detail-images"></div>
+          <section id="preview-attachment" class="preview-attachment" aria-label="Attached PDF preview" hidden>
+            <h4>Attached PDF</h4><p id="preview-attachment-name"></p>
+            <div class="preview-attachment-controls"><button type="button" class="button button-quiet" id="preview-attachment-previous">Previous</button><span id="preview-attachment-count" role="status" aria-live="polite"></span><button type="button" class="button button-quiet" id="preview-attachment-next">Next</button></div>
+            <p id="preview-attachment-status" role="status" aria-live="polite"></p>
+            <button type="button" class="text-button" id="preview-attachment-retry" hidden>Try this page again</button>
+            <div id="preview-attachment-image"></div>
+          </section>
           <p class="form-hint" id="preview-image-note" hidden>First-page image is unavailable. Open the full PDF to check the certificate and any attached list.</p>
           <div class="preview-full-actions"><button type="button" class="text-button" id="preview-full-pdf" aria-controls="preview-frame" aria-expanded="false">Enlarge preview</button><a class="text-button" id="preview-link" target="_blank" rel="noopener">Open full preview in browser ↗</a></div>
           <iframe id="preview-frame" title="Full certificate PDF including attached list" hidden></iframe>
@@ -190,13 +242,13 @@
       </section>
       </aside>
       </div>
-      <div class="modal-footer"><p class="required-note creation-destination" id="change-scope"></p><div><button type="button" class="button button-quiet" data-close="details-modal">Cancel</button><button type="submit" class="button button-primary" id="save-details">Create PDF</button></div></div>
+      <div class="modal-footer"><p class="required-note creation-destination" id="change-scope"></p><div><button type="button" class="button button-quiet" data-close="details-modal">Cancel</button><button type="button" class="button button-quiet" id="save-inward-details" hidden>Save to Excel</button><button type="submit" class="button button-primary" id="save-details">Create PDF</button></div></div>
     </form>
   </dialog>
 
   <dialog class="modal" id="excel-save-modal" aria-labelledby="excel-save-title">
-    <div class="modal-header"><div><h2 id="excel-save-title">Also update this inward in Excel?</h2><p>The corrected PDF will replace the current certificate. Choose whether to update this inward's details in Excel too. Other inwards stay unchanged.</p></div><button type="button" class="icon-button" data-close="excel-save-modal" aria-label="Cancel saving">×</button></div>
-    <div class="excel-save-changes"><dl id="excel-save-change-list"></dl><p>Both choices record the certificate number, date and Generated status. A backup is kept before updating Excel.</p></div>
+    <div class="modal-header"><div><h2 id="excel-save-title">Also update these details in Excel?</h2><p id="excel-save-description">Choose Yes to save your changes in Excel too, or No to use them only on this PDF.</p></div><button type="button" class="icon-button" data-close="excel-save-modal" aria-label="Cancel saving">×</button></div>
+    <div class="excel-save-changes"><dl id="excel-save-change-list"></dl><p id="excel-save-note">Both choices record the certificate number, date and Generated status. A backup is kept before updating Excel.</p></div>
     <div class="modal-footer"><button type="button" class="button button-quiet" data-close="excel-save-modal">Cancel</button><div><button type="button" class="button button-quiet" id="excel-save-no">No, keep Excel details</button><button type="button" class="button button-primary" id="excel-save-yes">Yes, update Excel</button></div></div>
   </dialog>
 
@@ -229,10 +281,33 @@
           <details><summary>Backup health details</summary><pre id="backup-health">No health details available.</pre></details>
         </details>
         <details class="history-section" id="history-section"><summary>Recent certificate activity</summary><p>The latest 50 creation records, including edited fields and accepted warnings.</p><button type="button" class="button button-quiet" id="reload-history">Refresh activity</button><p id="history-status" role="status"></p><ul class="history-list" id="history-list"></ul></details>
-        <section class="history-cleanup"><h3>Clear old history</h3><p>Remove old app records and deleted-PDF links. Current Excel files, PDFs and their active records stay.</p><button type="button" class="button button-danger" id="clear-old-history">Clear old history</button><p id="history-cleanup-status" role="status" aria-live="polite"></p></section>
+        <details class="technical-details"><summary>Advanced</summary><section class="history-cleanup"><h3>Delete mistaken entries</h3><p>Search ungenerated entries and review the inwards to remove. Generated and Completed certificates cannot be deleted. Recovery copies are kept.</p><button type="button" class="button button-danger" id="open-entry-deletion">Search entries to delete</button></section></details>
       </div>
       <div class="modal-footer"><span class="required-note" id="settings-status" role="status"></span><div><button type="button" class="button button-quiet" data-close="settings-modal">Cancel</button><button type="submit" class="button button-primary" id="save-settings">Save</button></div></div>
     </form>
+  </dialog>
+
+  <dialog class="modal remove-inward-modal" id="remove-inward-modal" aria-labelledby="remove-inward-title" aria-describedby="remove-inward-message">
+    <div class="modal-header"><div><h2 id="remove-inward-title">Remove this inward from Excel?</h2><p id="remove-inward-message">Use this for an inward entered by mistake. It deletes the inward row and its materials from Excel; it does not delete a certificate. This is available only before a certificate is generated.</p></div><button type="button" class="icon-button" data-close="remove-inward-modal" aria-label="Keep entry and close">×</button></div>
+    <div class="remove-inward-content"><dl id="remove-inward-facts"></dl><label class="remove-inward-check"><input type="checkbox" id="remove-inward-checked"><span>I checked the company, plant and materials above.</span></label><p id="remove-inward-error" role="alert" hidden></p></div>
+    <div class="modal-footer"><div><button type="button" class="button button-quiet" id="keep-inward" data-close="remove-inward-modal" autofocus>Keep entry</button><button type="button" class="button button-danger" id="confirm-remove-inward" disabled>Remove inward row</button></div></div>
+  </dialog>
+
+  <dialog class="modal entry-deletion-modal" id="entry-deletion-modal" aria-labelledby="entry-deletion-title">
+    <div class="modal-header"><div><h2 id="entry-deletion-title">Delete mistaken entries</h2><p>Search and choose the entries entered by mistake. Completed entries are included. Review before deleting.</p></div><button type="button" class="icon-button" data-close="entry-deletion-modal" aria-label="Cancel deletion">×</button></div>
+    <div class="bulk-content">
+      <div id="entry-delete-selection">
+        <div class="bulk-search"><label class="search-box"><span class="search-icon" aria-hidden="true">⌕</span><input type="search" id="entry-delete-search" aria-label="Find entries to delete" placeholder="Search company, SN, COD, reference, Form 6 or city" autocomplete="off"></label><button type="button" class="text-button" id="entry-delete-clear" hidden>Clear search</button></div>
+        <p id="entry-delete-shown" role="status" aria-live="polite"></p>
+        <div id="entry-delete-choices" class="bulk-choices" aria-label="Choose mistaken entries"></div>
+        <p id="entry-delete-empty" hidden>No entries found. Try another company, SN or COD.</p>
+        <label class="remove-inward-check"><input type="checkbox" id="entry-delete-hdd"><span>Also delete linked HDD requests that have not been generated.</span></label>
+        <p class="dialog-note">If unchecked, linked HDD records are kept as standalone records. Only checked entries will be deleted.</p>
+      </div>
+      <div id="entry-delete-review" hidden><h3>Review what will be deleted</h3><div id="entry-delete-review-list"></div><p id="entry-delete-kept-hdd"></p><p class="dialog-note">Only entries with no generated certificate can be deleted. Their inward rows and materials are removed, remaining rows and serial numbers close up, and a recovery copy is kept.</p><label class="remove-inward-check"><input type="checkbox" id="entry-delete-checked"><span>I checked these entries and PDFs and want to delete them.</span></label></div>
+      <p id="entry-delete-error" class="form-error" role="alert" hidden></p>
+    </div>
+    <div class="modal-footer"><span id="entry-delete-selected" role="status" aria-live="polite">0 selected</span><div><button type="button" class="button button-quiet" data-close="entry-deletion-modal" id="entry-delete-cancel">Cancel</button><button type="button" class="button button-quiet" id="entry-delete-back" hidden>Change selection</button><button type="button" class="button button-primary" id="entry-delete-preview" disabled>Review selected entries</button><button type="button" class="button button-danger" id="entry-delete-confirm" hidden disabled>Delete reviewed entries</button></div></div>
   </dialog>
 
   <dialog class="modal" id="action-confirmation-modal" aria-labelledby="action-confirmation-title" aria-describedby="action-confirmation-message">
@@ -267,25 +342,25 @@
     <form id="add-client-form">
       <div class="modal-header"><div><h2 id="add-client-title">Add client to Excel</h2></div><button type="button" class="icon-button" data-close="add-client-modal" aria-label="Close">×</button></div>
       <div class="client-entry-fields">
+        <p class="form-error" id="add-client-error" role="alert" tabindex="-1" hidden></p>
         <section class="client-entry-basics" aria-label="Client details">
         <div class="form-grid">
           <label class="field field-half"><span>Plant</span><select name="plant"><option value="plant1">Plant 1</option><option value="plant2">Plant 2</option></select></label>
-          <label class="field field-half"><span>Serial Number <small>Optional</small></span><input name="sn" maxlength="100" autocomplete="off" placeholder="Automatic if blank" aria-describedby="client-serial-number-hint"><small id="client-serial-number-hint" aria-live="polite" hidden></small></label>
+          <input type="hidden" name="sn" value=""><small id="client-serial-number-hint" hidden></small>
           <label class="field"><span>Company name *</span><input name="supplier" required maxlength="500" autocomplete="organization" placeholder="Enter the company name"></label>
           <label class="field field-half"><span>City / site <small>Optional</small></span><input name="location" maxlength="500" placeholder="Enter the location"></label>
-          <label class="field field-half"><span>Date material was received <small>Optional</small></span><input name="inward_date" type="date"></label>
+          <label class="field field-half"><span>Date material was received <small>Optional</small></span><input name="inward_date" type="text" data-date-input="true" inputmode="numeric" placeholder="DD/MM/YY"></label>
           <label class="field field-half"><span>Form 6 number <small>Optional — needed when creating a certificate</small></span><input name="form6" maxlength="100" placeholder="Enter when creating a certificate"></label>
         </div>
         <section class="client-entry-more-details" aria-labelledby="client-more-details-title"><h3 id="client-more-details-title">More details</h3><div class="form-grid">
-          <label class="field field-half"><span>Reference number <small>Optional</small></span><input name="reference" maxlength="100"></label>
-          <label class="field field-half"><span>Comments <small>Optional</small></span><input name="comments" maxlength="1000"></label>
-          <label class="field field-half"><span>Transporter / vehicle details <small>Optional</small></span><input name="transporter_details" maxlength="1000"></label>
-          <label class="field field-half"><span>Docket no. / vehicle no. <small>Optional</small></span><input name="docket_vehicle_no" maxlength="500"></label>
-          <label class="field field-half"><span>Weight slip / scale weight <small>Optional</small></span><input name="weight_slip_scale" maxlength="500"></label>
+          <label class="field field-half"><span>Reference number <small>Required for certificate</small></span><input name="reference" maxlength="100" placeholder="Enter reference manually"><small>Entered manually; never generated automatically.</small></label>
+            <label class="field field-half"><span>Comments</span><textarea name="comments" rows="3" maxlength="1000"></textarea></label>
+          <label class="field field-half"><span>Transporter / vehicle details</span><input name="transporter_details" maxlength="1000"></label>
+          <label class="field field-half"><span>Docket no. / vehicle no.</span><input name="docket_vehicle_no" maxlength="500"></label>
+          <label class="field field-half"><span>Weight slip / scale weight</span><input name="weight_slip_scale" maxlength="500"></label>
         </div></section>
         </section>
         <section class="client-entry-materials"><h3>Materials <small>Optional</small></h3><div id="client-material-rows"></div><p class="material-weight-total" id="client-material-weight-total" role="status" aria-live="polite" hidden></p><button type="button" class="button button-quiet" id="add-client-material">＋ Add material</button></section>
-        <p class="form-error" id="add-client-error" role="alert" hidden></p>
       </div>
       <div class="modal-footer"><span class="required-note">Adds the client to the selected plant workbook.</span><div><button type="button" class="button button-quiet" data-close="add-client-modal">Cancel</button><button type="submit" class="button button-primary" id="save-client">Add to Excel</button></div></div>
     </form>

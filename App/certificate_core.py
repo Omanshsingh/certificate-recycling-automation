@@ -356,6 +356,11 @@ def read_batches(path):
                 "location": text(raw[cols["location"]]) if "location" in cols else "",
                 "form6": text(raw[cols["form6"]]) if "form6" in cols else text(saved.get('form6')),
                 "reference": text(raw[cols["reference"]]) if "reference" in cols else text(saved.get('reference')),
+                "pdf_recovery_pending": bool(saved.get('_pdf_recovery_pending')),
+                "hdd_cod_no": text(saved.get('_hdd_cod_no')),
+                "hdd_cod_date": saved.get('_hdd_cod_date', ''),
+                **{key: text(raw[cols[key]]) if key in cols else '' for key in
+                   ('comments', 'transporter_details', 'docket_vehicle_no', 'weight_slip_scale')},
                 "certificate_weight": None if 'certificate_weight' in cols else number(saved.get('certificate_weight')),
                 "certificate_weight_invalid": False,
                 "certificate_type": text(raw[cols["certificate_type"]]) if "certificate_type" in cols else text(saved.get('certificate_type')) or "standard",
@@ -371,8 +376,8 @@ def read_batches(path):
                 'summary_records': [],
                 "import_notes": [],
                 "blocking_issues": [*header_issues, *saved_issues],
-                # Reference No. is optional; only certificate output columns
-                # are reported here as missing headers.
+                # Reference can be entered at certificate creation; only output
+                # columns are reported here as missing headers.
                 "missing_headers": [key for key in ("issued", "cod_no", "cod_date") if key not in cols],
                 "items": [],
                 "issues": [*header_issues, *saved_issues],
@@ -399,6 +404,11 @@ def read_batches(path):
             for key in ("inward_date", "supplier", "location", "form6", "reference", "cod_no", "cod_date", "issued"):
                 if key not in cols or not text(raw[cols[key]]):
                     continue
+                if current.get('hdd_cod_no') and excel_row == current['source_row'] + 1:
+                    if key == 'cod_no' and read_cell_text(key, raw[cols[key]], excel_row) == current['hdd_cod_no']:
+                        continue
+                    if key == 'cod_date' and excel_date(raw[cols[key]], epoch, parse_date) == parse_date(current.get('hdd_cod_date')):
+                        continue
                 actual = raw[cols[key]]
                 expected = current[key]
                 if key in {"inward_date", "cod_date"}:
@@ -464,7 +474,7 @@ def read_batches(path):
     serial_rows = {}
     for batch in batches:
         serial_rows.setdefault(batch['case_id'].strip().casefold(), []).append(batch['source_row'])
-    form6_counts = Counter(batch["form6"] for batch in batches if batch["form6"])
+    form6_counts = Counter(batch['form6'].strip().casefold() for batch in batches if batch['form6'])
     for batch in batches:
         if not batch["inward_date"]:
             batch["issues"].append("missing inward date")
@@ -504,16 +514,18 @@ def read_batches(path):
             batch['duplicate_serial_number'] = True
             batch['issues'].append(issue)
             batch['blocking_issues'].append(issue)
-        if batch["form6"] and form6_counts[batch["form6"]] > 1:
-            batch["issues"].append("Form 6 number is repeated on more than one batch in this plant workbook")
+        if batch['form6'] and form6_counts[batch['form6'].strip().casefold()] > 1:
+            issue = f'Form 6 number {batch["form6"]} is repeated on more than one inward. Correct the duplicate in Excel before creating a certificate.'
+            batch['issues'].append(issue)
+            batch['blocking_issues'].append(issue)
     return batches
 
 
 def inward_details_complete(batch, as_of=None):
     """Approve an unselected status only when its Excel source facts are valid.
 
-    Template-only manual identifiers are entered on the preview page. Optional
-    reference/COD/date values may be empty; COD and date are assigned on creation.
+    Manual identifiers and the required reference can be entered on the preview
+    page. COD and date are assigned on creation.
     """
     as_of = as_of or date.today()
     if source_value_issues(batch, as_of):
@@ -534,7 +546,7 @@ def status_value(value):
         return "blank"
     if cleaned in {"created", "drafted", "generated"}:
         return "generated"
-    if cleaned in {"generatedmanual", "manualgenerated"}:
+    if cleaned in {"generatedmanual", "manualgenerated", "generatedexternally", "externalgenerated"}:
         return "generated_manual"
     if cleaned in {"completed", "sent"}:
         return "completed"

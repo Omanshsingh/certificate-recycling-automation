@@ -13,13 +13,14 @@ from openpyxl.styles.numbers import is_date_format
 from openpyxl.utils.cell import get_column_letter, range_boundaries
 from openpyxl.utils.datetime import to_excel
 
+from register_protection import externally_protected
 from certificate_core import (batch_content, inward_details_complete, material_items, norm, number,
                               parse_date, read_batches, select_register, text,
                               supplier_is_always_not_applicable)
 from workbook_store import (_attributes, _date_style, _element, _range_fragment,
                             _set_cell, _sheet_member, _ensure_status_validation,
                             formatted_client_template, sync_generated_styles,
-                            add_tracking_column, center_client_row_alignment,
+                            add_tracking_column, left_align_client_rows,
                             order_register_for_save, next_register_row,
                             register_content_width, checked_register_column, checked_excel_text)
 from workbook_metadata import write_details
@@ -165,7 +166,7 @@ def stage_new_client(session, raw):
     try:
         sheet, header_row, cols = select_register(book)
         original_sheet_width = register_content_width(sheet, header_row)
-        if sheet.protection.sheet:
+        if externally_protected(sheet):
             raise ValueError('This Excel sheet is protected. Unprotect it before adding a client.')
         empty_template = not original and all(cell.value is None for row in
             sheet.iter_rows(min_row=header_row + 1) for cell in row)
@@ -210,6 +211,8 @@ def stage_new_client(session, raw):
                 cols[key] = next_column - 1
                 added_optional[key] = label
         ids = {batch['case_id'].strip().casefold() for batch in original}
+        if details.get('form6') and any(batch.get('form6', '').strip().casefold() == details['form6'].strip().casefold() for batch in original):
+            raise ValueError(f'Form 6 number {details["form6"]} is already used. Enter a different Form 6 number.')
         if details['sn']:
             case_id = details['sn']
             if case_id.casefold() in ids:
@@ -233,9 +236,14 @@ def stage_new_client(session, raw):
         source_rows = ([template] if count == 1 else
                        [template] + [continuation] * (count - 2) + [template_end])
         destinations = list(range(first, last + 1))
-        # The app writes new clients using these original styled rows. Center
-        # their copied alignment without changing any existing worksheet rows.
-        center_client_row_alignment(sheet, source_rows, sheet.max_column)
+        # Only copied rows use the new entry alignment. Existing rows stay intact.
+        left_align_client_rows(sheet, source_rows, sheet.max_column)
+        if 'comments' in cols:
+            for source_row in source_rows:
+                comment_cell = sheet.cell(source_row, cols['comments'] + 1)
+                alignment = copy(comment_cell.alignment)
+                alignment.wrap_text = True
+                comment_cell.alignment = alignment
         with ZipFile(BytesIO(source_data)) as archive:
             member = _sheet_member(archive, sheet.title)
             xml = archive.read(member).decode('utf-8')
@@ -299,7 +307,7 @@ def stage_new_client(session, raw):
                 source_cell = sheet.cell(template, cols['inward_date'] + 1)
                 style = source_cell.style_id
                 if not is_date_format(source_cell.number_format):
-                    styles, style = _date_style(styles, style, 'dd.mm.yyyy')
+                    styles, style = _date_style(styles, style, 'dd/mm/yy')
                 value = to_excel(datetime.combine(details['inward_date'], datetime.min.time()), book.epoch)
                 xml = _set_cell(xml, f'{get_column_letter(cols["inward_date"] + 1)}{first}', value, 'n', style)
             for row, material in zip(destinations, details['items']):

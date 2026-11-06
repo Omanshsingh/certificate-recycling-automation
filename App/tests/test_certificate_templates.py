@@ -9,6 +9,7 @@ from pathlib import Path
 import shutil
 import tempfile
 import unittest
+import zlib
 from unittest.mock import patch
 import warnings
 
@@ -43,7 +44,7 @@ def write_register(path, *, case_id="CLIENT", cod="", status="Ready", continuati
         sheet.title = "Inward Register"
         sheet.append(HEADERS)
         sheet.append([case_id, date(2026, 9, 1), "Independent Client Ltd", "Pune",
-                      "Servers", 2, 5, 10, "FORM-1", "REF-1", cod,
+                      "Servers", 2, 5, 10, ("FORM-1" if case_id == "CLIENT" and '2' not in Path(path).stem else f"FORM-{zlib.crc32((str(path) + case_id).encode()):08X}"), "REF-1", cod,
                       AS_OF if cod else None, status])
         if continuation:
             sheet.append([None, None, None, None, "Monitors", 3, 4, 12])
@@ -472,6 +473,8 @@ class DraftWorkflowTests(TemporaryCertificateTest):
                 "tube_serial": "TUBE-456", "site_location": "Pune Hospital",
             }
         details.update(changes)
+        if "form6" not in changes:
+            details["form6"] = f"FORM-{details['case_id']}"
         if "reference" not in changes:
             details["reference"] = f"R-{details['case_id']}"
         return details
@@ -514,7 +517,7 @@ class DraftWorkflowTests(TemporaryCertificateTest):
         self.assertNotIn("SIEMENS HEALTHCARE PRIVATE LIMITED", extracted)
         row = drafts.manual_rows(self.root)[0]
         self.assertEqual(row["certificate_fields"]["model_serial"], "MODEL-123")
-        self.assertEqual(row["plant"], "plant2")
+        self.assertIsNone(row["plant"])
 
     def test_draft_edit_retains_record_id_and_assigned_cod(self):
         result = self.generate()
@@ -589,7 +592,7 @@ class DraftWorkflowTests(TemporaryCertificateTest):
         register = self.root / "Data" / "Custom Certificates.json"
         original = register.read_bytes()
         row = drafts.manual_rows(self.root)[0]
-        self.assertEqual(row["warnings"], [history[1], history[3]])
+        self.assertEqual(row["warnings"], [history[1]])
         self.assertNotIn("disposal_date", row)
         self.assertEqual(register.read_bytes(), original)
         saved = drafts.read_register(self.root)["records"][0]
@@ -622,7 +625,7 @@ class DraftWorkflowTests(TemporaryCertificateTest):
         register = self.root / "Data" / "Custom Certificates.json"
         original = register.read_bytes()
         row = drafts.manual_rows(self.root)[0]
-        self.assertEqual(row["warnings"], retained)
+        self.assertEqual(row["warnings"], [warning for warning in retained if not warning.startswith('Reference ')])
         self.assertEqual(register.read_bytes(), original)
         self.assertEqual(drafts.read_register(self.root)["records"][0]["warnings"], obsolete + retained)
 
@@ -680,8 +683,9 @@ class DraftWorkflowTests(TemporaryCertificateTest):
         _, cod, _, warnings = drafts.prepare_certificate(
             self.root, "plant1", details, as_of=AS_OF, source_kind="workbook")
         self.assertEqual((cod, warnings), ("0010", []))
+        manual_details = self.details(case_id="MANUAL-EXCEL-1", form6="FORM-MANUAL-EXCEL-1")
         _, cod, _, warnings = drafts.prepare_certificate(
-            self.root, "plant1", details, as_of=AS_OF, source_kind="manual")
+            self.root, "plant1", manual_details, as_of=AS_OF, source_kind="manual")
         self.assertEqual(cod, "0016")
         self.assertFalse(any("belongs to another certificate" in warning for warning in warnings))
         self.assertEqual([path.read_bytes() for path in self.paths], before)
@@ -950,7 +954,7 @@ class WebGenerationTests(TemporaryCertificateTest):
         self.enterContext(patch.object(web_app, "ROOT", self.root))
         self.enterContext(patch.object(web_app, "RESULTS_PATH", results))
         self.enterContext(patch.object(web_app, "configured_paths", return_value=paths))
-        self.enterContext(patch.object(web_app, "load_settings", return_value={}))
+        self.enterContext(patch.object(web_app, "load_settings", return_value={"workbook_paths":[str(path) for path in paths]}))
         self.enterContext(patch.object(web_app, "manual_rows", return_value=[manual_row]))
         self.enterContext(patch.object(web_app, "find_certificate", return_value=True))
         self.enterContext(patch.object(web_app, "generate", side_effect=AssertionError("workspace read must not generate")))

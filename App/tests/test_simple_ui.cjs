@@ -18,6 +18,7 @@ class Node {
   }
   append(...nodes) { for (const node of nodes) { if (node.parentElement) node.parentElement.children = node.parentElement.children.filter(child => child !== node); node.parentElement = this; this.children.push(node); } }
   replaceChildren(...nodes) { this.children = nodes; }
+  contains(node) { return this === node || this.children.some(child => child.contains(node)); }
   setAttribute(key, value) { this.attributes[key] = value; }
   querySelectorAll() { return []; }
   addEventListener(event, fn) { (this.listeners[event] ||= []).push(fn); }
@@ -28,6 +29,8 @@ class Node {
   getBoundingClientRect() { return {left:10,right:100,top:10,bottom:100}; }
   focus() { this.focused = true; }
   setCustomValidity(message) { this.validationMessage = message; }
+  checkValidity() { return !this.validationMessage; }
+  reportValidity() { return this.checkValidity(); }
   showModal() { this.open = true; }
   close() { this.open = false; this.dispatch('close'); }
   showPopover() { this.popoverOpen = true; }
@@ -83,15 +86,413 @@ function harness(options = {}) {
   Object.assign(ui, vm.runInContext('({startInlineEdit, finishInlineEdit, syncWorkbookChanges, setState, renderWorkbookIssues, refreshState, pollReminderReview})',context));
   Object.assign(ui, vm.runInContext('({openAddClient, renderClientMaterials, clientMaterialValues, saveClient, validateClientSerialNumber, duplicateSerialNumber, compareRows})',context));
   Object.assign(ui, vm.runInContext('({excelTarget, openClientInExcel})',context));
+  Object.assign(ui, vm.runInContext('({openInwardRemoval, confirmInwardRemoval})',context));
+  Object.assign(ui, vm.runInContext('({openEntryDeletion,filterEntryDeletion,reviewEntryDeletion,confirmEntryDeletion,backToEntryDeletionSelection})',context));
+  Object.assign(ui, vm.runInContext('({changeDisplay})',context));
+  Object.assign(ui, vm.runInContext('({saveInwardDetails, openCompanionCertificate, updateDestructionChoice, showExcelSaveChoice})',context));
   Object.assign(ui, vm.runInContext('({noticeText, showDetailsError, warningInfo, renderWarningList, hasWarnings, needsAttention})',context));
+  Object.assign(ui, vm.runInContext('({missingFollowup, inwardChanges, renderEditorFollowup, filterBulkClients, updateBulkSelection})',context));
+  Object.assign(ui, vm.runInContext('({editorInwardRow, editorDestructionRequest, switchesLinkedCertificate, switchLinkedCertificate})',context));
+  Object.assign(ui, vm.runInContext('({updateRecordFilterButton, positionRecordFilters})',context));
+  Object.assign(ui, vm.runInContext('({init})',context));
+  Object.assign(ui, vm.runInContext('({changeDestructionChoice})',context));
+  Object.assign(ui, vm.runInContext('({dateLabel,normalizeDate,configureDateInput,canDeleteEntry,clientEntryPayload})',context));
   return {ui, controls, storage, requests, window, context, closeButtons, timers, settingsInputs};
 }
+
+test('Saved certificates filter by the same certificate types as Companies', () => {
+  const h=harness();h.controls.get('#saved-plant-filter').value='all';
+  const entries=['standard','destruction','siemens','sita'].map(certificate_type=>({certificate_type,path:`Certificates/0001_${certificate_type}.pdf`,cods:['0001']}));
+  h.controls.get('#saved-template-filter').value='all';assert.equal(entries.filter(h.ui.savedFileMatches).length,4);
+  for(const type of ['standard','destruction','siemens','sita']){
+    h.controls.get('#saved-template-filter').value=type;
+    assert.deepEqual(entries.filter(h.ui.savedFileMatches).map(entry=>entry.certificate_type),[type]);
+  }
+  const html=fs.readFileSync(path.join(__dirname,'../web/index.html'),'utf8');
+  const options=id=>html.match(new RegExp(`<select id="${id}"[^>]*>([\\s\\S]*?)<\\/select>`))[1];
+  assert.equal(options('saved-template-filter'),options('template-filter'));
+});
+
+test('App dates display DD/MM/YY and submit the correct ISO day', () => {
+  const h=harness(),form=editing(h);
+  assert.equal(h.ui.dateLabel('2026-11-02'),'02/11/26');
+  assert.equal(h.ui.normalizeDate('02/11/26'),'2026-11-02');
+  assert.equal(h.ui.normalizeDate('31/02/26'),'');
+  form.values.inward_date='02/11/26';form.values.cod_date='03/11/26';
+  assert.equal(h.ui.detailsBody(form).details.inward_date,'2026-11-02');
+  assert.equal(h.ui.detailsBody(form).details.cod_date,'2026-11-03');
+  const input=new Node('input');input.value='2026-11-02';h.ui.configureDateInput(input);
+  assert.equal(input.type,'text');assert.equal(input.value,'02/11/26');
+  input.value='31/02/26';input.dispatch('input');assert.equal(input.checkValidity(),false);
+  const entry=clientEntry(h);entry.form.values.inward_date='02/11/26';
+  assert.equal(h.ui.clientEntryPayload(entry.form).details.inward_date,'2026-11-02');
+});
+
+test('Add client ignores outside clicks and retains its fields until explicitly closed', () => {
+  const h=harness(),{form}=clientEntry(h);h.ui.wire();h.ui.openAddClient();
+  form.values.supplier='Still entering this client';
+  const modal=h.controls.get('#add-client-modal');modal.dispatch('click',{clientX:-10,clientY:-10});
+  assert.equal(modal.open,true);assert.equal(form.values.supplier,'Still entering this client');
+  h.closeButtons.find(button=>button.dataset.close==='add-client-modal').dispatch('click');
+  assert.equal(modal.open,false);h.ui.openAddClient();assert.equal(form.values.supplier,'Still entering this client');
+});
+
+test('Deletion stays available before generation and remains blocked by recycling or HDD issuance', () => {
+  const h=harness(),row={source_kind:'workbook',plant:'plant1',sn:'1',sheet:'Inward Register',row:2,certificate_status:'ready',certificate_no:'0042'};
+  assert.equal(h.ui.canDeleteEntry(row),true);
+  for(const change of [{has_issued_certificate:true},{hdd_cod_no:'0043'},{pdf_filename:'0042.pdf'},{certificate_status:'generated'},{certificate_status:'completed'}])assert.equal(h.ui.canDeleteEntry({...row,...change}),false);
+  h.ui.app.state.rows=[row,{source_kind:'manual',plant:'plant1',record_id:'hdd',certificate_status:'generated_manual',destruction_source:{plant:'plant1',case_id:'1'}}];
+  assert.equal(h.ui.canDeleteEntry(row),false);
+});
+
+test('Changing an issued certificate type never offers inward deletion', async () => {
+  const h=harness(),form=editing(h);
+  h.ui.app.editor.existing=true;h.ui.app.editor.issuedCertificate=true;
+  h.ui.app.editor.baseline=h.ui.detailsBody(form);h.ui.app.editor.excelBaseline=h.ui.detailsBody(form);
+  form.values.certificate_type='sita';h.ui.app.editor.template='sita';h.ui.app.editor.fields.sita={};
+  h.ui.showExcelSaveChoice(h.ui.detailsBody(form),'create');
+  assert.equal(h.controls.get('#excel-save-no').textContent,'No, keep editing');
+  assert.match(h.controls.get('#excel-save-note').textContent,/cannot be deleted/);
+  await h.ui.saveExcelChoice(false);assert.equal(h.requests.length,0);
+});
+
+const removalRow = {source_kind:'workbook',plant:'plant1',sn:'25',supplier:'ABC Company',sheet:'Inward Register',row:3,certificate_status:'ready'};
+
+test('Startup checks saved Excel changes before enabling actions and loads the dashboard only once', async () => {
+  for (const changed of [false,true]) {
+    let finishCheck;
+    const h=harness({fetch:async endpoint=>{
+      if(endpoint==='/api/state')return {ok:true,json:async()=>({state:{rows:[],scan_complete:true},workspace_revision:'initial',settings:{workbook_paths:['plant1.xlsx','plant2.xlsx']}})};
+      if(endpoint==='/api/workbook-changes')return new Promise(resolve=>{
+        finishCheck=()=>resolve({ok:true,json:async()=>changed
+          ? {changed:true,state:{rows:[],scan_complete:true,workspace_revision:'checked'}} : {changed:false}});
+      });
+      throw new Error(`Unexpected startup request: ${endpoint}`);
+    }});
+    h.window.setInterval=()=>{};
+    const loads=[];h.window.CertificateAnalytics={load:()=>loads.push(h.ui.app.workspaceRevision)};
+    vm.runInContext('document.addEventListener=()=>{}; loadTemplates=async()=>true; pollReminderReview=()=>{};',h.context);
+    const startup=h.ui.init();await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(h.ui.app.loadingWorkspace,true);assert.equal(h.controls.get('#new-button').disabled,true);
+    assert.equal(loads.length,0);finishCheck();await startup;
+    assert.equal(h.ui.app.loadingWorkspace,false);assert.equal(h.controls.get('#new-button').disabled,false);
+    assert.deepEqual(loads,[changed?'checked':'initial']);
+    assert.deepEqual(h.requests.map(request=>request.endpoint),['/api/state','/api/workbook-changes']);
+  }
+});
+test('Several warning messages for one certificate never appear as several certificates', () => {
+  const h=harness();
+  h.ui.showWarnings(['missing supplier name','missing inward date'],{payload:{details:{supplier:'Sample company'}},fromDetails:true});
+  assert.equal(h.controls.get('#warning-list').children.length,1);
+  assert.match(h.controls.get('#warning-description').textContent,/this certificate/);
+  assert.doesNotMatch(h.controls.get('#warning-description').textContent,/2 certificates/);
+});
+test('Old shared-reference notices never display or mark a record as needing attention', () => {
+  const h=harness(),list=new Node('ul');
+  const first='Reference SAME-REF is also used by another inward. You can keep the same reference and continue.';
+  const second='Reference SAME-REF already appears in another PDF. This may be the same inward or an already-created certificate. Review it; continuing keeps this reference unchanged.';
+  h.ui.renderWarningList(list,[first,second],true);
+  assert.equal(list.children.length,0);
+  const row={certificate_status:'ready',warnings:[first,second]};
+  assert.equal(h.ui.hasWarnings(row),false);
+  assert.equal(h.ui.needsAttention(row),false);
+  assert.equal(h.ui.stateLabel(row),'Ready');
+});
+test('Preview and confirmation keep every current check visible', () => {
+  const h=harness(), list=new Node('ul');
+  const warnings=['missing supplier name','missing inward date','no item rows','total weight must be a positive number'];
+  h.ui.renderWarningList(list,warnings,true);
+  assert.equal(list.children.length,4);
+  assert.equal(all(list,n=>n.className==='issue-card').length,4);
+  h.ui.renderWarningList(list,warnings);
+  assert.equal(list.children.length,4,'The creation confirmation must keep every check visible');
+});
+test('Different wording for the same inward-date warning shows one check', () => {
+  const h=harness(), list=new Node('ul');
+  h.ui.renderWarningList(list,['missing inward date','Missing inward date; check the date in Excel.','no item rows']);
+  assert.equal(list.children.length,2);
+  assert.doesNotMatch(text(list),/other entr/);
+});
+const followupRow = {...removalRow, certificate_status:'completed', comments:'', transporter_details:'Eco Recycling', docket_vehicle_no:'D-42', weight_slip_scale:''};
+
+test('Later details stay separate from certificate alerts and include completed inwards', () => {
+  const h=harness();
+  h.controls.get('#plant-filter').value='all'; h.controls.get('#template-filter').value='all';
+  h.controls.get('#status-filter').value='details_to_finish';
+  assert.equal(h.ui.matches(followupRow),true);
+  assert.equal(h.ui.needsAttention(followupRow),false);
+  assert.deepEqual(Array.from(h.ui.missingFollowup(followupRow)),['comments','weight_slip_scale']);
+  assert.equal(h.ui.matches({...followupRow,comments:'Not applicable',weight_slip_scale:'Yes'}),false);
+  assert.equal(h.ui.matches({...followupRow,source_kind:'manual'}),false);
+  assert.equal(h.ui.matches({source_kind:'system',plant:'plant1'}),false);
+  const actions=h.ui.makeActions(followupRow,0);
+  assert.deepEqual(all(actions,n=>n.tag==='button').map(n=>n.textContent),['Review & edit']);
+  assert.match(text(h.ui.makeClientCell(followupRow,0)),/Missing: Comments.*Weight slip/);
+});
+
+test('The four inward fields remain visible in Add client and directly inside Review & edit', () => {
+  const html=fs.readFileSync(path.join(__dirname,'../web/index.html'),'utf8');
+  const editor=html.slice(html.indexOf('id="details-modal"'),html.indexOf('id="excel-save-modal"'));
+  const intake=html.slice(html.indexOf('id="add-client-modal"'));
+  for(const key of ['comments','transporter_details','docket_vehicle_no','weight_slip_scale']) {
+    assert.ok(editor.includes(`name="${key}"`)); assert.ok(intake.includes(`name="${key}"`));
+  }
+  assert.doesNotMatch(editor,/<details[^>]*id="editor-inward-details"|followup-modal|editor-fill-details/);
+  assert.doesNotMatch(intake,/Fill later/);
+});
+
+function inlineInward(h, issued=true) {
+  const form=editing(h);
+  Object.assign(form.values,{comments:'Existing',transporter_details:'Eco Recycling',docket_vehicle_no:'D-42',weight_slip_scale:''});
+  Object.assign(h.ui.app.editor,{existing:true,issuedCertificate:issued,sourcePlant:'plant1',sourceSn:'1001',workspaceRevision:'revision-1'});
+  h.ui.app.editor.baseline=h.ui.detailsBody(form);
+  h.ui.app.editor.excelBaseline=JSON.parse(JSON.stringify(h.ui.app.editor.baseline));
+  h.ui.app.templatesLoaded=true;
+  h.controls.get('#details-modal').open=true;
+  return form;
+}
+
+test('Changing only inward details saves from the main editor after Yes and creates no PDF', async () => {
+  const h=harness({fetch:async()=>({ok:true,json:async()=>({state:{rows:[]},workspace_revision:'revision-2'})})});
+  vm.runInContext('setState = state => { app.state=state; };',h.context);
+  const form=inlineInward(h);form.values.comments='Updated comment';
+  await h.ui.saveInwardDetails();
+  assert.equal(h.ui.app.excelSavePayload.mode,'inward_only');assert.equal(h.requests.length,0);
+  await h.ui.saveExcelChoice(false);
+  assert.equal(h.requests.length,0);assert.equal(form.values.comments,'Updated comment');
+  await h.ui.saveInwardDetails();await h.ui.saveExcelChoice(true);
+  assert.equal(h.requests.length,1);assert.equal(h.requests[0].endpoint,'/api/clients/followup');
+  assert.deepEqual(Object.keys(h.requests[0].payload.details),['comments','transporter_details','docket_vehicle_no','weight_slip_scale']);
+  assert.equal(h.requests[0].payload.details.comments,'Updated comment');
+  assert.equal(h.requests[0].payload.confirmed_excel,true);
+});
+
+test('Issued PDF-only corrections do not prevent saving new inward details on their own', async () => {
+  const h=harness();const form=inlineInward(h);
+  h.ui.app.editor.excelBaseline.details.location='Original Excel city';
+  form.values.weight_slip_scale='WS-10';
+  await h.ui.saveInwardDetails();
+  assert.equal(h.ui.app.excelSavePayload.mode,'inward_only');
+  assert.match(text(h.controls.get('#excel-save-change-list')),/Weight slip/);
+  assert.doesNotMatch(text(h.controls.get('#excel-save-change-list')),/Original Excel city/);
+});
+
+test('An inline inward save failure keeps the entered fields and error in Review & edit', async () => {
+  const h=harness({fetch:async()=>({ok:false,status:400,json:async()=>({error:'Excel is busy. Try again.'})})});
+  const form=inlineInward(h);form.values.comments='Keep my text';
+  await h.ui.saveInwardDetails();await h.ui.saveExcelChoice(true);
+  assert.equal(form.values.comments,'Keep my text');
+  assert.equal(h.controls.get('#details-modal').open,true);
+  assert.match(text(h.controls.get('#details-error')),/Excel is busy/);
+});
+
+function removalHarness(fail = false) {
+  const h=harness({fetch:async endpoint=>({ok:!(fail && endpoint==='/api/clients/remove'),json:async()=>
+    endpoint==='/api/clients/remove-preview' ? {entry:{...removalRow,inward_date:'2026-10-01',materials:2},review_token:'reviewed-entry',expected_revision:'revision-1'}
+      : fail ? {error:'The files changed. Check the entry again.'} : {removed:true,state:{rows:[]}}})});
+  h.ui.app.workspaceRevision='revision-1';
+  vm.runInContext('setState = state => { app.state=state; };',h.context);
+  return h;
+}
+
+test('Remove inward is directly visible and unavailable for issued or manual records', () => {
+  const h=harness();
+  const actions=h.ui.makeActions(removalRow,0);
+  assert.equal(all(actions,n=>n.tag==='details').length,0);
+  assert.match(text(actions),/Review & edit.*Open in Excel/);
+  const trash=all(actions,n=>n.dataset.action==='remove-inward')[0];
+  assert.match(trash.attributes['aria-label'],/Delete inward/); assert.match(trash.innerHTML,/<svg/);
+  assert.equal(all(h.ui.makeActions({...removalRow,certificate_no:'0042'},0),n=>n.dataset.action==='remove-inward').length,1);
+  assert.equal(all(actions,n=>n.dataset.action==='remove-inward').length,1);
+  for(const changes of [{has_issued_certificate:true},{certificate_status:'generated'},
+    {certificate_status:'completed'},{source_kind:'manual'},{duplicate_serial_number:true}]) {
+    assert.equal(all(h.ui.makeActions({...removalRow,...changes},0),n=>n.dataset.action==='remove-inward').length,0);
+  }
+});
+
+const deletionSearchRows = [
+  {source_kind:'workbook',plant:'plant1',sn:'17',sheet:'Inward Register',row:2,supplier:'Acme Medical',location:'Mumbai',certificate_no:'0212',reference:'REF-ALPHA',form6:'F6-OLD',certificate_status:'ready'},
+  {source_kind:'workbook',plant:'plant2',sn:'18',sheet:'Inward Register',row:3,supplier:'Another company',location:'Pune',certificate_no:'0213',reference:'REF-BETA',certificate_status:'ready'},
+  {source_kind:'manual',plant:'plant1',record_id:'local-test',supplier:'International client',certificate_no:'0214',certificate_status:'ready'}
+];
+
+test('Ungenerated-entry deletion is inside collapsed Settings Advanced and uses a searchable checklist', () => {
+  const html=fs.readFileSync(path.join(__dirname,'../web/index.html'),'utf8');
+  assert.match(html,/<details class="technical-details"><summary>Advanced<\/summary>[\s\S]*?id="open-entry-deletion"/);
+  const h=harness();h.ui.app.state={rows:deletionSearchRows,workspace_revision:'search-review'};
+  h.ui.openEntryDeletion();
+  assert.equal(h.ui.app.entryDeletion.rows.length,3);
+  assert.equal(h.ui.app.entryDeletion.checked.size,0);
+  assert.equal(h.controls.get('#entry-delete-preview').disabled,true);
+  assert.equal(h.controls.get('#entry-delete-hdd').checked,false);
+  assert.equal(h.controls.get('#entry-delete-search').focused,true);
+  for(const query of ['acme','17','0212','REF-ALPHA','F6-OLD','mumbai','ready acme']){
+    h.controls.get('#entry-delete-search').value=query;h.ui.filterEntryDeletion();
+    assert.equal(h.ui.app.entryDeletion.labels.filter(label=>!label.hidden).length,1,query);
+    assert.equal(h.ui.app.entryDeletion.labels[0].hidden,false);
+  }
+  assert.equal(h.requests.length,0);
+});
+
+test('Settings no longer offers old-history cleanup or exposes its endpoint', () => {
+  const html=fs.readFileSync(path.join(__dirname,'../web/index.html'),'utf8');
+  const source=fs.readFileSync(path.join(__dirname,'../web/app.js'),'utf8');
+  assert.doesNotMatch(html,/clear-old-history|Clear old history/);
+  assert.doesNotMatch(source,/\/api\/history\/clear|clearOldHistory/);
+});
+
+test('App-only forms submit no hidden plant and local PDFs do not infer one from their filename', () => {
+  const h=harness();const form=editing(h);
+  form.values.source_kind='manual';form.values.plant='plant2';
+  assert.equal(h.ui.detailsBody(form).plant,null);
+  assert.equal(vm.runInContext("labelPlant(null)",h.context),'App only');
+  assert.equal(vm.runInContext("savedFilePlant({path:'Certificates/Manually Added/0042_Client_1.pdf',managed_owner:{source_kind:'manual',plant:null,key:'local'}})",h.context),'local');
+});
+
+test('Inward deletion keeps the Advanced checklist hidden until its review is ready', async () => {
+  let finishPreview;
+  const h=harness({fetch:async()=>new Promise(resolve=>{finishPreview=()=>resolve({ok:true,json:async()=>({
+    review:{entries:[{plant:'plant1',sn:'17',supplier:'Acme Medical',cod:'0212',materials:1}],pdfs:[],kept_hdd:[]},review_token:'review-token'})});})});
+  h.ui.app.state={rows:deletionSearchRows,workspace_revision:'search-review'};
+  h.ui.openEntryDeletion({showDialog:false});
+  h.ui.app.entryDeletion.checked.add(0);
+  assert.equal(Boolean(h.controls.get('#entry-deletion-modal').open),false,'no searchable Settings dialog should flash');
+  const pending=h.ui.reviewEntryDeletion();
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(Boolean(h.controls.get('#entry-deletion-modal').open),false,'keep it hidden during the preview request');
+  finishPreview(); await pending;
+  assert.equal(h.controls.get('#entry-deletion-modal').open,true);
+  assert.equal(h.controls.get('#entry-delete-selection').hidden,true);
+  assert.equal(h.controls.get('#entry-delete-review').hidden,false);
+});
+
+test('Deletion search keeps checked entries across searches and shows hidden selection counts', () => {
+  const h=harness();h.ui.app.state={rows:deletionSearchRows,workspace_revision:'search-review'};h.ui.openEntryDeletion();
+  const first=h.ui.app.entryDeletion.labels[0].children[0];first.checked=true;first.dispatch('change');
+  h.controls.get('#entry-delete-search').value='another';h.ui.filterEntryDeletion();
+  assert.equal(h.ui.app.entryDeletion.checked.size,1);
+  assert.match(h.controls.get('#entry-delete-selected').textContent,/1 selected.*1 hidden/);
+  assert.equal(h.controls.get('#entry-delete-preview').disabled,false);
+  h.controls.get('#entry-delete-search').value='';h.ui.filterEntryDeletion();
+  assert.equal(first.checked,true);assert.equal(h.ui.app.entryDeletion.labels[0].hidden,false);
+});
+
+test('Advanced deletion reviews exact entries and PDFs and waits for a checked confirmation', async () => {
+  const review={entries:[{source_kind:'workbook',plant:'plant1',sn:'17',supplier:'Acme Medical',cod:'0212',materials:2,certificate_type:'siemens'}],pdfs:['Certificates/Auto Generated/0212_Acme_Mumbai.pdf'],kept_hdd:[{supplier:'Acme Medical',cod:'0215'}]};
+  const h=harness({fetch:async(endpoint)=>({ok:true,json:async()=>endpoint.endsWith('delete-preview')?{review,review_token:'review-token'}:{deleted:true,state:{rows:[]}}})});
+  h.ui.app.state={rows:deletionSearchRows,workspace_revision:'search-review'};
+  vm.runInContext('setState=state=>{app.state=state;};',h.context);h.ui.wire();h.ui.openEntryDeletion();
+  const input=h.ui.app.entryDeletion.labels[0].children[0];input.checked=true;input.dispatch('change');
+  await h.ui.reviewEntryDeletion();
+  assert.equal(h.requests.length,1);assert.equal(h.requests[0].endpoint,'/api/entries/delete-preview');
+  assert.deepEqual(h.requests[0].payload.selected,[{source_kind:'workbook',plant:'plant1',sn:'17',sheet:'Inward Register',row:2}]);
+  assert.match(text(h.controls.get('#entry-delete-review-list')),/0212_Acme_Mumbai.pdf/);
+  assert.match(h.controls.get('#entry-delete-kept-hdd').textContent,/kept as standalone/);
+  assert.equal(h.controls.get('#entry-delete-confirm').disabled,true);
+  assert.equal(h.controls.get('#entry-delete-cancel').focused,true);
+  await h.ui.confirmEntryDeletion();assert.equal(h.requests.length,1);
+  h.controls.get('#entry-delete-checked').checked=true;h.controls.get('#entry-delete-checked').dispatch('change');
+  await h.ui.confirmEntryDeletion();
+  assert.equal(h.requests.length,2);assert.equal(h.requests[1].endpoint,'/api/entries/delete');
+  assert.equal(h.requests[1].payload.review_token,'review-token');assert.equal(h.requests[1].payload.checked,true);
+  assert.equal(h.controls.get('#entry-deletion-modal').open,false);assert.equal(h.ui.app.entryDeletion,null);
+});
+
+test('Canceling advanced deletion clears its review and never deletes an entry', async () => {
+  const h=harness({fetch:async()=>({ok:true,json:async()=>({review:{entries:[],pdfs:[],kept_hdd:[]},review_token:'token'})})});
+  h.ui.app.state={rows:deletionSearchRows,workspace_revision:'search-review'};h.ui.wire();h.ui.openEntryDeletion();
+  h.ui.app.entryDeletion.checked.add(0);await h.ui.reviewEntryDeletion();
+  h.controls.get('#entry-deletion-modal').close();
+  assert.equal(h.ui.app.entryDeletion,null);assert.equal(h.requests.length,1);
+  assert.equal(h.controls.get('#entry-delete-checked').checked,false);
+});
+
+test('Standalone HDD kept after deleting a mistaken inward never guesses another Excel entry', () => {
+  const h=harness();h.ui.app.state.rows=[deletionSearchRows[0]];
+  assert.equal(h.ui.excelTarget({source_kind:'manual',record_id:'kept-hdd',certificate_type:'destruction',supplier:'Acme Medical',location:'Mumbai',detached_inward:{plant:'plant1',case_id:'17'}}),null);
+});
+
+test('Removal review shows the exact inward, defaults to Keep entry and cannot submit unchecked', async () => {
+  const h=removalHarness();await h.ui.openInwardRemoval(removalRow);
+  assert.equal(h.requests.length,1);assert.equal(h.requests[0].endpoint,'/api/clients/remove-preview');
+  assert.match(text(h.controls.get('#remove-inward-facts')),/ABC Company.*25.*Plant 1/);
+  assert.equal(h.controls.get('#keep-inward').focused,true);
+  assert.equal(h.controls.get('#remove-inward-checked').checked,false);
+  assert.equal(h.controls.get('#confirm-remove-inward').disabled,true);
+  await h.ui.confirmInwardRemoval();assert.equal(h.requests.length,1);
+  h.controls.get('#remove-inward-checked').checked=true;
+  await h.ui.confirmInwardRemoval();assert.equal(h.requests.length,1,'Disabled button cannot be bypassed by a click');
+});
+
+test('Deliberate removal sends the reviewed identity once and closes after success', async () => {
+  const h=removalHarness();await h.ui.openInwardRemoval(removalRow);
+  h.controls.get('#remove-inward-checked').checked=true;h.controls.get('#confirm-remove-inward').disabled=false;
+  await Promise.all([h.ui.confirmInwardRemoval(),h.ui.confirmInwardRemoval()]);
+  assert.equal(h.requests.filter(r=>r.endpoint==='/api/clients/remove').length,1);
+  const sent=h.requests.at(-1).payload;
+  assert.equal(sent.checked,true);assert.equal(sent.review_token,'reviewed-entry');
+  assert.equal(sent.sn,'25');assert.equal(sent.row,3);assert.equal(sent.expected_revision,'revision-1');
+  assert.equal(h.controls.get('#remove-inward-modal').open,false);
+});
+
+test('Removal errors keep the message open, clear consent and preserve the reviewed identity for retry', async () => {
+  const h=removalHarness(true);await h.ui.openInwardRemoval(removalRow);
+  h.controls.get('#remove-inward-checked').checked=true;h.controls.get('#confirm-remove-inward').disabled=false;
+  await h.ui.confirmInwardRemoval();
+  assert.equal(h.controls.get('#remove-inward-modal').open,true);
+  assert.equal(h.controls.get('#remove-inward-checked').checked,false);
+  assert.equal(h.controls.get('#confirm-remove-inward').disabled,true);
+  assert.match(h.controls.get('#remove-inward-error').textContent,/files changed/);
+  assert.equal(h.ui.app.removalPending.sn,'25');
+});
+
+test('Closing removal clears consent and Enter on the checkbox never deletes', async () => {
+  const h=removalHarness();h.ui.wire();await h.ui.openInwardRemoval(removalRow);
+  let prevented=false;
+  h.controls.get('#remove-inward-modal').dispatch('keydown',{key:'Enter',target:h.controls.get('#remove-inward-checked'),preventDefault(){prevented=true;}});
+  assert.equal(prevented,true);assert.equal(h.requests.length,1);
+  h.controls.get('#remove-inward-checked').checked=true;h.controls.get('#remove-inward-checked').dispatch('change');
+  assert.equal(h.controls.get('#confirm-remove-inward').disabled,false);
+  h.controls.get('#remove-inward-modal').close();
+  assert.equal(h.ui.app.removalPending,null);assert.equal(h.controls.get('#remove-inward-checked').checked,false);
+  assert.equal(h.controls.get('#confirm-remove-inward').disabled,true);
+  await h.ui.openInwardRemoval(removalRow);
+  assert.equal(h.controls.get('#confirm-remove-inward').disabled,true);
+});
+
+test('HDD change review shows received dates and device numbers instead of stored JSON', () => {
+  const h=harness(), form=editing(h);
+  const before='[{"date":"2026-08-06","count":""}]', after='[{"date":"2026-08-06","count":"153"}]';
+  form.values.certificate_type='destruction';h.ui.app.editor.template='destruction';
+  h.ui.app.editor.baseline.details.certificate_type='destruction';
+  h.ui.app.editor.baseline.details.certificate_fields={device_receipts:before};
+  h.ui.app.editor.fields.destruction={device_receipts:after};
+  h.ui.app.templates=[{id:'destruction',name:'Data destruction',fields:[{key:'device_receipts',label:'Device receipts'}]}];
+  h.ui.renderChangeSummary();
+  const shown=text(h.controls.get('#change-list'));
+  assert.match(shown,/Device receipts.*Before:.*06\/08\/26.*Number not entered.*After:.*06\/08\/26.*153 devices/);
+  assert.doesNotMatch(shown,/"date"|"count"|\[\{|device_receipts/);
+  assert.equal(JSON.parse(h.ui.detailsBody(form).details.certificate_fields.device_receipts)[0].count,'153');
+});
+
+test('Both device-list key formats, multiple dates, singular counts and missing details are readable', () => {
+  const h=harness(), rows=[{date:'2026-08-06',count:'1'},{date:'',count:'153'}];
+  const plain=h.ui.changeDisplay('device_receipts',JSON.stringify(rows));
+  assert.equal(plain,h.ui.changeDisplay('certificate_fields.device_receipts',JSON.stringify(rows)));
+  assert.match(plain,/1 device; Date not entered.*153 devices/);
+  assert.equal(plain,h.ui.changeDisplay('device_receipts',rows));
+  for(const value of ['bad JSON','{}','null']) {
+    assert.match(h.ui.changeDisplay('device_receipts',value),/Check the received dates/);
+  }
+  assert.equal(h.ui.changeDisplay('device_receipts','[]'),'No devices entered');
+  assert.match(h.ui.changeDisplay('device_receipts','[{"date":{},"count":"0"}]'),/Check the received date.*Check the number/);
+});
 
 function editing(h) {
   const form = h.controls.get('#details-form');
   form.values = {plant:'plant1',source_kind:'workbook',edit_scope:'certificate_only',certificate_type:'standard',supplier:'Acme',weight:'100.2',case_id:'1001',use_certificate_weight:false};
   const inputs = {};
-  form.elements = {namedItem: name => inputs[name] ||= {type:name === 'use_certificate_weight' ? 'checkbox' : 'text', focus(){this.focused = true;}, get value() {return form.values[name] || '';}, set value(value) {form.values[name] = value;}, get checked() {return Boolean(form.values[name]);}, set checked(value) {form.values[name] = Boolean(value);}}};
+  form.elements = {namedItem: name => inputs[name] ||= {dataset:{},listeners:{},addEventListener:Node.prototype.addEventListener,type:name === 'use_certificate_weight' ? 'checkbox' : 'text', focus(){this.focused = true;}, setCustomValidity(message){this.validationMessage=message;}, checkValidity(){return !this.validationMessage;}, reportValidity(){return this.checkValidity();}, get value() {return form.values[name] || '';}, set value(value) {form.values[name] = value;}, get checked() {return Boolean(form.values[name]);}, set checked(value) {form.values[name] = Boolean(value);}}};
   form.reset = () => {};
   form.reportValidity = () => true;
   form.checkValidity = () => true;
@@ -102,6 +503,59 @@ function editing(h) {
   h.ui.app.editor.baseline = h.ui.detailsBody(form);
   return form;
 }
+
+test('Analytics overview navigation preserves company and saved-file workspaces', () => {
+  const h = harness();
+  h.ui.setWorkspaceView('analytics');
+  assert.equal(h.ui.app.workspaceView, 'analytics');
+  assert.equal(h.controls.get('#analytics-workspace').hidden, false);
+  assert.equal(h.controls.get('#records-workspace').hidden, true);
+  assert.equal(h.controls.get('#folder-inventory').hidden, true);
+  assert.equal(h.controls.get('#view-records').attributes['aria-pressed'], 'false');
+  h.ui.setWorkspaceView('records');
+  assert.equal(h.controls.get('#analytics-workspace').hidden, true);
+  assert.equal(h.controls.get('#records-workspace').hidden, false);
+});
+
+test('Analytics drilldown filters isolate pending review, dispatch and destruction follow-up', () => {
+  const h = harness(), filter = h.controls.get('#status-filter');
+  const generated = {plant:'plant1',certificate_status:'generated'};
+  const manual = {plant:'plant1',certificate_status:'generated_manual'};
+  filter.value = 'awaiting_send';
+  assert.equal(h.ui.matches(generated), true);
+  assert.equal(h.ui.matches(manual), true);
+  assert.equal(h.ui.matches({...generated,certificate_status:'completed'}), false);
+  filter.value = 'pending_review';
+  assert.equal(h.ui.matches({...generated,certificate_status:'blank'}), true);
+  assert.equal(h.ui.matches({...generated,certificate_status:'ready',warnings:['Check weight']}), true);
+  assert.equal(h.ui.matches({...generated,certificate_status:'ready'}), false);
+  assert.equal(h.ui.matches(generated), false);
+  filter.value = 'destruction_pending';
+  assert.equal(h.ui.matches({...manual,certificate_type:'destruction'}), true);
+  assert.equal(h.ui.matches({...manual,certificate_type:'destruction',certificate_status:'completed'}), false);
+  filter.value = 'overdue_unissued'; h.ui.app.analyticsAsOf = '2026-10-19';
+  assert.equal(h.ui.matches({...generated,certificate_status:'ready',inward_date:'2026-08-01'}), true);
+  assert.equal(h.ui.matches({...generated,certificate_status:'ready',inward_date:'2026-08-01',destruction_source:{sn:'1'}}), false);
+  assert.equal(h.ui.matches({...generated,inward_date:'2026-08-01'}), false);
+});
+
+test('The dashboard inward-date drilldown shows only matching inwards for its plant', () => {
+  const h = harness(); h.ui.wire();
+  h.ui.setState({rows:[
+    {plant:'plant1',sn:'1',supplier:'Date missing',inward_date:''},
+    {plant:'plant1',sn:'2',supplier:'Invalid date',inward_date:'31/02/26'},
+    {plant:'plant1',sn:'3',supplier:'Date present',inward_date:'2026-11-01'},
+    {plant:'plant2',sn:'4',supplier:'Other plant',inward_date:''},
+    {plant:'plant1',sn:'1',supplier:'Linked HDD',source_kind:'manual',record_id:'hdd',inward_date:''},
+  ]});
+  h.controls.get('#analytics-plant').value = 'plant1';
+  h.controls.get('#serial-filter').value = '3';
+  h.controls.get('#received-date-filter').value = '01/11/26';
+  h.controls.get('#analytics-workspace').dispatch('analytics:review',{detail:{status:'needs_inward_date'}});
+  assert.equal(h.ui.app.workspaceView,'records');
+  assert.equal(h.controls.get('#queue-title').textContent,'Inwards that need a received date');
+  assert.deepEqual(Array.from(h.ui.app.filtered, item=>item.row.sn),['1','2']);
+});
 
 const duplicateIssueExamples = [
   'COD 0365 is already recorded in certificate PDF history (0365_Dummy Client 2_Pune_1.pdf). If you continue, new automatic COD 0393 will be used; existing PDFs will not be overwritten.',
@@ -124,7 +578,7 @@ test('Unreadable workbooks get a separate message and readable companies stay vi
   assert.doesNotMatch(messages,/Received date missing|Company name missing/);
   assert.equal(h.controls.get('#open-bulk').disabled,true);
   const actions=h.ui.makeActions(h.ui.app.state.rows[0],0);
-  assert.match(text(actions),/View details.*Open in Excel/);
+  assert.match(text(actions),/Review & edit.*Open in Excel/);
   assert.doesNotMatch(text(actions),/Review & create/);
 });
 
@@ -165,7 +619,7 @@ test('Issued duplicate and history-conflict records remain blocked and keep Open
       const actions = all(h.ui.makeActions(row,0), node => node.tag === 'button');
       assert.equal(actions.filter(node => node.textContent === 'Open in Excel').length,1);
       assert.equal(actions.filter(node => node.dataset.action === 'edit-details' || node.dataset.action === 'complete').length,0);
-      await h.ui.openDetails(row,false,true);
+      await h.ui.openDetails(row,true,false);
       assert.equal(h.ui.app.editor.issuanceBlocked,true);
       assert.equal(h.controls.get('#save-details').disabled,true);
       assert.equal(h.controls.get('#preview-details').disabled,true);
@@ -182,20 +636,18 @@ test('Issued duplicate and history-conflict records remain blocked and keep Open
   }
 });
 
-test('Duplicate issue cards keep the COD change, reference and next steps visible without technical filenames', async () => {
+test('Duplicate issue cards keep the COD change and omit retired reference notices', async () => {
   const h = harness({fetch:async () => ({ok:true,json:async () => ({preview_url:`/previews/${'a'.repeat(32)}.pdf`,
     certificate_no:'0393', warnings:duplicateIssueExamples})})}); editing(h);
   await h.ui.previewDetails();
   const list = h.controls.get('#preview-warnings');
-  const cards = all(list,node => node.className === 'issue-card'); assert.equal(cards.length,2);
+  const cards = all(list,node => node.className === 'issue-card'); assert.equal(cards.length,1);
   const visibleCopy = card => card.children.filter(node => node.tag !== 'details').map(text).join(' ');
   assert.match(visibleCopy(cards[0]),/COD 0365 is already used.*COD 0393.*Existing PDFs stay unchanged.*inward already has a certificate/);
-  assert.match(visibleCopy(cards[1]),/Reference already used.*DUMMY-REF-1002.*reference unchanged.*same inward.*cancel/);
-  assert.doesNotMatch(visibleCopy(cards[0]) + visibleCopy(cards[1]),/What to do:/);
+  assert.doesNotMatch(text(list),/Reference already used|DUMMY-REF-1002/);
+  assert.doesNotMatch(visibleCopy(cards[0]),/What to do:/);
   for (let index = 0; index < cards.length; index++) {
     assert.doesNotMatch(visibleCopy(cards[index]), /\.pdf|PDF history|automatic COD/);
-    const details = cards[index].children.find(node => node.tag === 'details');
-    assert.notEqual(details.open,true); assert.ok(text(details).includes(duplicateIssueExamples[index]));
   }
   assert.equal(h.controls.get('#preview-warnings-title').textContent,'Check before creating');
   assert.equal(h.requests.length,1); assert.equal(h.requests[0].endpoint,'/api/preview');
@@ -207,7 +659,7 @@ test('Warning review uses the same short duplicate messages and preserves the or
   const h = harness(); const form = editing(h); const payload = h.ui.detailsBody(form);
   h.ui.showWarnings([{plant:'plant1',supplier:'Acme',warnings:duplicateIssueExamples}],
     {endpoint:'/api/create',payload,fromDetails:true,revision:h.ui.app.previewRevision,reviewToken:'original-review'});
-  assert.equal(all(h.controls.get('#warning-list'),node => node.className === 'issue-card').length,2);
+  assert.equal(all(h.controls.get('#warning-list'),node => node.className === 'issue-card').length,1);
   assert.equal(h.ui.app.pendingConfirmation.payload,payload); assert.equal(h.ui.app.pendingConfirmation.reviewToken,'original-review');
   await h.ui.confirmWarnings();
   assert.equal(h.requests[0].payload.review_token,'original-review');
@@ -243,7 +695,8 @@ test('Unknown issues stay fully visible and company rows show a short useful iss
   const client = h.ui.makeClientCell({supplier:'Acme',certificate_status:'ready',warnings:duplicateIssueExamples},0);
   const note = all(client,node => node.className === 'row-alert-note')[0];
   assert.equal(note.textContent,'COD 0365 is already used');
-  assert.match(note.title,/0393.*DUMMY-REF-1002/); assert.doesNotMatch(note.textContent,/\.pdf|…/);
+  assert.match(note.title,/0393/); assert.doesNotMatch(note.title,/DUMMY-REF-1002/);
+  assert.doesNotMatch(note.textContent,/\.pdf|…/);
 });
 
 test('Saved PDF issues identify the certificate and keep unknown file alerts intact', () => {
@@ -261,12 +714,12 @@ test('Saved PDF issues identify the certificate and keep unknown file alerts int
 });
 test('Overdue does not conceal canonical certificate statuses', () => {
   const {ui} = harness();
-  for (const [state, label] of [['ready','Ready'],['alert','Needs attention'],['generated','Generated'],['generated_manual','Generated Manual'],['completed','Completed'],['blank',''],['na','N/A']]) {
+  for (const [state, label] of [['ready','Ready'],['alert','Needs attention'],['generated','Generated'],['generated_manual','Generated Externally'],['completed','Completed'],['blank',''],['na','N/A']]) {
     assert.equal(ui.stateLabel({certificate_status:state,overdue:true}), label);
     const expectedClass = state === 'alert' ? 'status-needs_attention' : `status-${state}`;
     assert.equal(ui.statusClass({certificate_status:state,overdue:true}), expectedClass);
   }
-  for (const [legacy, canonical] of [['Created','Generated'],['Sent','Completed'],['Check Details','Needs attention'],['Working Draft','Needs attention']]) {
+  for (const [legacy, canonical] of [['Created','Generated'],['Sent','Completed'],['Check Details','Needs attention'],['Working Draft','Needs attention'],['Generated Manual','Generated Externally'],['Generated Externally','Generated Externally']]) {
     assert.equal(ui.stateLabel({certificate_status:legacy}), canonical);
   }
 });
@@ -310,6 +763,40 @@ test('Background Excel checks refresh Ready and its revision without interruptin
   assert.equal(h.ui.app.state.rows[0].certificate_status, 'ready');
   assert.equal(h.ui.app.workspaceRevision, 'saved-excel');
 });
+test('Background workbook errors stay inline and disappear after recovery', async () => {
+  let failed=true;
+  const h=harness({fetch:async()=>{
+    if (failed) throw new Error('Temporary connection failure');
+    return {ok:true,json:async()=>({changed:false})};
+  }});
+  h.controls.get('#offline-screen').hidden=true;
+  h.controls.get('#busy-overlay').hidden=true;
+  await h.ui.syncWorkbookChanges();
+  await h.ui.syncWorkbookChanges();
+  assert.equal(h.controls.get('#offline-screen').hidden,true);
+  assert.equal(h.controls.get('#toast').classList.contains('visible'),false);
+  assert.equal(h.controls.get('#workbook-issue-list').children.length,1);
+  assert.match(text(h.controls.get('#workbook-issue-list')),/could not be reached/);
+  failed=false;
+  await h.ui.syncWorkbookChanges();
+  assert.equal(h.controls.get('#workbook-issues').hidden,true);
+});
+
+test('Automatic preview problems stay by the preview, explicit requests show the error', async () => {
+  const h=harness({fetch:async()=>({ok:false,status:400,json:async()=>({error:'Enter the actual date the devices were destroyed.'})})});
+  const form=editing(h);
+  form.reportValidity=()=>{throw new Error('Automatic preview must not pop up field validation');};
+  form.checkValidity=()=>false;
+  await h.ui.previewDetails({automatic:true});
+  assert.equal(h.requests.length,0);
+  form.checkValidity=()=>true;
+  await h.ui.previewDetails({automatic:true});
+  assert.equal(h.controls.get('#details-error').hidden,true);
+  assert.match(h.controls.get('#preview-status').textContent,/Destruction date missing/);
+  await h.ui.previewDetails();
+  assert.equal(h.controls.get('#details-error').hidden,false);
+});
+
 test('Search still finds identifiers hidden from the main table', () => {
   const {ui,controls} = harness();
   for (const [key,value] of [['reference','REF-19'],['form6','F6-20'],['sn','4018'],['certificate_no','0324']]) {
@@ -320,24 +807,24 @@ test('Search still finds identifiers hidden from the main table', () => {
 test('Ready action opens review, never immediately generates', () => {
   const {ui} = harness(); const node = ui.makeActions({certificate_status:'ready',supplier:'Acme'},4);
   const buttons = all(node, node => node.tag === 'button');
-  assert.equal(buttons[0].textContent, 'Review & create');
-  assert.equal(buttons[0].dataset.action, 'details');
+  assert.equal(buttons[0].textContent, 'Review & edit');
+  assert.equal(buttons[0].dataset.action, 'edit-details');
   assert.equal(buttons.length, 1, 'Review opens the preview directly without a Details expansion.');
 });
-test('Explicit Edit details actions open editing, while Review & create stays preview-first', async () => {
+test('Review & edit opens the editable form before or after issuance', async () => {
   const h = harness();
   const row = {certificate_status:'alert',supplier:'Acme',plant:'plant1',sn:'1001'};
   h.ui.app.state.rows = [row];
   const rowAction = all(h.ui.makeActions(row,0), node => node.tag === 'button')[0];
   const detailAction = all(h.ui.makeDetailRow(row,0), node => node.tag === 'button').find(node => node.textContent === 'Edit details');
-  assert.equal(rowAction.textContent,'Review details'); assert.equal(rowAction.dataset.action,'edit-details');
+  assert.equal(rowAction.textContent,'Review & edit'); assert.equal(rowAction.dataset.action,'edit-details');
   assert.equal(detailAction.dataset.action,'edit-details');
   vm.runInContext('globalThis.editorRequests = []; openDetails = (...args) => editorRequests.push(args);',h.context);
   await h.ui.handleAction(rowAction);
   await h.ui.handleAction({dataset:{index:'0',action:'details'}});
-  assert.deepEqual(JSON.parse(JSON.stringify(h.context.editorRequests.map(args => args[3] || false))),[true,false]);
+  assert.deepEqual(JSON.parse(JSON.stringify(h.context.editorRequests.map(args => args[2] || false))),[true,false]);
 });
-test('Generated Manual has its own filter and can be marked Completed', () => {
+test('Generated Externally has its own filter and can be marked Completed', () => {
   const {ui,controls} = harness(); controls.get('#status-filter').value = 'generated_manual';
   const row = {certificate_status:'generated_manual',supplier:'Acme',pdf_filename:'0001_Acme.pdf'};
   assert.equal(ui.matches(row), true);
@@ -347,7 +834,7 @@ test('Generated Manual has its own filter and can be marked Completed', () => {
 test('Full logs are retained only inside a closed technical disclosure', () => {
   const {ui} = harness(); const raw = 'Created very_long_filename.pdf; Workbook backup: old.xlsx';
   const detail = ui.makeDetailRow({certificate_status:'generated',detail:raw,display_weight:1.7999999999999998},0);
-  assert.equal(detail.children[0].colSpan, 5);
+  assert.equal(detail.children[0].colSpan, 6);
   const technical = all(detail,node => node.tag === 'details').find(node => node.children[0].textContent === 'Technical details');
   assert.ok(technical); assert.notEqual(technical.open,true); assert.match(text(technical), /very_long_filename/);
   assert.match(text(detail), /1.8 kg/);
@@ -391,7 +878,9 @@ test('Saved certificates share one list with clear folder sources and preserve l
   ui.app.state.certificate_inventory = {entries};
   ui.renderFolderInventory();
   const labels = all(controls.get('#folder-inventory-files'), node => node.className === 'saved-file-source').map(node => node.textContent);
-  assert.deepEqual(labels.sort(), ['Auto Generated','Created in App','Created in App','Existing PDF','Manually Added'].sort());
+  assert.deepEqual(labels.sort(), ['Auto Generated','Auto Generated','Auto Generated','Existing PDF','Manually Added'].sort());
+  ui.showSavedFile(entries[0]);
+  assert.doesNotMatch(text(controls.get('#saved-file-facts')), /Created in App/);
   ui.showSavedFile(entries[1]);
   assert.match(text(controls.get('#saved-file-facts')), /Source Manually Added/);
 });
@@ -448,7 +937,7 @@ test('Analytics cards count the standardized certificate statuses', () => {
   controls.get('#status-filter').value = 'needs_attention';
   assert.equal(ui.matches(ui.app.state.rows[2]),true);
   assert.equal(controls.get('#count-generated').textContent,1);
-  assert.equal(controls.get('#count-generated-manual').textContent,1);
+  assert.equal(controls.get('#count-generated-externally').textContent,1);
   assert.equal(controls.get('#count-completed').textContent,1);
   assert.equal(controls.get('#count-overdue').textContent,0);
 });
@@ -483,7 +972,8 @@ test('Optional form sections and bulk action are closed by default', () => {
   for (const match of html.matchAll(/<details\b[^>]*>/g)) assert.doesNotMatch(match[0], /\bopen\b/);
   assert.equal((html.match(/name="certificate_weight"/g)||[]).length,1);
   assert.equal((html.match(/name="cod_no"/g)||[]).length,1);
-  assert.equal((html.match(/<th>/g)||[]).length,5);
+  const queueHeader = html.match(/<thead><tr><th>SN<\/th><th>Company<\/th>.*?<\/thead>/s)?.[0] || '';
+  assert.equal((queueHeader.match(/<th>/g)||[]).length,6);
 });
 test('Bulk creation payload follows the selected plant filter exactly', () => {
   const {ui,controls} = harness();
@@ -494,6 +984,32 @@ test('Bulk creation payload follows the selected plant filter exactly', () => {
   assert.deepEqual(JSON.parse(JSON.stringify(ui.bulkGenerationPayload())), {plants:['plant2']});
   plantFilter.value = 'all';
   assert.deepEqual(JSON.parse(JSON.stringify(ui.bulkGenerationPayload())), {plants:['plant1','plant2']});
+});
+
+test('Company SN and received-date filters and familiar sort choices work together', () => {
+  const h=harness();
+  const rows=[{plant:'plant1',sn:'10',supplier:'Beta',inward_date:'2026-10-02'},
+    {plant:'plant1',sn:'2',supplier:'Alpha',inward_date:'2026-10-01'}];
+  h.controls.get('#serial-filter').value='2';
+  assert.equal(h.ui.matches(rows[0]),false);assert.equal(h.ui.matches(rows[1]),true);
+  h.controls.get('#serial-filter').value='';h.controls.get('#received-date-filter').value='2026-10-02';
+  assert.equal(h.ui.matches(rows[0]),true);assert.equal(h.ui.matches(rows[1]),false);
+  h.controls.get('#received-date-filter').value='';h.controls.get('#company-sort').value='serial';
+  assert.equal([...rows].sort(h.ui.compareRows)[0].sn,'2');
+  h.controls.get('#company-sort').value='received-newest';assert.equal([...rows].sort(h.ui.compareRows)[0].sn,'10');
+  h.controls.get('#company-sort').value='company';assert.equal([...rows].sort(h.ui.compareRows)[0].supplier,'Alpha');
+});
+
+test('Linked HDD and its saved PDF open the same inward in Excel without guessing ambiguous clients', () => {
+  const h=harness();
+  const inward={source_kind:'workbook',plant:'plant1',sn:'12',supplier:'ABC',location:'Pune',sheet:'Inward',row:5};
+  const hdd={source_kind:'manual',record_id:'hdd-1',plant:'plant1',certificate_type:'destruction',supplier:'ABC',location:'Pune',destruction_source:{plant:'plant1',case_id:'12'}};
+  h.ui.app.state.rows=[inward,hdd];
+  assert.deepEqual(JSON.parse(JSON.stringify(h.ui.excelTarget(hdd))),{plant:'plant1',sn:'12',sheet:'Inward',row:5});
+  assert.equal(h.ui.excelTarget({managed_owner:{source_kind:'manual',plant:'plant1',key:'hdd-1'}}).sn,'12');
+  assert.match(text(h.ui.makeActions(hdd,1)),/Open in Excel/);
+  delete hdd.destruction_source;assert.equal(h.ui.excelTarget(hdd).sn,'12');
+  h.ui.app.state.rows.push({...inward,sn:'13',row:6});assert.equal(h.ui.excelTarget(hdd),null);
 });
 test('Clean numeric displays preserve untouched precision in the generation payload', () => {
   const {ui} = harness();
@@ -582,9 +1098,22 @@ test('Past numbers are searchable without changing the inventory', () => {
   assert.equal(JSON.stringify(ui.app.state),before);
 });
 
+test('Saved HDD details show its own number while attached certificate numbers stay reserved', () => {
+  const h = harness();
+  const entry = {path:'Certificates/Auto Generated/0205_Company_Mumbai_hdd.pdf',present:true,
+    cods:['0189','0205'],current_cods:['0205'],attachment_cods:['0189'],references:['REF-1'],warnings:[]};
+  h.ui.showSavedFile(entry);
+  const facts = text(h.controls.get('#saved-file-facts'));
+  assert.match(facts,/Certificate number\s+0205/);
+  assert.doesNotMatch(facts,/0189/);
+  assert.doesNotMatch(facts,/Reference number|REF-1/);
+  assert.equal(h.controls.get('#saved-file-warnings').hidden,true);
+  assert.deepEqual(entry.cods,['0189','0205']);
+});
+
 test('Every tracked mutation carries a revision; explicit editor revision stays frozen', async () => {
   const h = harness({fetch:async () => ({ok:true,json:async () => ({workspace_revision:'revision-2',state:{rows:[]}})})}); h.ui.app.workspaceRevision = 'revision-1';
-  for (const endpoint of ['/api/create','/api/generate','/api/manual/save','/api/manual/generate','/api/manual/complete','/api/complete','/api/backup/restore']) {
+  for (const endpoint of ['/api/create','/api/generate','/api/manual/save','/api/manual/generate','/api/manual/complete','/api/complete','/api/backup/restore','/api/destruction/request']) {
     await h.ui.api(endpoint, {});
     assert.equal(h.requests.at(-1).payload.expected_revision, endpoint === '/api/create' ? 'revision-1' : 'revision-2');
   }
@@ -592,6 +1121,124 @@ test('Every tracked mutation carries a revision; explicit editor revision stays 
   assert.equal(h.requests.at(-1).payload.expected_revision,'editor-snapshot');
   await h.ui.api('/api/state'); assert.equal(h.requests.at(-1).method,'GET');
   await h.ui.api('/api/backup/create', {}); assert.equal(h.requests.at(-1).payload.expected_revision,undefined);
+});
+
+test('Marking HDD inside the editor and reopening it reuses the saved request without a refresh', async () => {
+  const inwards = [
+    {plant:'plant1',sn:'1',supplier:'First company'},
+    {plant:'plant2',sn:'1',supplier:'Second company'},
+  ];
+  const requests = [];
+  let revision = 'before-requests';
+  const h = harness({fetch:async (endpoint, init) => {
+    assert.equal(endpoint,'/api/destruction/request');
+    const payload = JSON.parse(init.body);
+    if (payload.expected_revision !== revision) return {ok:false,json:async()=>({error:'Excel has changed. Refresh and review the latest details.'})};
+    const id = `request-${payload.plant}`;
+    if (!requests.some(row => row.record_id === id)) {
+      requests.push({record_id:id,plant:payload.plant,source_kind:'manual',certificate_type:'destruction',destruction_source:{plant:payload.plant,case_id:payload.sn}});
+      revision = `with-${requests.length}-requests`;
+    }
+    return {ok:true,json:async()=>({record_id:id,state:{rows:[...inwards,...requests]},workspace_revision:revision})};
+  }});
+  vm.runInContext(`render=()=>{}; renderFolderInventory=()=>{}; updateSettingsDisplay=()=>{};
+    setDetailsBusy=on=>{app.detailsBusy=on;};
+    openDetails=async row=>{app.openedRequest=row.record_id; $('#details-modal').showModal();};
+    editorDirty=()=>false;`,h.context);
+  h.ui.setState({rows:inwards,workspace_revision:revision});
+  for (const index of [0,1,0,1]) {
+    const form=editing(h);
+    form.values.plant=inwards[index].plant;form.values.case_id=inwards[index].sn;
+    Object.assign(h.ui.app.editor,{sourceSn:inwards[index].sn,sourcePlant:inwards[index].plant,workspaceRevision:revision});
+    h.controls.get('#destruction-needed').checked=false;
+    h.ui.app.editor.baseline=h.ui.detailsBody(form);
+    h.controls.get('#destruction-needed').checked=true;
+    if (!requests.some(row=>row.plant===inwards[index].plant)) await h.ui.saveInwardDetails();
+    await h.ui.openCompanionCertificate();
+    assert.equal(h.controls.get('#details-modal').open,true);
+    assert.equal(h.ui.app.openedRequest,`request-${inwards[index].plant}`);
+    assert.equal(h.ui.app.state.workspace_revision,revision);
+    assert.equal(h.ui.app.detailsBusy,false);
+    assert.equal(h.ui.requestDetailsClose(),true);
+  }
+  assert.equal(requests.length,2,'Reopening must reuse each existing request.');
+  assert.equal(h.requests.length,2,'An existing HDD request opens without another save or refresh.');
+});
+
+test('A successful deletion uses the returned revision instead of an old nested report token', async () => {
+  const h=harness({fetch:async()=>({ok:true,json:async()=>({workspace_revision:'after-delete',state:{rows:[],workspace_revision:'before-delete'}})})});
+  h.ui.app.workspaceRevision='before-delete';
+  const result=await h.ui.api('/api/clients/remove',{});
+  assert.equal(h.ui.app.workspaceRevision,'after-delete');
+  assert.equal(result.state.workspace_revision,'after-delete');
+  await h.ui.api('/api/clients/remove-preview',{});
+  assert.equal(h.requests.at(-1).payload.expected_revision,'after-delete');
+});
+
+test('A changed Excel file refreshes the queue and clears a stale deletion review without replaying it', async () => {
+  let changed=false;
+  const h=harness({fetch:async endpoint=>({ok:!changed || endpoint==='/api/check',json:async()=>
+    endpoint==='/api/clients/remove-preview' ? {entry:{...removalRow,materials:1},review_token:'old-review',expected_revision:'old'}
+    : endpoint==='/api/check' ? {workspace_revision:'latest',state:{rows:[{...removalRow,supplier:'Latest Excel company'}]}}
+    : {error:'The files changed since you opened these details.'}})});
+  vm.runInContext('setState=state=>{app.state=state;app.workspaceRevision=state.workspace_revision;};',h.context);
+  h.ui.app.workspaceRevision='old';await h.ui.openInwardRemoval(removalRow);
+  h.controls.get('#remove-inward-checked').checked=true;h.controls.get('#confirm-remove-inward').disabled=false;
+  changed=true;await h.ui.confirmInwardRemoval();
+  assert.equal(h.requests.filter(r=>r.endpoint==='/api/clients/remove').length,1);
+  assert.equal(h.requests.at(-1).endpoint,'/api/check');
+  assert.equal(h.ui.app.workspaceRevision,'latest');
+  assert.equal(h.controls.get('#remove-inward-modal').open,false);
+  assert.equal(h.ui.app.removalPending,null);
+  assert.equal(h.ui.app.state.rows[0].supplier,'Latest Excel company');
+});
+
+test('A real external change still blocks a destruction request without opening or retrying it', async () => {
+  const h = harness({fetch:async()=>({ok:false,json:async()=>({error:'Excel has changed. Refresh and review the latest details.'})})});
+  h.ui.app.workspaceRevision='reviewed'; h.ui.app.state.rows=[{plant:'plant1',sn:'1'}];
+  editing(h);h.ui.app.editor.workspaceRevision='reviewed';h.controls.get('#destruction-needed').checked=true;
+  vm.runInContext('setDetailsBusy=on=>{app.detailsBusy=on;};',h.context);
+  await h.ui.saveInwardDetails();
+  assert.equal(h.requests.length,2); assert.equal(h.requests[0].payload.expected_revision,'reviewed');
+  assert.equal(h.requests[1].endpoint,'/api/check','refresh the queue without retrying the rejected save');
+  assert.equal(h.controls.get('#details-modal').open,true);
+  assert.equal(h.ui.app.workspaceRevision,'reviewed'); assert.equal(h.ui.app.detailsBusy,false);
+  assert.match(h.controls.get('#details-error').textContent,/Excel has changed/);
+});
+
+test('A late background check cannot roll back a newly opened data destruction request', async () => {
+  let finish;
+  const h = harness({fetch:async endpoint=>endpoint === '/api/workbook-changes'
+    ? new Promise(resolve=>{finish=resolve;})
+    : {ok:true,json:async()=>({record_id:'new-request',workspace_revision:'request-saved',state:{rows:[{record_id:'new-request',source_kind:'manual'}]}})}
+  });
+  vm.runInContext(`render=()=>{}; renderFolderInventory=()=>{}; updateSettingsDisplay=()=>{};
+    setDetailsBusy=on=>{app.detailsBusy=on;}; openDetails=async()=>{};`,h.context);
+  h.controls.get('#offline-screen').hidden=true; h.controls.get('#busy-overlay').hidden=true;
+  h.ui.setState({rows:[{plant:'plant1',sn:'1'}],workspace_revision:'before-request'});
+  const pending=h.ui.syncWorkbookChanges();
+  editing(h);h.ui.app.editor.workspaceRevision='before-request';h.controls.get('#destruction-needed').checked=true;
+  await h.ui.saveInwardDetails();
+  finish({ok:true,json:async()=>({changed:true,workspace_revision:'before-request',state:{rows:[{plant:'plant1',sn:'1'}]}})});
+  await pending;
+  assert.equal(h.ui.app.workspaceRevision,'request-saved');
+  assert.equal(h.ui.app.state.rows[0].record_id,'new-request');
+});
+
+test('Choosing a backup folder rereads rows before another certificate action; cancel does not', async () => {
+  for (const cancelled of [false,true]) {
+    const h = harness({fetch:async endpoint=>({ok:true,json:async()=>
+      endpoint === '/api/backup/pick-destination' ? cancelled ? {cancelled:true} : {settings:{backup_destination:'D:\\Recovery'},workspace_revision:'settings-only'}
+      : endpoint === '/api/check' ? {state:{rows:[{supplier:'Checked company'}]},workspace_revision:'checked-after-settings'}
+      : {backups:[],workspace_revision:'settings-only'}
+    })});
+    vm.runInContext('setBusy=()=>{}; render=()=>{}; renderFolderInventory=()=>{}; updateSettingsDisplay=()=>{};',h.context);
+    h.ui.app.workspaceRevision='before-settings';
+    await h.ui.backupAction('pick-destination');
+    assert.equal(h.ui.app.workspaceRevision,cancelled ? 'before-settings' : 'checked-after-settings');
+    assert.equal(h.requests.filter(request=>request.endpoint==='/api/check').length,cancelled ? 0 : 1);
+    assert.equal(h.ui.app.backupBusy,false);
+  }
 });
 
 test('Change summary shows exact field differences and both tracking scopes', () => {
@@ -660,8 +1307,8 @@ test('Discarding startup recovery stays on the dashboard without opening a blank
   assert.equal(h.requests.length,0);
 });
 
-test('Discarding recovery prompted by New, Review, Edit or Copy resumes exactly the requested editor', async () => {
-  for (const action of ['new','details','edit-details','copy']) {
+test('Discarding recovery prompted by New, Review or Edit resumes exactly the requested editor', async () => {
+  for (const action of ['new','details','edit-details']) {
     const h = harness(); const form = editing(h); form.values.supplier = 'Previous draft';
     h.ui.saveWorkingDraft(); h.controls.get('#details-modal').close(); h.ui.wire();
     const row = {supplier:'Selected company',plant:'plant2',sn:'2001'}; h.ui.app.state.rows = [row];
@@ -671,9 +1318,9 @@ test('Discarding recovery prompted by New, Review, Edit or Copy resumes exactly 
     vm.runInContext('globalThis.editorRequests = []; openDetails = (...args) => editorRequests.push(args);',h.context);
     h.controls.get('#discard-working-draft').dispatch('click');
     assert.equal(h.context.editorRequests.length,1);
-    const [selected, copyAsNew, skipRecovery] = h.context.editorRequests[0];
-    assert.equal(selected,action === 'new' ? null : row); assert.equal(copyAsNew,action === 'copy'); assert.equal(skipRecovery,true);
-    assert.equal(h.context.editorRequests[0][3] || false,action === 'edit-details');
+    const [selected, skipRecovery, startEditing] = h.context.editorRequests[0];
+    assert.equal(selected,action === 'new' ? null : row); assert.equal(skipRecovery,true);
+    assert.equal(startEditing || false,action === 'edit-details');
     assert.equal(h.ui.readWorkingDraft(),null); assert.equal(h.requests.length,0);
   }
 });
@@ -777,6 +1424,20 @@ test('Canceled or overlapping action confirmations never mark a certificate Comp
   const source = fs.readFileSync(path.join(__dirname,'../web/app.js'),'utf8');
   assert.doesNotMatch(source,/\b(?:window\.)?(?:confirm|alert|prompt)\s*\(/);
   assert.match(source,/beforeunload/);
+});
+
+test('A late background response cannot replace Completed with an older Generated status or revision', async () => {
+  let finish;
+  const h = harness({fetch:async () => new Promise(resolve => {finish=resolve;})});
+  vm.runInContext('render=()=>{}; renderFolderInventory=()=>{}; updateSettingsDisplay=()=>{};',h.context);
+  h.controls.get('#offline-screen').hidden=true;h.controls.get('#busy-overlay').hidden=true;
+  h.ui.setState({rows:[{plant:'plant1',sn:'1001',certificate_status:'generated'}],workspace_revision:'old'});
+  const pending=h.ui.syncWorkbookChanges();
+  h.ui.setState({rows:[{plant:'plant1',sn:'1001',certificate_status:'completed'}],workspace_revision:'completed'});
+  finish({ok:true,json:async()=>({changed:true,state:{rows:[{plant:'plant1',sn:'1001',certificate_status:'generated'}],workspace_revision:'old'},workspace_revision:'old'})});
+  await pending;
+  assert.equal(h.ui.app.state.rows[0].certificate_status,'completed');
+  assert.equal(h.ui.app.workspaceRevision,'completed');
 });
 
 test('Warning continuation needs one click, uses the response revision and token, and keeps names/consequences', async () => {
@@ -906,7 +1567,7 @@ test('Backup options show localized date/time, file counts and pre-restore purpo
   vm.runInContext('setBusy = () => {};',h.context);
   await h.ui.openBackupRestore();
   const options = h.controls.get('#backup-selection').children;
-  const localized = new Date(timestamp).toLocaleString(undefined,{day:'2-digit',month:'short',year:'numeric',hour:'numeric',minute:'2-digit'});
+  const d=new Date(timestamp); const localized=`${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')}/${String(d.getFullYear()).slice(-2)} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
   assert.ok(options[0].textContent.startsWith(localized));
   assert.match(options[0].textContent,/24 files.*Pre-restore recovery copy/);
   assert.match(options[1].textContent,/1 file · Manual backup/);
@@ -1040,6 +1701,45 @@ test('Missing, unsafe or failed raster images retain a working full-PDF option w
   assert.match(h.controls.get('#preview-status').textContent,/could not be displayed.*full PDF/);
 });
 
+test('Attached PDF pages appear in the preview with Previous and Next and clear after editing', async () => {
+  const id='e'.repeat(32),pages=[2,3].map(page=>`/previews/${id}/page/${page}.png`);
+  const h=harness({fetch:async()=>({ok:true,json:async()=>({preview_url:`/previews/${id}.pdf`,preview_image_url:`/previews/${id}.png`,preview_attachment:{name:'Device list.pdf',pages},warnings:[]})})});
+  editing(h);h.ui.wire();await h.ui.previewDetails();
+  assert.equal(h.controls.get('#preview-attachment').hidden,false);
+  assert.equal(h.controls.get('#preview-attachment-name').textContent,'Device list.pdf');
+  assert.equal(h.controls.get('#preview-attachment-count').textContent,'Page 1 of 2');
+  assert.equal(h.controls.get('#preview-attachment-previous').disabled,true);
+  const first=h.controls.get('#preview-attachment-image').children[0];first.dispatch('load');
+  assert.equal(first.hidden,false);assert.match(first.src,/page\/2\.png$/);
+  h.controls.get('#preview-attachment-next').dispatch('click');
+  const second=h.controls.get('#preview-attachment-image').children[0];second.dispatch('load');
+  assert.match(second.src,/page\/3\.png$/);assert.equal(h.controls.get('#preview-attachment-count').textContent,'Page 2 of 2');
+  assert.equal(h.controls.get('#preview-attachment-next').disabled,true);
+  first.dispatch('error');assert.equal(h.controls.get('#preview-attachment-status').hidden,true,'old page failures cannot replace the current page');
+  h.controls.get('#preview-attachment-previous').dispatch('click');
+  assert.equal(h.controls.get('#preview-attachment-count').textContent,'Page 1 of 2');
+  h.ui.invalidatePreview();
+  assert.equal(h.controls.get('#preview-attachment').hidden,true);assert.equal(h.controls.get('#preview-attachment-image').children.length,0);
+  second.dispatch('load');assert.equal(h.controls.get('#preview-attachment').hidden,true);
+});
+
+test('Attachment preview failures offer retry and unsafe or mismatched page URLs never load', async () => {
+  const id='f'.repeat(32);
+  for(const pages of [[`https://example.com/previews/${id}/page/2.png`],[`/previews/${'a'.repeat(32)}/page/2.png`],[`/previews/${id}/page/2.png?other=1`]]) {
+    const h=harness({fetch:async()=>({ok:true,json:async()=>({preview_url:`/previews/${id}.pdf`,preview_attachment:{name:'List.pdf',pages},warnings:[]})})});
+    editing(h);await h.ui.previewDetails();
+    assert.equal(h.controls.get('#preview-attachment-image').children.length,0);
+    assert.match(h.controls.get('#preview-attachment-status').textContent,/full preview/);
+  }
+  const h=harness({fetch:async()=>({ok:true,json:async()=>({preview_url:`/previews/${id}.pdf`,preview_attachment:{name:'List.pdf',pages:[`/previews/${id}/page/2.png`]},warnings:[]})})});
+  editing(h);h.ui.wire();await h.ui.previewDetails();
+  h.controls.get('#preview-attachment-image').children[0].dispatch('error');
+  assert.equal(h.controls.get('#preview-attachment-retry').hidden,false);
+  h.controls.get('#preview-attachment-retry').dispatch('click');
+  h.controls.get('#preview-attachment-image').children[0].dispatch('load');
+  assert.equal(h.controls.get('#preview-attachment-status').hidden,true);assert.equal(h.controls.get('#preview-attachment-retry').hidden,true);
+});
+
 test('UI keeps a responsive paired editor without avatars, stat icons or editable backup paths', () => {
   const {ui} = harness();
   assert.equal(all(ui.makeClientCell({supplier:'Acme'},0),node => node.className === 'client-avatar').length,0);
@@ -1077,7 +1777,7 @@ test('Settings can create a new Plant workbook template without silently connect
   const html = fs.readFileSync(path.join(__dirname,'../web/index.html'),'utf8');
   const app = fs.readFileSync(path.join(__dirname,'../web/app.js'),'utf8');
   assert.equal((html.match(/data-create-setting="plant[12]"/g)||[]).length,2);
-  assert.match(html,/Create a ready-to-use blank workbook/);
+  assert.match(html,/data-create-setting="plant1"[^>]*>Create (?:template|blank Excel)/);
   assert.match(app,/api\/create-plant-workbook/);
   assert.match(app,/Click Save to connect it/);
 });
@@ -1088,36 +1788,85 @@ test('Home uses one status filter bar with counts beside the company list', () =
   assert.equal((html.match(/class="quick-views"/g)||[]).length,1);
   assert.doesNotMatch(html,/summary-panel|stat-card|attention-strip|review-alerts/);
   assert.match(html,/<div[^>]*id="more-filters"/);
-  assert.match(html,/<h3 class="filter-section-title">More filters<\/h3>/);
-  assert.doesNotMatch(html,/<details[^>]*id="more-filters"|id="filters-summary"/);
+  assert.match(html,/id="more-filters" popover="auto"/);
+  assert.doesNotMatch(html,/>More filters</);
+  assert.doesNotMatch(html,/<details[^>]*id="more-filters"/);
   assert.doesNotMatch(html,/id="create-another"|>Create another<\/button>/);
   const toolbar = html.slice(html.indexOf('<div class="toolbar">'),html.indexOf('<div class="quick-views"'));
   assert.match(toolbar,/id="search"/); assert.match(toolbar,/id="plant-filter"/);
+  assert.match(toolbar,/id="open-record-filters" popovertarget="more-filters"/);
   assert.doesNotMatch(toolbar,/id="status-filter"|id="template-filter"|id="generate-all"/);
   const bulk = html.slice(html.indexOf('id="bulk-generation-modal"'),html.indexOf('id="saved-file-modal"'));
-  assert.match(bulk,/Search, status and certificate-type filters do not narrow/);
-  assert.match(bulk,/Empty statuses and N\/A rows are skipped/);
+  assert.match(bulk,/Only checked clients will get a PDF/);
+  assert.match(bulk,/id="bulk-select-all"/);
 });
 
-test('Certificate footer has only Cancel and Create PDF; secondary saving stays accessible', () => {
+test('Filter icon counts only its own settings and clearing them preserves the status, plant and search', () => {
+  const h=harness();h.ui.wire();
+  h.controls.get('#status-filter').value='completed';h.controls.get('#plant-filter').value='plant2';h.controls.get('#search').value='Acme';
+  h.ui.updateRecordFilterButton();assert.equal(h.controls.get('#record-filter-count').hidden,true);
+  h.controls.get('#template-filter').value='destruction';h.controls.get('#serial-filter').value='4';
+  h.controls.get('#received-date-filter').value='2026-10-22';h.controls.get('#company-sort').value='company';
+  h.ui.updateRecordFilterButton();assert.equal(h.controls.get('#record-filter-count').textContent,'4');
+  assert.equal(h.controls.get('#record-filter-count').hidden,false);
+  assert.equal(h.controls.get('#open-record-filters').attributes['aria-label'],'Filters, 4 active');
+  h.controls.get('#clear-filters').dispatch('click');
+  assert.equal(h.controls.get('#record-filter-count').hidden,true);
+  assert.equal(h.controls.get('#status-filter').value,'completed');assert.equal(h.controls.get('#plant-filter').value,'plant2');
+  assert.equal(h.controls.get('#search').value,'Acme');assert.equal(h.controls.get('#company-sort').value,'received-oldest');
+});
+
+test('Certificate footer offers Save to Excel before creating a PDF', () => {
   const html = fs.readFileSync(path.join(__dirname,'../web/index.html'),'utf8');
   const editor = html.slice(html.indexOf('id="details-modal"'),html.indexOf('id="excel-save-modal"'));
   const footer = editor.slice(editor.lastIndexOf('<div class="modal-footer">'));
-  assert.equal((footer.match(/<button\b/g) || []).length,2);
+  assert.equal((footer.match(/<button\b/g) || []).length,3);
+  assert.match(footer,/id="save-inward-details" hidden>Save to Excel/);
   assert.match(footer,/>Cancel<\/button>/); assert.match(footer,/id="save-details">Create PDF/);
   assert.match(editor,/<details[^>]*id="draft-options"[\s\S]*?id="keep-working-draft"[\s\S]*?id="save-draft"/);
   assert.match(editor,/<form[^>]*novalidate/);
 });
 
-test('Other status filters are visible buttons without repeating All, Ready or Alert', () => {
+test('All statuses and Details to finish are visible peers without a status dropdown', () => {
   const html = fs.readFileSync(path.join(__dirname,'../web/index.html'),'utf8');
   const statusChoices = [...html.matchAll(/data-filter-status="([^"]+)"/g)].map(match => match[1]);
+  assert.doesNotMatch(html,/certificate-status-select|followup-filter/);
+  const bar=html.slice(html.indexOf('id="status-filters"'),html.indexOf('id="status-filter"'));
+  assert.match(bar,/data-quick-status="details_to_finish"/);
   assert.deepEqual(statusChoices,['generated','generated_manual','completed','blank','na']);
   assert.match(html,/<input type="hidden" id="status-filter" value="all">/);
   assert.doesNotMatch(html,/<select[^>]*id="status-filter"/);
   assert.equal((html.match(/data-quick-status="all"/g)||[]).length,1);
   assert.equal((html.match(/data-quick-status="ready"/g)||[]).length,1);
   assert.equal((html.match(/data-quick-status="needs_attention"/g)||[]).length,1);
+  assert.match(bar,/<input type="checkbox" id="attention-only">/);
+});
+
+test('Needs attention checkbox matches the displayed status inside the wider attention list', () => {
+  const h = harness(); h.ui.wire();
+  const box = h.controls.get('#attention-only');
+  const filter = h.controls.get('#attention-status-filter');
+  const status = h.controls.get('#status-filter');
+  status.value = 'all';
+  h.ui.setState({rows:[{plant:'plant1',sn:'1',supplier:'Needs review',certificate_status:'alert'},
+    {plant:'plant1',sn:'2',supplier:'Ready and overdue',certificate_status:'ready',reminder_due:true},
+    {plant:'plant1',sn:'3',supplier:'HDD to send',certificate_status:'generated_manual',destruction_pending:true},
+    {plant:'plant1',sn:'4',supplier:'Ready with warning',certificate_status:'ready',warnings:['missing inward date']},
+    {plant:'plant1',sn:'5',supplier:'No status',certificate_status:'blank'}]});
+  assert.equal(filter.hidden,true);
+  status.value = 'needs_attention'; status.dispatch('change');
+  assert.equal(filter.hidden,false);
+  assert.equal(h.ui.app.filtered.length,5);
+  box.checked = true; box.dispatch('change');
+  assert.equal(status.value,'needs_attention');
+  assert.deepEqual(Array.from(h.ui.app.filtered, item=>item.row.sn),['1','4']);
+  box.checked = false; box.dispatch('change');
+  assert.equal(status.value,'needs_attention');
+  assert.equal(h.ui.app.filtered.length,5);
+  box.checked = true; box.dispatch('change');
+  h.ui.resetRecordFilters();
+  assert.equal(box.checked,false);
+  assert.equal(filter.hidden,true);
 });
 
 test('Changing editor presentation does not change payload, dirty state or saved recovery', () => {
@@ -1157,7 +1906,7 @@ test('First preview exposes reference, COD/date, inward ID and all read-only mat
   const before = JSON.stringify(h.ui.detailsBody(form));
   h.ui.setEditorMode();
   const facts = text(h.controls.get('#editor-facts'));
-  for (const value of ['REF-1010','F6-1010','0362','2026','Serial Number','1001']) assert.ok(facts.includes(value));
+  for (const value of ['REF-1010','F6-1010','0362','30/09/26','SN','1001']) assert.ok(facts.includes(value));
   const materials = h.controls.get('#editor-materials');
   assert.match(text(materials), /Laptops.*Quantity: 2.*3.5 kg per piece.*7 kg total/);
   assert.match(text(materials), /Monitors.*Quantity: 3.*2 kg per piece.*6 kg total/);
@@ -1183,9 +1932,9 @@ test('Preview facts use the actual rendered COD, date and printed weight and cle
   const before = JSON.stringify(h.ui.detailsBody(form));
   await h.ui.previewDetails();
   const facts = text(h.controls.get('#editor-facts'));
-  assert.match(facts, /0042/); assert.match(facts, /2026/); assert.match(facts, /12 KG · material total/);
+  assert.match(facts, /0042/); assert.match(facts, /30\/09\/26/); assert.match(facts, /12 KG · material total/);
   assert.doesNotMatch(facts, /0001|Set automatically/);
-  assert.match(h.controls.get('#preview-number').textContent, /COD 0042.*30.*2026/);
+  assert.match(h.controls.get('#preview-number').textContent, /COD 0042.*30\/09\/26/);
   assert.equal(JSON.stringify(h.ui.detailsBody(form)), before);
   h.ui.invalidatePreview();
   assert.equal(h.ui.app.editor.previewFacts, null);
@@ -1210,7 +1959,9 @@ test('Weight note separates the asset total from the weight that will print', ()
 });
 
 test('Invalid hidden fields reveal their disclosure and edit screen before preview or creation', async () => {
-  const h = harness(); const form = editing(h); h.ui.setEditorMode(false);
+  const h = harness(); const form = editing(h);
+  h.ui.app.state.numbering = {needs_start:false,next_cod:'0362'};
+  h.ui.setEditorMode(false);
   const disclosure = new Node('details'); disclosure.tagName = 'DETAILS'; disclosure.parentElement = form;
   const invalid = new Node('input'); invalid.parentElement = disclosure;
   form.checkValidity = () => false;
@@ -1231,7 +1982,7 @@ test('Batch selection shows exact plants and Ready count without creating anythi
     h.controls.get('#plant-filter').value = plant; h.controls.get('#search').value = 'Unrelated search';
     h.controls.get('#status-filter').value = 'completed'; h.controls.get('#template-filter').value = 'siemens';
     h.ui.app.workspaceRevision = 'reviewed-batch'; h.ui.openBulkGeneration();
-    assert.equal(h.controls.get('#bulk-description').textContent,`${count} certificate${count === 1 ? '' : 's'} from ${description}.${plant === 'plant2' ? '' : ' 1 needs warning review.'}`);
+    assert.equal(h.controls.get('#bulk-description').textContent,`${count} ${count === 1 ? 'client' : 'clients'} ready · ${description}. Choose who needs a PDF.`);
     assert.equal(h.controls.get('#bulk-generation-modal').open,true);
     assert.equal(h.requests.length,0); assert.equal(h.ui.app.bulkSelection.expected_revision,'reviewed-batch');
   }
@@ -1239,24 +1990,106 @@ test('Batch selection shows exact plants and Ready count without creating anythi
 
 test('Batch cancellation is harmless and creation retains the reviewed plant and revision', async () => {
   const h = harness(); h.ui.wire();
-  h.ui.app.state.rows = [{plant:'plant2',certificate_status:'ready'}];
+  h.ui.app.state.rows = [{plant:'plant2',sn:'7',certificate_status:'ready',certificate_no:'0300'}];
   h.controls.get('#plant-filter').value = 'plant2'; h.ui.app.workspaceRevision = 'reviewed-batch';
   h.ui.openBulkGeneration(); h.controls.get('#bulk-generation-modal').close();
   await h.ui.startBulkGeneration(); assert.equal(h.requests.length,0);
   h.ui.openBulkGeneration(); h.controls.get('#plant-filter').value = 'plant1'; h.ui.app.workspaceRevision = 'changed-batch';
   vm.runInContext('submitGeneration = async payload => { app.submittedBatch = payload; };',h.context);
+  h.ui.app.bulkCheckboxes[0].checked=true; h.ui.app.bulkCheckboxes[0].dispatch('change');
   await h.ui.startBulkGeneration();
-  assert.deepEqual(JSON.parse(JSON.stringify(h.ui.app.submittedBatch)),{plants:['plant2'],expected_revision:'reviewed-batch'});
+  assert.deepEqual(JSON.parse(JSON.stringify(h.ui.app.submittedBatch)),{selections:[{plant:'plant2',sn:'7'}],expected_revision:'reviewed-batch'});
 });
 
-test('Material entry shows name and weight first while quantity fields retain their values', () => {
-  const h = harness(); h.ui.renderMaterialRows([{item:'Laptops',weight:'21',quantity:'3',per_piece_weight:'7'}]);
-  const row = h.ui.app.materialRows[0];
-  assert.equal(row.element.children[1].children.length,2);
-  assert.match(text(row.element.children[1]),/Material or asset.*Weight \(KG\)/);
-  const calculation = row.element.children[2]; assert.equal(calculation.tag,'details'); assert.equal(calculation.open,false);
-  assert.equal(row.inputs.quantity.value,'3'); assert.equal(row.inputs.per_piece_weight.value,'7');
-  assert.equal(h.ui.materialWeightTotal().total,21);
+function searchableBulk() {
+  const h=harness();h.ui.wire();
+  h.controls.get('#plant-filter').value='all';h.ui.app.workspaceRevision='bulk-review';
+  h.ui.app.state.numbering={needs_start:false,next_cod:'0209'};
+  h.ui.app.state.rows=[
+    {plant:'plant1',sn:'13',supplier:'Siemens Healthcare',location:'Mumbai',reference:'REF-A',certificate_status:'ready'},
+    {plant:'plant2',sn:'21',supplier:'Northstar Technologies',location:'Pune',reference:'REF-B',certificate_status:'ready'},
+    {plant:'plant1',sn:'14',supplier:'Harbour Education',location:'Mumbai',reference:'REF-C',certificate_status:'ready'},
+  ];
+  h.ui.openBulkGeneration();return h;
+}
+
+test('Create several searches names, SNs, references and cities without losing selections', () => {
+  const h=searchableBulk();
+  const selected=h.ui.app.bulkRows.findIndex(row=>row.sn==='21');
+  h.ui.app.bulkCheckboxes[selected].checked=true;h.ui.app.bulkCheckboxes[selected].dispatch('change');
+  for(const query of ['SIEMENS','13','ref-a','mumbai healthcare']) {
+    h.controls.get('#bulk-search').value=query;h.controls.get('#bulk-search').dispatch('input');
+    assert.deepEqual(Array.from(h.ui.app.bulkVisible).map(i=>h.ui.app.bulkRows[i].sn),['13']);
+    assert.equal(h.ui.app.bulkChecked.has(selected),true);
+    assert.equal(h.controls.get('#bulk-selected-count').textContent,'1 selected');
+    assert.match(h.controls.get('#bulk-selection-note').textContent,/1 selected client is hidden/);
+  }
+  h.controls.get('#bulk-clear-search').dispatch('click');
+  assert.equal(h.ui.app.bulkVisible.length,3);assert.equal(h.ui.app.bulkCheckboxes[selected].checked,true);
+  assert.equal(h.controls.get('#bulk-search').focused,true);
+});
+
+test('Select shown affects only matching clients and leaves other checked clients intact', () => {
+  const h=searchableBulk(),find=sn=>h.ui.app.bulkRows.findIndex(row=>row.sn===sn);
+  h.ui.app.bulkCheckboxes[find('21')].checked=true;h.ui.app.bulkCheckboxes[find('21')].dispatch('change');
+  h.controls.get('#bulk-search').value='Mumbai';h.controls.get('#bulk-search').dispatch('input');
+  assert.equal(h.controls.get('#bulk-select-label').textContent,'Select shown');
+  const selectAll=h.controls.get('#bulk-select-all');selectAll.checked=true;selectAll.dispatch('change');
+  assert.equal(h.ui.app.bulkChecked.size,3);assert.equal(selectAll.indeterminate,false);
+  selectAll.checked=false;selectAll.dispatch('change');
+  assert.equal(h.ui.app.bulkChecked.size,1);assert.equal(h.ui.app.bulkChecked.has(find('21')),true);
+  h.ui.app.bulkCheckboxes[find('13')].checked=true;h.ui.app.bulkCheckboxes[find('13')].dispatch('change');
+  assert.equal(selectAll.indeterminate,true);
+});
+
+test('Empty bulk search offers clear search without changing existing choices', () => {
+  const h=searchableBulk();
+  h.ui.app.bulkCheckboxes[0].checked=true;h.ui.app.bulkCheckboxes[0].dispatch('change');
+  h.controls.get('#bulk-search').value='Not a client';h.controls.get('#bulk-search').dispatch('input');
+  assert.equal(h.controls.get('#bulk-empty').hidden,false);
+  assert.equal(h.controls.get('#bulk-select-all').disabled,true);
+  assert.equal(h.controls.get('#generate-all').disabled,false);
+  assert.equal(h.controls.get('#bulk-visible-count').textContent,'0 of 3 shown');
+  h.controls.get('#bulk-generation-modal').close();h.ui.openBulkGeneration();
+  assert.equal(h.controls.get('#bulk-search').value,'');assert.equal(h.ui.app.bulkChecked.size,0);
+});
+
+test('Bulk creation sends exactly the selected clients including clearly counted hidden selections', async () => {
+  const h=searchableBulk();
+  h.ui.app.bulkCheckboxes[0].checked=true;h.ui.app.bulkCheckboxes[0].dispatch('change');
+  h.controls.get('#bulk-search').value='Northstar';h.controls.get('#bulk-search').dispatch('input');
+  const visible=h.ui.app.bulkVisible[0];h.ui.app.bulkCheckboxes[visible].checked=true;h.ui.app.bulkCheckboxes[visible].dispatch('change');
+  const expected=Array.from(h.ui.app.bulkChecked).sort((a,b)=>a-b).map(i=>h.ui.app.bulkRows[i].sn);
+  vm.runInContext('submitGeneration = async payload => { app.submittedBatch=payload; };',h.context);
+  await h.ui.startBulkGeneration();
+  assert.deepEqual(Array.from(h.ui.app.submittedBatch.selections).map(row=>row.sn),expected);
+  assert.equal(h.ui.app.submittedBatch.expected_revision,'bulk-review');
+});
+
+test('Issued company actions form tidy pairs without a redundant More control', () => {
+  const h=harness();
+  for(const certificate_status of ['generated','completed']) {
+    const actions=h.ui.makeActions({...removalRow,certificate_status,pdf_filename:'0209_Test.pdf',certificate_no:'0209'},0);
+    const groups=all(actions,n=>n.className==='row-actions-main'||n.className==='row-actions-extra');
+    assert.ok(groups.every(group=>group.children.length<=2));
+    assert.equal(all(actions,n=>n.tag==='details').length,0);
+    assert.ok(all(actions,n=>n.dataset.action==='edit-details').length);
+    assert.match(text(actions),/Open PDF.*Review & edit.*Open in Excel/);
+  }
+});
+
+test('Review materials use the Add client calculation layout and recalculate weights', () => {
+  const h=harness(); const form=editing(h);
+  h.ui.renderMaterialRows([{item:'Laptops',weight:'21',quantity:'3',per_piece_weight:'7'}]);
+  const row=h.ui.app.materialRows[0];
+  assert.match(text(row.element),/Material or asset.*Calculate weight.*Per Pcs Weight.*×.*Quantity in Pcs.*=.*Weight/);
+  assert.equal(all(row.element,n=>n.tag==='details').length,0);
+  row.inputs.quantity.value='4';row.inputs.quantity.dispatch('input');
+  assert.equal(row.inputs.weight.value,'28');assert.equal(h.ui.materialWeightTotal().total,28);
+  assert.equal(h.ui.app.editor.touched.has('weight'),true);
+  row.inputs.quantity.value='1 lot';row.inputs.quantity.dispatch('input');
+  assert.equal(row.inputs.weight.value,'');row.inputs.weight.value='12';row.inputs.weight.dispatch('input');
+  assert.equal(h.ui.materialWeightTotal().total,12);
 });
 
 test('Generated certificate rows open the exact safe PDF locally and expose completion directly', () => {
@@ -1279,7 +2112,7 @@ test('A recovered Ready inward with old certificate details is offered for creat
     certificate_status:'ready',has_issued_certificate:false,
     last_certificate_details:{certificate_type:'siemens'}};
   const actions = all(h.ui.makeActions(row,0), node => node.tag === 'button').map(node => node.textContent);
-  assert.ok(actions.includes('Review & create'));
+  assert.ok(actions.includes('Review & edit'));
   assert.equal(actions.includes('Edit certificate'),false);
 });
 
@@ -1293,11 +2126,11 @@ test('Alert shortcut count respects plant selection without making Blank or N/A 
 });
 
 test('First issuance opens a preview with one edit control; PDF corrections leave Excel untouched', async () => {
-  for (const kind of ['existing','new','copy']) {
+  for (const kind of ['existing','new']) {
     const h = harness(); const form = editing(h); h.controls.get('#details-modal').open = false;
     vm.runInContext('updateSourceControls = () => {}; renderTemplateEditor = () => {}; globalThis.previews = []; previewDetails = async () => previews.push(detailsBody(document.querySelector("#details-form")));',h.context);
-    const row = {plant:'plant2',sn:'2001',supplier:'Northstar',form6:'F6-2001',weight:12,inward_date:'2026-10-01',items:[{item:'Laptops',weight:12}]};
-    await h.ui.openDetails(kind === 'new' ? null : row,kind === 'copy');
+    const row = {plant:'plant2',sn:'2001',supplier:'Northstar',form6:'F6-2001',reference:'REF-2001',weight:12,inward_date:'2026-10-01',items:[{item:'Laptops',weight:12}]};
+    await h.ui.openDetails(kind === 'new' ? null : row);
     if (kind === 'new') assert.equal(form.values.inward_date,'','A new certificate must not assume today was the receipt date.');
     assert.equal(h.controls.get('#editor-fields').hidden,false);
     assert.equal(h.controls.get('#excel-detail-fields').hidden,kind === 'existing');
@@ -1311,7 +2144,7 @@ test('First issuance opens a preview with one edit control; PDF corrections leav
       assert.equal(h.controls.get('#editor-fields').hidden,false);
       assert.equal(h.controls.get('#excel-detail-fields').hidden,false,'the single edit button reveals certificate-only corrections');
       h.ui.app.editor.pdfEditUsed = true;
-      assert.equal(h.ui.detailsBody(h.controls.get('#details-form')).pdf_only_edits,true);
+      assert.equal(h.ui.detailsBody(h.controls.get('#details-form')).review_edits,true);
       assert.equal(h.controls.get('#material-weight-total').textContent,'Total weight: 12 kg');
     }
   }
@@ -1365,6 +2198,30 @@ test('Source controls preserve review mode for a filled inward and explicit edit
   assert.equal(form.elements.namedItem('form6').readOnly,false);
 });
 
+test('HDD hides and disables reference entry; switching back restores the normal requirement', () => {
+  const h = harness(), form = editing(h);
+  const fields = {};
+  for (const name of ['certificate_weight','case_id','inward_date','form6','reference']) {
+    const field = new Node('label'), span = new Node('span');
+    field.append(span); field.querySelector = () => span;
+    form.elements.namedItem(name).closest = () => field; fields[name] = field;
+  }
+  form.values.source_kind = 'manual'; form.values.reference = 'LEGACY-REF';
+  vm.runInContext('suggestWorkbookId=()=>{}; updatePrintedWeight=()=>{};',h.context);
+  for (const kind of ['destruction','standard','destruction','sita']) {
+    form.values.certificate_type = kind; h.ui.app.editor.template = kind;
+    h.ui.app.editor.fields[kind] ||= {};
+    vm.runInContext('updateSourceControls()',h.context);
+    const hdd = kind === 'destruction';
+    assert.equal(form.elements.namedItem('reference').required, !hdd);
+    assert.equal(form.elements.namedItem('reference').disabled, hdd);
+    assert.equal(fields.reference.hidden, hdd);
+    h.ui.renderEditorSummary();
+    assert.equal(text(h.controls.get('#editor-facts')).includes('Reference number'), !hdd);
+  }
+  assert.equal(form.values.reference, 'LEGACY-REF', 'Changing type must not erase a manually entered reference.');
+});
+
 test('Choosing a certificate type exposes its fields from the first-issuance review', () => {
   const h = harness(), form = editing(h);
   Object.assign(h.ui.app.editor, {existing:true,firstGeneration:true,editingDetails:false});
@@ -1384,10 +2241,10 @@ test('An explicit Edit details action starts an existing record in the form', as
   const h = harness(); editing(h); h.controls.get('#details-modal').open = false;
   vm.runInContext('updateSourceControls = () => {}; renderTemplateEditor = () => {}; globalThis.previews = []; previewDetails = async () => previews.push(detailsBody(document.querySelector("#details-form")));',h.context);
   const row = {plant:'plant2',sn:'2001',supplier:'Northstar',has_issued_certificate:true,weight:12,inward_date:'2026-10-01',items:[{item:'Laptops',weight:12}]};
-  await h.ui.openDetails(row,false,false,true);
+  await h.ui.openDetails(row,false,true);
   assert.equal(h.controls.get('#editor-fields').hidden,false);
   assert.equal(h.controls.get('#editor-summary').hidden,true);
-  assert.match(h.controls.get('#details-title').textContent,/Edit certificate for Northstar/);
+  assert.match(h.controls.get('#details-title').textContent,/Review & edit: Northstar/);
   assert.equal(h.context.previews.length,1,'The read-only preview remains available in the editor.');
   assert.equal(h.requests.length,0,'Opening edit mode never creates a PDF or saves Excel changes.');
 });
@@ -1482,7 +2339,7 @@ test('Status selection preserves search, plant and certificate type', () => {
 
 test('A delayed close event cannot erase a newly reopened batch selection', () => {
   const h = harness(); h.ui.wire();
-  h.ui.app.state.rows = [{plant:'plant2',certificate_status:'ready'}];
+  h.ui.app.state.rows = [{plant:'plant2',sn:'7',certificate_status:'ready',certificate_no:'0300'}];
   h.controls.get('#plant-filter').value = 'plant2'; h.ui.openBulkGeneration();
   const selection = h.ui.app.bulkSelection;
   h.controls.get('#bulk-generation-modal').dispatch('close');
@@ -1695,7 +2552,7 @@ test('Day-25 reminder appears as an alert without changing status or approving B
   const h = harness(); h.controls.get('#status-filter').value = 'needs_attention';
   const row = {plant:'plant2',certificate_status:'ready',reminder_due:true,age_days:25};
   assert.equal(h.ui.matches(row),true); assert.equal(h.ui.stateLabel(row),'Ready');
-  assert.match(text(h.ui.makeStatus(row)),/Certificate pending · received 25 days ago/);
+  assert.match(text(h.ui.makeStatus(row)),/No certificate yet\. Received 25 days ago/);
   h.ui.app.state.rows = [row,{plant:'plant2',certificate_status:'blank',reminder_due:true},{plant:'plant2',certificate_status:'na'}];
   h.ui.summarize(); assert.equal(h.controls.get('#count-attention').textContent,2);
   assert.equal(h.controls.get('#generate-count').textContent,'(1)');
@@ -1707,19 +2564,65 @@ test('Attention view explains future dates, pending PDFs and missing PDFs with u
   assert.match(text(h.ui.makeStatus(future)),/Received date is in the future/);
   assert.doesNotMatch(text(h.ui.makeStatus(future)),/-8/);
   const correction = all(h.ui.makeActions(future,0), node => node.tag === 'button');
-  assert.equal(correction[0].textContent,'Review details');
+  assert.equal(correction[0].textContent,'Review & edit');
   assert.ok(correction.some(node => node.textContent === 'Open in Excel'));
   const readyWithIssue = {...future,certificate_status:'ready',warnings:['inward date is in the future']};
   const readyActions = all(h.ui.makeActions(readyWithIssue,0), node => node.tag === 'button');
-  assert.equal(readyActions[0].textContent,'Review details');
-  assert.equal(readyActions[0].dataset.action,'details','First generation still opens its safe preview.');
+  assert.equal(readyActions[0].textContent,'Review & edit');
+  assert.equal(readyActions[0].dataset.action,'edit-details','First generation supports reviewed edits.');
   assert.ok(readyActions.some(node => node.textContent === 'Open in Excel'));
   const issued = {certificate_status:'generated',reminder_due:true,age_days:50,pdf_filename:'0001_Acme.pdf'};
-  assert.match(text(h.ui.makeStatus(issued)),/PDF ready.*mark Completed/);
+  assert.match(text(h.ui.makeStatus(issued)),/PDF ready.*Mark Completed/);
   const missing = {...issued,pdf_filename:''};
-  assert.match(text(h.ui.makeStatus(missing)),/Saved PDF is missing/);
+  assert.match(text(h.ui.makeStatus(missing)),/PDF missing\. Create it again in Review & edit/);
   assert.equal(all(h.ui.makeActions(missing,0), node => node.dataset.action === 'complete').length,0);
   assert.equal(all(h.ui.makeActions(missing,0), node => node.dataset.action === 'edit-details').length,1);
+});
+
+test('Attention messages replace recovery reports with one short instruction and retain the COD', () => {
+  const h = harness(); h.controls.get('#status-filter').value = 'needs_attention';
+  for (const statusNote of ['Excel was changed to Ready.', 'Ready to recreate; Excel status update is pending.', 'Still Ready to recreate.']) {
+    const detail = `PDF missing from Certificates: ${statusNote} Keep COD 0188 when recreating it. Ready to generate COD 0188.`;
+    for (const pdf_missing of [true, false]) {
+      const row = {certificate_status:'ready',certificate_no:'0188',system_alert:true,pdf_missing,detail,warnings:[]};
+      const status = h.ui.makeStatus(row);
+      const notes = all(status,node => node.className === 'age-note attention-reason');
+      assert.equal(notes.length,1);
+      assert.equal(notes[0].textContent,'PDF missing. Create it again with COD 0188.');
+      assert.doesNotMatch(text(status),/Excel was changed|Ready to recreate|Ready to generate/);
+      assert.equal(row.detail,detail,'The original report remains available in technical details.');
+    }
+  }
+  const flagged = h.ui.makeStatus({certificate_status:'ready',pdf_missing:true,certificate_no:'ECO-0190',warnings:[]});
+  assert.match(text(flagged),/PDF missing\. Create it again with COD ECO-0190\./);
+  const local = h.ui.makeStatus({source_kind:'manual',certificate_status:'ready',system_alert:true,pdf_missing:true,certificate_no:'0190',detail:'PDF missing. Ready to recreate with COD 0190.',warnings:[]});
+  assert.equal(all(local,node => node.className === 'age-note attention-reason')[0].textContent,'PDF missing. Create it again with COD 0190.');
+});
+
+test('Attention messages use plain actions for common missing details and data destruction', () => {
+  const h = harness(); h.controls.get('#status-filter').value = 'needs_attention';
+  for (const [warning, expected] of [
+    ['missing Form 6 number / manifest number','Form 6 missing. Add it in Review & edit.'],
+    ['Enter the reference number before creating the certificate.','Reference number missing. Add it in Review & edit.'],
+    ['Material receipt date is missing or invalid; it will be blank on the certificate.','Received date missing or invalid. Fix it in Review & edit.'],
+    ['Weight is missing, invalid or not positive; check the material list and certificate weight.','Weight missing or invalid. Check it in Review & edit.'],
+  ]) {
+    const status = h.ui.makeStatus({certificate_status:'ready',warnings:[warning]});
+    assert.equal(all(status,node => node.className === 'age-note attention-reason')[0].textContent,expected);
+  }
+  const hdd = {certificate_status:'generated_manual',destruction_pending:true,pdf_filename:'HDD-0190.pdf'};
+  assert.match(text(h.ui.makeStatus(hdd)),/Send the Data Destruction PDF, then click Mark Completed\./);
+  assert.doesNotMatch(text(h.ui.makeStatus(hdd)),/HDD|Payment/);
+  assert.match(text(h.ui.makeStatus({...hdd,pdf_missing:true})),/Data Destruction PDF missing\. Create it again in Review & edit\./);
+});
+
+test('Attention messages preserve unfamiliar problems and show data issues during PDF recovery', () => {
+  const h = harness(); h.controls.get('#status-filter').value = 'needs_attention';
+  const raw = 'Unexpected import problem. Ask the operator to check this record.';
+  assert.ok(text(h.ui.makeStatus({certificate_status:'ready',system_alert:true,detail:raw})).includes(raw));
+  const detail = 'PDF missing from Certificates: Excel was changed to Ready. Keep COD 0188 when recreating it. Weight is missing, invalid or not positive; check the material list and certificate weight.';
+  assert.match(text(h.ui.makeStatus({certificate_status:'ready',system_alert:true,pdf_missing:true,detail})),/Weight missing or invalid\. Check it in Review & edit\./);
+  assert.ok(h.ui.warningInfo(detail).message.includes('Weight is missing'),'Expanded warnings retain the underlying issue.');
 });
 
 test('Reminder review reuses the current page and clears filters without a navigation', async () => {
@@ -1905,7 +2808,8 @@ test('Attachment refresh binds new rows without blessing old cached data and the
     ? {workspace_revision:'attachment-only',annexure:{id:'a',name:'List.pdf'}}
     : endpoint === '/api/check' ? {workspace_revision:'fresh-rows',state:{rows:[{plant:'plant1',sn:'1001',supplier:'Outside edit'}]}}
     : {preview_url:previewUrl,certificate_no:'0002',warnings:[]}})});
-  editing(h); h.ui.renderMaterialRows([{item:'Laptops',weight:10}]);
+  const form = editing(h); h.ui.renderMaterialRows([{item:'Laptops',weight:10}]);
+  form.elements.namedItem('starting_cod').setCustomValidity = () => {};
   vm.runInContext('setBusy = () => {}; setDetailsBusy = on => { app.detailsBusy = on; };',h.context);
   await h.ui.pickAnnexure();
   assert.equal(h.ui.app.workspaceRevision,'fresh-rows'); assert.equal(h.ui.app.state.rows[0].supplier,'Outside edit');
@@ -1984,11 +2888,12 @@ test('Persistent errors expose a clickable dismiss control, and keyboard search 
   assert.equal(prevented,false); assert.notEqual(h.controls.get('#search').focused,true);
 });
 
-test('Issued certificates expose Edit certificate directly with no Details expansion', () => {
+test('Issued certificates expose Review & edit directly with no Details expansion or HDD action', () => {
   const h = harness();
   const row = {plant:'plant1',sn:'1001',certificate_status:'generated',pdf_filename:'0001_Acme_Mumbai_1.pdf'};
   const buttons = all(h.ui.makeActions(row,0), node => node.tag === 'button');
-  assert.ok(buttons.some(button => button.textContent === 'Edit certificate' && button.dataset.action === 'edit-details'));
+  assert.ok(buttons.some(button => button.textContent === 'Review & edit' && button.dataset.action === 'edit-details'));
+  assert.ok(buttons.every(button => button.dataset.action !== 'destruction'));
   assert.ok(buttons.every(button => !Object.hasOwn(button.dataset,'expand')));
 });
 
@@ -2087,7 +2992,7 @@ test('Inline material edit preserves named source controls and submits every cha
   h.ui.setEditorMode(); h.ui.startInlineEdit('materials','Materials');
   const editor = h.ui.app.editor.inlineEdit.container;
   const inputs = all(editor,node => node.tag === 'input'); assert.ok(inputs.every(input => !input.name));
-  const secondWeight = inputs.find(input => input.attributes['aria-label'] === 'Weight (KG) for material 2');
+  const secondWeight = inputs.find(input => input.attributes['aria-label'] === 'Material 2: Weight (KG)');
   secondWeight.value = '8'; secondWeight.dispatch('input');
   const items = h.ui.detailsBody(form).details.items;
   assert.equal(items[0].weight,'100.19999999999999'); assert.equal(items[1].weight,'8');
@@ -2151,10 +3056,10 @@ test('Reopening a PDF-only correction restores last issued details and its weigh
   assert.equal(h.controls.get('#excel-detail-fields').hidden,true);
 });
 
-test('Corrections wait for Yes or No before submitting and preview refresh does not invalidate the choice', async () => {
-  for (const yes of [false,true]) {
+test('Edits before and after first creation wait for Yes or No before updating Excel', async () => {
+  for (const firstGeneration of [false,true]) for (const yes of [false,true]) {
     const h = harness(), form = editing(h);
-    Object.assign(h.ui.app.editor,{existing:true,firstGeneration:false});
+    Object.assign(h.ui.app.editor,{existing:true,firstGeneration,reviewEdits:true});
     form.values.supplier = 'Corrected company';
     vm.runInContext('submitGeneration = async payload => {app.correctionPayload = payload;};',h.context);
     await h.ui.saveDetails({preventDefault(){},currentTarget:form});
@@ -2163,9 +3068,214 @@ test('Corrections wait for Yes or No before submitting and preview refresh does 
     h.ui.app.previewRevision++; // Same data, newer raster preview.
     await h.ui.saveExcelChoice(yes);
     assert.equal(h.ui.app.correctionPayload.edit_scope,yes ? 'update_excel' : 'certificate_only');
+    assert.equal(h.ui.app.correctionPayload.confirmed_excel,yes);
+    assert.equal(h.ui.app.correctionPayload.review_edits,true);
     assert.equal(h.ui.app.correctionPayload.details.supplier,'Corrected company');
     assert.equal(h.controls.get('#excel-save-modal').open,false);
   }
+});
+
+test('Save to Excel before first PDF uses a separate confirmed save and No keeps editing', async () => {
+  for (const yes of [false,true]) {
+    const h = harness({fetch:async()=>({ok:true,json:async()=>({saved:true,created:0,state:{rows:[]},workspace_revision:'saved-revision'})})});
+    const form = editing(h);
+    Object.assign(h.ui.app.editor,{existing:true,firstGeneration:true,reviewEdits:true});
+    form.values.supplier='Changed before any PDF';
+    vm.runInContext('setState=state=>{app.state=state;};',h.context);
+    await h.ui.saveInwardDetails();
+    assert.equal(h.controls.get('#excel-save-modal').open,true);
+    assert.equal(h.requests.length,0);
+    assert.match(h.controls.get('#excel-save-title').textContent,/Save these changes to Excel/);
+    await h.ui.saveExcelChoice(yes);
+    assert.equal(h.requests.length,yes ? 1 : 0);
+    assert.equal(h.controls.get('#details-modal').open,!yes);
+    if (yes) {
+      assert.equal(h.requests[0].endpoint,'/api/clients/update');
+      assert.equal(h.requests[0].payload.confirmed_excel,true);
+      assert.equal(h.requests[0].payload.details.supplier,'Changed before any PDF');
+    }
+  }
+});
+
+test('Type changes offer updating Excel or explicitly deleting the inward and keeping PDF', async () => {
+  for (const firstGeneration of [false,true]) for (const yes of [false,true]) {
+    const h = harness(), form = editing(h);
+    Object.assign(h.ui.app.editor,{existing:true,firstGeneration,reviewEdits:true});
+    h.ui.app.editor.excelBaseline = JSON.parse(JSON.stringify(h.ui.app.editor.baseline));
+    form.values.certificate_type = 'siemens';
+    h.ui.app.editor.template = 'siemens'; h.ui.app.editor.fields.siemens = {};
+    vm.runInContext('confirmAction = async () => true; submitGeneration = async payload => {app.correctionPayload = payload;};',h.context);
+    await h.ui.saveDetails({preventDefault(){},currentTarget:form});
+    assert.equal(h.controls.get('#excel-save-modal').open,true);
+    assert.match(h.controls.get('#excel-save-description').textContent,/Excel has Recycling; this PDF will use Medical/);
+    assert.equal(h.controls.get('#excel-save-no').textContent,'Delete Excel inward; keep PDF');
+    await h.ui.saveExcelChoice(yes);
+    assert.equal(h.controls.get('#excel-save-modal').open,false);
+    assert.equal(h.controls.get('#details-modal').open,true);
+    assert.equal(form.values.certificate_type,'siemens');
+    assert.equal(h.ui.app.correctionPayload.edit_scope,yes ? 'update_excel' : 'remove_excel');
+    assert.equal(yes ? h.ui.app.correctionPayload.confirmed_excel : h.ui.app.correctionPayload.confirmed_excel_removal,true);
+    assert.equal(h.ui.app.correctionPayload.details.certificate_type,'siemens');
+  }
+});
+
+test('Previously PDF-only type changes still prompt against the actual Excel type', async () => {
+  const h = harness(), form = editing(h);
+  Object.assign(h.ui.app.editor,{existing:true,firstGeneration:false,reviewEdits:true});
+  h.ui.app.editor.excelBaseline = JSON.parse(JSON.stringify(h.ui.app.editor.baseline));
+  form.values.certificate_type = 'siemens';
+  h.ui.app.editor.template = 'siemens'; h.ui.app.editor.fields.siemens = {};
+  h.ui.app.editor.baseline = h.ui.detailsBody(form);
+  await h.ui.saveDetails({preventDefault(){},currentTarget:form});
+  assert.match(h.controls.get('#excel-save-title').textContent,/original Excel inward/);
+  assert.equal(h.controls.get('#excel-save-no').textContent,'Delete Excel inward; keep PDF');
+});
+
+test('International type changes clear Form 6 and keep PDF through confirmed Excel removal', async () => {
+  const h = harness(), form = editing(h);
+  Object.assign(h.ui.app.editor,{existing:true,firstGeneration:true,reviewEdits:true});
+  h.ui.app.editor.excelBaseline = JSON.parse(JSON.stringify(h.ui.app.editor.baseline));
+  form.values.certificate_type = 'sita'; form.values.form6 = 'F6-new'; form.values.reference = 'REF-new';
+  h.ui.app.editor.template = 'sita'; h.ui.app.editor.fields.sita = {};
+  vm.runInContext('confirmAction = async () => true; submitGeneration = async payload => {app.correctionPayload = payload;};',h.context);
+  await h.ui.saveDetails({preventDefault(){},currentTarget:form});
+  assert.match(h.controls.get('#excel-save-description').textContent,/this PDF will use International/);
+  assert.match(h.controls.get('#excel-save-note').textContent,/all its materials from Excel/);
+  assert.equal(h.controls.get('#excel-save-no').textContent,'Delete Excel inward; keep PDF');
+  await h.ui.saveExcelChoice(false);
+  assert.equal(h.ui.app.correctionPayload.edit_scope,'remove_excel');
+  assert.equal(h.ui.app.correctionPayload.details.form6,'');
+  assert.equal(h.ui.app.correctionPayload.details.certificate_type,'sita');
+});
+
+test('Canceling type-change deletion keeps the editor and sends no generation request', async () => {
+  const h = harness(), form = editing(h);
+  Object.assign(h.ui.app.editor,{existing:true,firstGeneration:true,reviewEdits:true});
+  form.values.certificate_type='sita'; h.ui.app.editor.template='sita'; h.ui.app.editor.fields.sita={};
+  vm.runInContext('submitGeneration = async payload => {app.correctionPayload = payload;};',h.context);
+  await h.ui.saveDetails({preventDefault(){},currentTarget:form});
+  const pending=h.ui.saveExcelChoice(false);
+  assert.equal(h.controls.get('#action-confirmation-modal').open,true);
+  assert.match(h.controls.get('#action-confirmation-message').textContent,/SN 1001/);
+  assert.equal(h.controls.get('#cancel-action').textContent,'Keep editing');
+  assert.equal(h.controls.get('#cancel-action').focused,true);
+  h.ui.settleActionConfirmation(false); await pending;
+  assert.equal(h.ui.app.correctionPayload,undefined);
+  assert.equal(h.controls.get('#details-modal').open,true);
+  assert.equal(form.values.certificate_type,'sita');
+});
+
+test('Type-change deletion cannot submit changed details after its confirmation', async () => {
+  const h=harness(),form=editing(h);
+  Object.assign(h.ui.app.editor,{existing:true,reviewEdits:true});
+  form.values.certificate_type='sita';h.ui.app.editor.template='sita';h.ui.app.editor.fields.sita={};
+  vm.runInContext('submitGeneration=async payload=>{app.correctionPayload=payload;}; confirmAction=async()=>{document.querySelector("#details-form").values.supplier="Changed after review";return true;};',h.context);
+  await h.ui.saveDetails({preventDefault(){},currentTarget:form});
+  await h.ui.saveExcelChoice(false);
+  assert.equal(h.ui.app.correctionPayload,undefined);
+  assert.match(h.controls.get('#details-error').textContent,/details changed/i);
+});
+
+test('First-PDF confirmation explains any required Form 6 or reference writes in the No choice', async () => {
+  const h=harness(),form=editing(h);
+  Object.assign(h.ui.app.editor,{existing:true,firstGeneration:true,reviewEdits:true});
+  form.values.form6='F6-entered';form.values.reference='REF-entered';form.values.supplier='Changed company';
+  await h.ui.saveDetails({preventDefault(){},currentTarget:form});
+  assert.match(h.controls.get('#excel-save-description').textContent,/Form 6 number and reference number must be recorded in Excel/);
+  assert.equal(h.controls.get('#excel-save-no').textContent,'No, only save required details');
+});
+
+test('Data Destruction checkbox is separate from the main type and warns on closing unsaved choices', () => {
+  const h=harness();editing(h);
+  h.ui.app.editor.existing=true;
+  h.controls.get('#destruction-needed').checked=true;
+  const payload=h.ui.detailsBody(h.controls.get('#details-form'));
+  assert.equal(payload.details.certificate_type,'standard');
+  assert.equal(payload.data_destruction_needed,true);
+  assert.equal(payload.details.data_destruction_needed,undefined);
+  assert.equal(h.ui.editorDirty(),true);
+  assert.equal(h.ui.requestDetailsClose(),false);
+  assert.equal(h.controls.get('#unsaved-modal').open,true);
+});
+
+test('Saving an HDD request clears its finished draft and preserves any other unsaved edits', async () => {
+  for (const otherEdits of [false,true]) {
+    const request={source_kind:'manual',record_id:'hdd-request',certificate_type:'destruction',plant:'plant1',destruction_source:{plant:'plant1',case_id:'1001'}};
+    const h=harness({fetch:async()=>({ok:true,json:async()=>({record_id:'hdd-request',workspace_revision:'request-saved',state:{rows:[request]}})})});
+    const form=editing(h);
+    h.ui.app.editor.issuedCertificate=otherEdits;
+    if(otherEdits) form.values.supplier='Still being edited';
+    h.controls.get('#destruction-needed').checked=true;
+    h.ui.saveWorkingDraft();
+    vm.runInContext('setState=state=>{app.state=state;};',h.context);
+    await h.ui.saveInwardDetails();
+    assert.equal(h.ui.editorDirty(),otherEdits);
+    if(otherEdits) {
+      assert.equal(h.ui.readWorkingDraft().values.supplier,'Still being edited');
+      assert.equal(h.ui.readWorkingDraft().editor.baseline.data_destruction_needed,true);
+    } else {
+      assert.equal(h.ui.readWorkingDraft(),null);
+      assert.equal(h.ui.requestDetailsClose(),true);
+    }
+  }
+});
+
+test('A saved HDD request stays editable and unticking saves removal without changing Excel', async () => {
+  const h=harness({fetch:async()=>({ok:true,json:async()=>({state:{rows:[]},workspace_revision:'removed'})})});
+  const form=editing(h);h.ui.app.editor.existing=true;h.ui.app.editor.issuedCertificate=true;
+  const request={source_kind:'manual',record_id:'request',certificate_type:'destruction',certificate_status:'ready',
+    destruction_source:{plant:'plant1',case_id:'1001'}};
+  h.ui.app.state.rows=[request];h.ui.updateDestructionChoice();
+  const checkbox=h.controls.get('#destruction-needed');assert.equal(checkbox.disabled,false);assert.equal(checkbox.checked,true);
+  h.ui.app.editor.baseline=h.ui.detailsBody(form);checkbox.checked=false;
+  h.ui.updateDestructionChoice(h.ui.detailsBody(form));assert.equal(checkbox.checked,false);
+  assert.equal(h.controls.get('#save-inward-details').hidden,false);
+  assert.equal(h.controls.get('#save-inward-details').textContent,'Save request');
+  vm.runInContext('setState=state=>{app.state=state;};',h.context);
+  await h.ui.saveInwardDetails();
+  assert.equal(h.requests[0].endpoint,'/api/destruction/request');assert.equal(h.requests[0].payload.needed,false);
+  assert.equal(h.ui.editorDirty(),false);assert.equal(h.ui.app.editor.workspaceRevision,'removed');
+});
+
+test('The linked HDD editor shows removal for an unissued request', async () => {
+  const link={plant:'plant1',case_id:'1001'};
+  const request={source_kind:'manual',record_id:'request',certificate_type:'destruction',certificate_status:'draft',
+    destruction_requested:true,destruction_source:link};
+  const h=harness({fetch:async()=>({ok:true,json:async()=>({state:{rows:[{...request,destruction_requested:false}]},workspace_revision:'removed'})})});
+  const form=editing(h);
+  Object.assign(h.ui.app.editor,{existing:true,template:'destruction',sourceSn:null,sourcePlant:'plant1',destructionSource:link,
+    recordId:'request',issuedCertificate:false,fields:{destruction:{}}});
+  form.values.source_kind='manual';form.values.certificate_type='destruction';
+  h.ui.app.state.rows=[request];h.ui.updateDestructionChoice();
+  const checkbox=h.controls.get('#destruction-needed');
+  assert.equal(h.controls.get('#destruction-needed-card').hidden,false);
+  assert.equal(h.controls.get('#destruction-needed-label').textContent,'Keep this Data Destruction request active');
+  assert.equal(checkbox.checked,true);assert.equal(checkbox.disabled,false);
+  h.ui.app.editor.baseline=h.ui.detailsBody(form);
+  checkbox.checked=false;await h.ui.changeDestructionChoice();
+  h.ui.updateDestructionChoice(h.ui.detailsBody(form));
+  assert.equal(h.controls.get('#save-inward-details').hidden,false);
+  assert.equal(h.controls.get('#save-inward-details').textContent,'Save request');
+  assert.match(h.controls.get('#destruction-choice-status').textContent,/Save to remove this request/);
+  vm.runInContext('setState=state=>{app.state=state;};',h.context);
+  await h.ui.saveInwardDetails();
+  assert.equal(h.requests[0].endpoint,'/api/destruction/request');
+  assert.deepEqual(h.requests[0].payload,{plant:'plant1',sn:'1001',expected_revision:'revision-1',needed:false,confirmed:false});
+  assert.equal(h.ui.editorDirty(),false);
+  assert.equal(h.controls.get('#save-inward-details').hidden,true);
+  assert.equal(h.ui.app.editor.workspaceRevision,'removed');
+});
+
+test('Unticking an issued HDD asks for confirmation and cancel restores the tick', async () => {
+  const h=harness(),form=editing(h);h.ui.app.editor.existing=true;
+  h.ui.app.state.rows=[{source_kind:'manual',record_id:'request',certificate_type:'destruction',certificate_status:'generated_manual',
+    has_issued_certificate:true,destruction_source:{plant:'plant1',case_id:'1001'}}];
+  h.ui.updateDestructionChoice();const checkbox=h.controls.get('#destruction-needed');checkbox.checked=false;
+  let change=h.ui.changeDestructionChoice();assert.equal(h.controls.get('#action-confirmation-modal').open,true);
+  h.ui.settleActionConfirmation(false);await change;assert.equal(checkbox.checked,true);assert.equal(h.requests.length,0);
+  checkbox.checked=false;change=h.ui.changeDestructionChoice();h.ui.settleActionConfirmation(true);await change;
+  assert.equal(checkbox.checked,false);assert.equal(h.ui.detailsBody(form).destruction_removal_confirmed,true);
+  h.ui.updateDestructionChoice(h.ui.detailsBody(form));assert.equal(checkbox.checked,false);
 });
 
 test('Canceling the Excel choice or changing details while it is open never submits stale edits', async () => {
@@ -2202,7 +3312,8 @@ test('Restoring an older first-generation draft keeps Excel facts and discards u
   h.ui.app.editor.fields.standard = {company_display:'Old edited name',weight_display:'999 KG'};
   h.ui.saveWorkingDraft(); h.ui.app.draftRecovery = {draft:h.ui.readWorkingDraft()};
   h.ui.app.state.rows = [{plant:'plant1',sn:'1001',certificate_status:'ready',supplier:'Excel company',
-    location:'Pune',inward_date:'2026-10-01',items:[{item:'Asset',quantity:1,per_piece_weight:10,weight:10}]}];
+    location:'Pune',inward_date:'2026-10-01',comments:'Already entered',transporter_details:'Eco Recycling',
+    docket_vehicle_no:'DC-44',weight_slip_scale:'WS-44',items:[{item:'Asset',quantity:1,per_piece_weight:10,weight:10}]}];
   vm.runInContext('updateSourceControls = () => {}; renderTemplateEditor = () => {};',h.context);
   await h.ui.restoreWorkingDraft();
   assert.equal(form.values.supplier,'Excel company');
@@ -2210,6 +3321,8 @@ test('Restoring an older first-generation draft keeps Excel facts and discards u
   assert.equal(h.controls.get('#excel-detail-fields').hidden,false);
   assert.equal(h.ui.app.editor.fields.standard.company_display,undefined);
   assert.equal(h.ui.app.editor.fields.standard.weight_display,undefined);
+  assert.equal(form.values.comments,'Already entered');
+  assert.equal(form.values.weight_slip_scale,'WS-44');
   assert.equal(h.requests.length,0);
 });
 
@@ -2231,30 +3344,13 @@ function clientEntry(h) {
   return {form,inputs};
 }
 
-test('Add client explains a duplicate Serial Number before saving and clears it after correction', async () => {
-  const h = harness(), {form,inputs} = clientEntry(h);
-  h.ui.app.state.rows = [
-    {source_kind:'workbook',plant:'plant1',sn:'ABC-10',supplier:'Existing company'},
-    {source_kind:'manual',plant:'plant1',case_id:'LOCAL-1',supplier:'Local company'},
-  ];
-  h.ui.openAddClient();
-  form.values.supplier = 'New company'; form.values.form6 = 'F-NEW'; form.values.sn = ' abc-10 ';
-  assert.equal(h.ui.validateClientSerialNumber(),false);
-  assert.match(inputs.sn.validationMessage,/Already used by Existing company.*another number or leave blank/);
-  assert.equal(h.controls.get('#client-serial-number-hint').hidden,false);
-  assert.equal(inputs.sn.attributes['aria-invalid'],'true');
-  await h.ui.saveClient();
-  assert.equal(h.requests.length,0);
-  form.values.plant = 'plant2';
+test('Add client always requests an automatic SN and exposes no manual SN field', () => {
+  const h=harness(), {form,inputs}=clientEntry(h);
+  form.values.sn='OLD-DRAFT-NUMBER';
   assert.equal(h.ui.validateClientSerialNumber(),true);
-  assert.equal(inputs.sn.validationMessage,'');
-  assert.equal(h.controls.get('#client-serial-number-hint').hidden,true);
-  assert.equal(h.controls.get('#client-serial-number-hint').textContent,'');
-  assert.equal(inputs.sn.attributes['aria-invalid'],'false');
-  form.values.plant = 'plant1'; form.values.sn = 'LOCAL-1';
-  assert.equal(h.ui.validateClientSerialNumber(),true,'Local certificates do not reserve workbook Serial Numbers.');
-  form.values.sn = '';
-  assert.equal(h.ui.validateClientSerialNumber(),true);
+  assert.equal(form.values.sn,''); assert.equal(inputs.sn.validationMessage,'');
+  const html=fs.readFileSync(path.join(__dirname,'../web/index.html'),'utf8');
+  assert.match(html, /<input type="hidden" name="sn" value="">/);
 });
 
 test('Company order follows received date across statuses and keeps unknown dates last', () => {
@@ -2274,7 +3370,7 @@ test('Add client leaves certificate template selection to certificate creation',
   assert.doesNotMatch(form,/Standard COD|name="certificate_type"/);
   assert.doesNotMatch(form,/class="client-entry-id"|Numeric quantities can use|Required for every inward/);
   assert.match(form,/id="client-serial-number-hint"[^>]*hidden/);
-  assert.match(html,/<select name="certificate_type"><option value="standard">Standard/);
+  assert.match(html,/<select name="certificate_type"><option value="standard">Recycling/);
 });
 
 test('Add client keeps calculation and additional fields visible without dropdowns', () => {
@@ -2292,7 +3388,7 @@ test('Add client keeps calculation and additional fields visible without dropdow
   const calculation = all(grid,node => node.className?.includes('client-material-calculation'))[0];
   assert.ok(calculation);
   assert.equal(all(grid,node => node.tag === 'details').length,0);
-  assert.match(text(calculation),/Calculate weight.*Quantity in Pcs.*Per Pcs Weight/);
+  assert.match(text(calculation),/Calculate weight.*Per Pcs Weight.*Quantity in Pcs.*Weight \(KG\)/);
   const html = fs.readFileSync(path.join(__dirname,'../web/index.html'),'utf8');
   const optional = html.match(/<section class="client-entry-more-details"[\s\S]*?<\/section>/)[0];
   for (const name of ['reference','comments','transporter_details','docket_vehicle_no','weight_slip_scale']) {
@@ -2304,7 +3400,7 @@ test('Opening Excel for repair gives a short success notice', async () => {
   const warning = 'Serial Number 10 is repeated. The matching rows are selected in Excel; give each inward a unique Serial Number.';
   const h = harness({fetch:async () => ({ok:true,json:async () => ({selected:true,selection:'repair',warning})})});
   await h.ui.openClientInExcel('plant1','10');
-  assert.equal(h.controls.get('#toast-message').textContent,'Excel opened. Check the Serial Number, then save and refresh.');
+  assert.equal(h.controls.get('#toast-message').textContent,'Excel opened. Check the SN, then save and refresh.');
   assert.equal(h.controls.get('#dismiss-toast').hidden,true);
   assert.equal(h.controls.get('#toast').classList.contains('error'),false);
   assert.equal(h.ui.app.openingExcel,false);
@@ -2368,7 +3464,7 @@ test('Add client saves every material once and shows the new Excel entry in the 
   assert.equal(h.requests[0].payload.expected_revision,'revision-1');
   assert.equal(h.requests[0].payload.details.items.length,2);
   assert.equal(h.requests[0].payload.details.items[1].weight,'8');
-  assert.equal(h.requests[0].payload.details.sn,'1000');
+  assert.equal(h.requests[0].payload.details.sn,'');
   assert.equal(h.requests[0].payload.details.inward_date,'2026-06-15');
   assert.equal(h.requests[0].payload.details.comments,'Return visit');
   assert.equal(h.requests[0].payload.details.transporter_details,'ABC Logistics');
@@ -2461,10 +3557,11 @@ test('Data destruction requests remain attention items after PDF creation until 
     certificate_type:'destruction',certificate_status:'generated_manual',pdf_filename:'0303_Acme.pdf',destruction_pending:true};
   h.ui.app.state.rows = [row];
   assert.equal(h.ui.needsAttention(row),true);
-  assert.match(h.ui.nextStep(row),/Send the data destruction PDF.*Completed/);
+  assert.match(h.ui.nextStep(row),/Send the Data Destruction PDF.*Completed/);
   h.ui.summarize();
   assert.equal(h.controls.get('#destruction-pending').hidden,false);
-  assert.match(h.controls.get('#destruction-pending').textContent,/1 data destruction request/);
+  assert.match(h.controls.get('#destruction-pending').textContent,/Data Destruction · 1 to finish/);
+  assert.match(h.controls.get('#destruction-pending').title,/Payment may depend/);
   row.destruction_pending = false; row.certificate_status = 'completed'; h.ui.summarize();
   assert.equal(h.controls.get('#destruction-pending').hidden,true);
 });
@@ -2484,6 +3581,163 @@ test('Data destruction payload retains its disabled type and inward link during 
   assert.equal(h.ui.readWorkingDraft().values.certificate_type,'destruction');
 });
 
+const linkedBase = {source_kind:'workbook',plant:'plant1',sn:'1001',supplier:'Acme',location:'Mumbai',certificate_type:'standard',cod_no:'0301',certificate_status:'completed',items:[{item:'Computers',weight:20}]};
+const linkedHdd = {source_kind:'manual',plant:'plant1',record_id:'hdd-1',supplier:'Acme',location:'Mumbai',certificate_type:'destruction',cod_no:'0302',certificate_status:'generated',destruction_source:{plant:'plant1',case_id:'1001'},certificate_fields:{device_receipts:'[{"date":"2026-10-01","count":"4"}]'}};
+const settleSwitch = () => new Promise(resolve => setImmediate(resolve));
+function linkedEditor(h, rows=[linkedBase,linkedHdd]) {
+  const form=editing(h);h.ui.app.editor.existing=true;h.ui.app.state.rows=rows;
+  vm.runInContext('globalThis.opened=[]; openDetails=async row=>{opened.push(row);};',h.context);
+  return form;
+}
+
+test('A stale linked HDD save can be retried after refresh only when its records still match', async () => {
+  const hdd={...linkedHdd,raw_details:{supplier:'Acme',certificate_type:'destruction',cod_no:'0302'}};
+  for (const changed of [false,true]) {
+    const inward=changed ? {...linkedBase,supplier:'Changed in Excel'} : linkedBase;
+    const h=harness({fetch:async endpoint => endpoint === '/api/check'
+      ? {ok:true,json:async()=>({workspace_revision:'revision-2',state:{scan_complete:true,rows:[inward,hdd]}})}
+      : {ok:false,status:400,json:async()=>({error:'The files changed since you opened these details.'})}});
+    const form=linkedEditor(h,[linkedBase,hdd]);
+    Object.assign(h.ui.app.editor,{template:'destruction',sourceSn:null,recordId:hdd.record_id,
+      destructionSource:hdd.destruction_source,fields:{destruction:{}}});
+    form.values.certificate_type='destruction';form.values.source_kind='manual';
+    form.values.supplier='Edited for this certificate';
+    vm.runInContext('app.editor.linkedHddSaveSnapshot=linkedHddSaveSnapshot();',h.context);
+    await h.ui.submitGeneration(h.ui.detailsBody(form),false,'/api/manual/generate',true);
+    assert.deepEqual(h.requests.map(request=>request.endpoint),['/api/manual/generate','/api/check']);
+    assert.equal(form.values.supplier,'Edited for this certificate');
+    assert.equal(h.ui.detailsBody(form).expected_revision,changed?'revision-1':'revision-2');
+    assert.match(h.controls.get('#details-error').textContent,changed?/Excel has changed/:/still match/);
+  }
+});
+
+test('Switching from the inward opens its own HDD record without editing either certificate', async () => {
+  const h=harness(),form=linkedEditor(h);h.ui.wire();
+  form.values.certificate_type='destruction';
+  form.dispatch('input',{target:{name:'certificate_type',value:'destruction'}});
+  form.dispatch('change',{target:{name:'certificate_type',value:'destruction'}});
+  await settleSwitch();
+  assert.equal(form.values.certificate_type,'standard');
+  assert.equal(h.context.opened[0],linkedHdd);assert.equal(h.context.opened[0].cod_no,'0302');
+  assert.equal(h.requests.length,0);assert.equal(h.controls.get('#unsaved-modal').open,undefined);
+  assert.equal(linkedBase.cod_no,'0301');
+});
+
+test('Switching back from linked HDD opens the exact inward in its plant', async () => {
+  const h=harness(),form=linkedEditor(h,[{...linkedBase,plant:'plant2',cod_no:'9999'},linkedBase,linkedHdd]);
+  Object.assign(h.ui.app.editor,{template:'destruction',sourceSn:null,recordId:'hdd-1',destructionSource:linkedHdd.destruction_source});
+  form.values.certificate_type='destruction';form.values.source_kind='manual';
+  h.ui.updateDestructionChoice();
+  h.ui.app.editor.baseline=h.ui.detailsBody(form);
+  const companion=h.controls.get('#open-companion-certificate');
+  assert.equal(companion.hidden,false);assert.equal(companion.textContent,'Open Recycling');
+  h.ui.openCompanionCertificate();await settleSwitch();
+  assert.equal(h.context.opened[0],linkedBase);assert.equal(h.requests.length,0);
+});
+
+test('After Excel removal the local certificate and HDD switch by local ID without opening a reused SN', async () => {
+  const base={...linkedBase,source_kind:'manual',record_id:'local-base',removed_inward:{plant:'plant1',case_id:'1001'},certificate_type:'siemens'};
+  const hdd={...linkedHdd,destruction_source:{plant:'plant1',case_id:'1001',record_id:base.record_id}};
+  const h=harness(),form=linkedEditor(h,[{...linkedBase,supplier:'Different replacement inward'},base,hdd]);
+  Object.assign(h.ui.app.editor,{sourceSn:null,localInwardId:base.record_id,recordId:base.record_id,template:'siemens',fields:{siemens:{}}});
+  form.values.source_kind='manual';form.values.certificate_type='siemens';h.ui.app.editor.baseline=h.ui.detailsBody(form);
+  assert.equal(h.ui.editorInwardRow(),base);assert.equal(h.ui.editorDestructionRequest(),hdd);
+  assert.equal(h.ui.excelTarget(hdd),null);
+  h.ui.switchLinkedCertificate('destruction');await settleSwitch();
+  assert.equal(h.context.opened[0],hdd);
+  Object.assign(h.ui.app.editor,{localInwardId:null,recordId:hdd.record_id,template:'destruction',destructionSource:hdd.destruction_source,fields:{destruction:{}}});
+  form.values.certificate_type='destruction';h.ui.app.editor.baseline=h.ui.detailsBody(form);
+  h.ui.switchLinkedCertificate('siemens');await settleSwitch();
+  assert.equal(h.context.opened[1],base);assert.equal(h.requests.length,0);
+});
+
+test('A local certificate retained after Excel deletion can add its own HDD request', async () => {
+  const base={...linkedBase,source_kind:'manual',record_id:'local-base',removed_inward:{plant:'plant1',case_id:'1001'},certificate_type:'siemens'};
+  const hdd={...linkedHdd,destruction_source:{plant:'plant1',case_id:'1001',record_id:base.record_id}};
+  const h=harness({fetch:async()=>({ok:true,json:async()=>({record_id:hdd.record_id,state:{rows:[base,hdd]}})})});
+  const form=linkedEditor(h,[base]);
+  vm.runInContext('setState=state=>{app.state=state;};',h.context);
+  Object.assign(h.ui.app.editor,{sourceSn:null,localInwardId:base.record_id,recordId:base.record_id,template:'siemens',fields:{siemens:{}}});
+  form.values.source_kind='manual';form.values.certificate_type='siemens';h.ui.app.editor.baseline=h.ui.detailsBody(form);
+  h.ui.switchLinkedCertificate('destruction');await settleSwitch();
+  assert.equal(h.requests.length,1);assert.equal(h.requests[0].endpoint,'/api/destruction/request');
+  assert.equal(h.requests[0].payload.record_id,base.record_id);
+  assert.equal(h.context.opened[0],hdd);
+});
+
+test('Canceling a switch preserves unsaved edits and the current dropdown; discarding opens only the selected certificate', async () => {
+  const h=harness(),form=linkedEditor(h);form.values.supplier='Unsaved company';
+  form.values.certificate_type='destruction';h.ui.switchLinkedCertificate('destruction');
+  assert.equal(h.controls.get('#unsaved-modal').open,true);assert.equal(form.values.certificate_type,'standard');
+  h.ui.finishDraftClose(false);await settleSwitch();
+  assert.equal(h.context.opened.length,0);assert.equal(form.values.supplier,'Unsaved company');
+  h.ui.switchLinkedCertificate('destruction');h.ui.finishDraftClose(true);await settleSwitch();
+  assert.equal(h.context.opened[0],linkedHdd);assert.equal(h.requests.length,0);
+});
+
+test('HDD can open before Recycling is issued or the HDD checkbox is selected', async () => {
+  let finish;
+  const inward={...linkedBase,cod_no:'',certificate_status:'alert'};
+  const h=harness({fetch:()=>new Promise(resolve=>{finish=resolve;})});linkedEditor(h,[inward]);
+  vm.runInContext('setState=state=>{app.state=state;};',h.context);
+  h.ui.updateDestructionChoice();
+  assert.equal(h.controls.get('#open-companion-certificate').hidden,false);
+  assert.equal(h.controls.get('#open-companion-certificate').textContent,'Open Data Destruction (HDD)');
+  h.ui.openCompanionCertificate();h.ui.openCompanionCertificate();
+  assert.equal(h.requests.length,1);assert.equal(h.requests[0].endpoint,'/api/destruction/request');
+  assert.deepEqual(h.requests[0].payload,{plant:'plant1',sn:'1001',expected_revision:'revision-1'});
+  const pending={...linkedHdd,cod_no:'',certificate_status:'draft'};
+  finish({ok:true,json:async()=>({record_id:'hdd-1',state:{rows:[inward,pending]},workspace_revision:'revision-2'})});
+  await settleSwitch();assert.equal(h.context.opened[0],pending);assert.equal(h.ui.app.workspaceRevision,'revision-2');
+  assert.equal(h.ui.app.detailsBusy,false);assert.equal(h.ui.app.switchingCertificate,false);
+});
+
+test('A failed HDD request reopens the original certificate and shows the error', async () => {
+  const h=harness({fetch:async()=>({ok:false,status:409,json:async()=>({error:'Excel has changed.'})})});linkedEditor(h,[linkedBase]);
+  h.ui.switchLinkedCertificate('destruction');await settleSwitch();
+  assert.equal(h.context.opened[0],linkedBase);assert.match(h.controls.get('#details-error').textContent,/Excel has changed/);
+  assert.equal(h.controls.get('#details-error').hidden,false);assert.equal(h.ui.app.detailsBusy,false);
+});
+
+test('Missing or ambiguous inward links never navigate by company name or another plant’s SN', () => {
+  for(const rows of [[{...linkedBase,plant:'plant2'},linkedHdd],[linkedBase,{...linkedBase},linkedHdd]]) {
+    const h=harness();linkedEditor(h,rows);
+    Object.assign(h.ui.app.editor,{template:'destruction',sourceSn:null,recordId:'hdd-1',destructionSource:linkedHdd.destruction_source});
+    h.ui.switchLinkedCertificate('standard');assert.equal(h.context.opened.length,0);assert.equal(h.requests.length,0);
+    assert.equal(h.controls.get('#details-error').hidden,false);
+  }
+});
+
+test('The linked HDD selector allows its base type; standalone HDD remains fixed', () => {
+  for(const linked of [false,true]) {
+    const h=harness(),form=editing(h);h.ui.app.state.rows=[linkedBase,linkedHdd];
+    Object.assign(h.ui.app.editor,{existing:true,template:'destruction',sourceSn:null,destructionSource:linked?linkedHdd.destruction_source:null});
+    form.values.certificate_type='destruction';form.values.source_kind='manual';
+    const select=form.elements.namedItem('certificate_type');
+    select.options=['standard','destruction','siemens','sita'].map(value=>({value}));
+    h.ui.renderTemplateEditor();assert.equal(select.disabled,!linked);
+    assert.equal(select.options[1].disabled,false);assert.equal(select.options[1].hidden,false);
+    if(linked) {assert.equal(select.options[0].disabled,false);assert.equal(select.options[2].disabled,true);}
+  }
+});
+
+test('Opening linked certificates resets warnings and loads each record’s own COD, receipt fields and identity', async () => {
+  const h=harness(),form=editing(h);h.controls.get('#details-modal').open=false;
+  form.reset=()=>{form.values={};};h.ui.app.state.rows=[linkedBase,linkedHdd];
+  vm.runInContext('updateSourceControls=()=>{}; renderTemplateEditor=()=>{}; previewDetails=async()=>{};',h.context);
+  for(const row of [linkedBase,linkedHdd,linkedBase]) {
+    h.controls.get('#details-modal').open=false;h.controls.get('#preview-warnings').hidden=false;
+    h.controls.get('#details-error').hidden=false;
+    await h.ui.openDetails(row,true,true);
+    assert.equal(form.values.cod_no,row.cod_no);assert.equal(form.values.certificate_type,row.certificate_type);
+    assert.equal(h.ui.app.editor.recordId,row.record_id||null);
+    assert.equal(h.ui.app.editor.sourceSn,row.source_kind==='manual'?null:'1001');
+    assert.equal(h.controls.get('#details-error').hidden,true);assert.equal(h.controls.get('#preview-warnings').hidden,true);
+    assert.match(h.controls.get('#certificate-selection-status').textContent,new RegExp(row.cod_no));
+    if(row===linkedHdd)assert.equal(h.ui.app.editor.fields.destruction.device_receipts,linkedHdd.certificate_fields.device_receipts);
+  }
+});
+
 test('Data destruction automatic preview works with device counts and no material weight', async () => {
   const h = harness(); const form = editing(h);
   form.values.source_kind = 'manual'; form.values.certificate_weight = ''; form.values.weight = '';
@@ -2493,4 +3747,25 @@ test('Data destruction automatic preview works with device counts and no materia
   const timer = [...h.timers.values()].find(timer => timer.delay === 1000);
   assert(timer); await timer.fn();
   assert.equal(vm.runInContext('destructionPreviewCount',h.context),1);
+});
+
+test('Reopened attachments show the retained filename and page count from the catalog', () => {
+  const h = harness(); editing(h);
+  const token = 'a'.repeat(32);
+  h.ui.app.editor.fields.standard._annexure = token;
+  h.ui.app.attachments = {[token]:{id:token,name:'Manually selected list.pdf',pages:2}};
+  vm.runInContext('updateAnnexureDisplay()',h.context);
+  assert.equal(h.controls.get('#annexure-name').hidden,false);
+  assert.match(h.controls.get('#annexure-name').textContent,/Manually selected list.pdf.*2 pages/);
+});
+
+test('Reference is preserved exactly and SN is the visible record label', () => {
+  const h = harness(); const form = editing(h);
+  form.values.reference = 'MY MANUAL REF / 0007-A';
+  assert.equal(h.ui.detailsBody(form).details.reference,'MY MANUAL REF / 0007-A');
+  assert.equal(h.ui.detailsBody(form).details.reference,'MY MANUAL REF / 0007-A');
+  assert.equal(vm.runInContext('fieldLabels.case_id',h.context),'SN');
+  const html = fs.readFileSync(path.join(__dirname,'../web/index.html'),'utf8');
+  assert.match(html,/<span>SN /);
+  assert.match(html,/never generated automatically/);
 });

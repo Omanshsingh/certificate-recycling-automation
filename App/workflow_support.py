@@ -134,6 +134,8 @@ class Report:
                         "A new COD will be assigned when you create it.")
             status_note = ('Ready to recreate; Excel status update is pending.'
                            if batch.get('_workbook_read_only') or batch.get('_preflight_read_only') else 'Excel was changed to Ready.')
+            if batch.get('pdf_recovery_pending'):
+                status_note = 'Still Ready to recreate.'
             detail = f"PDF missing from Certificates: {status_note} {recovery} {detail}"
             system_alert = True
         raw_date = batch.get('raw_inward_date', batch.get("inward_date"))
@@ -166,6 +168,7 @@ class Report:
             row_warnings.append(date_warning)
         row = {
             "source_kind": "system" if is_system else "workbook",
+            'converted_record_id': batch.get('converted_record_id'),
             "plant": batch.get("source_id", "Setup"),
             "file": batch.get("source_path", ""),
             "sheet": batch.get("source_sheet", ""),
@@ -175,6 +178,8 @@ class Report:
             "location": str(batch.get("location", "") or ""),
             "form6": str(batch.get("form6", "") or ""),
             "reference": str(batch.get("reference", "") or ""),
+            **{key: str(batch.get(key, '') or '') for key in
+               ('comments', 'transporter_details', 'docket_vehicle_no', 'weight_slip_scale')},
             "certificate_weight": batch.get("certificate_weight"),
             "certificate_type": str(batch.get("certificate_type") or "").strip() or "standard",
             "certificate_fields": dict(batch.get("certificate_fields") or {}),
@@ -191,6 +196,7 @@ class Report:
             "outcome": outcome,
             "detail": detail,
             "certificate_no": str(batch.get("cod_no", "") or ""),
+            "hdd_cod_no": batch.get('hdd_cod_no', ''),
             "certificate_date": parse_date(batch.get("cod_date")).isoformat() if parse_date(batch.get("cod_date")) else "",
             "certificate_status": status,
             'pdf_filename': batch.get('pdf_filename', ''),
@@ -200,6 +206,7 @@ class Report:
             "age_days": age,
             "reminder_due": due,
             "overdue": bool(due and age is not None and age > 30),
+            "pdf_missing": bool(batch.get('_missing_pdf')),
             "warnings": row_warnings,
         }
         if issue_code:
@@ -266,7 +273,8 @@ class Report:
 
 def _actionable_rows(result):
     rows = result.get("rows", []) if isinstance(result, dict) else []
-    return [row for row in rows if row.get("reminder_due") or row.get("system_alert")]
+    return [row for row in rows if row.get("reminder_due") or row.get("system_alert")
+            or row.get('attention_pending') or row.get('destruction_pending')]
 
 
 def alert_workbook_targets(result, workbook_paths):
@@ -275,6 +283,11 @@ def alert_workbook_targets(result, workbook_paths):
              for index, value in enumerate(workbook_paths, 1) if index <= 2 and value}
     affected = set()
     for row in _actionable_rows(result):
+        if row.get('source_kind') == 'manual':
+            link = row.get('destruction_source')
+            if isinstance(link, dict) and not link.get('record_id') and link.get('plant') in paths:
+                affected.add(link['plant'])
+            continue
         if row.get('plant') in paths:
             affected.add(row['plant'])
         elif row.get('file'):
@@ -364,13 +377,21 @@ def open_excel_record(workbook, sheet_name, row_number, *, case_id=None, header_
         f"$preferredRow={preferred_row or 0}; "
         "try {$excel=[Runtime.InteropServices.Marshal]::GetActiveObject('Excel.Application')} "
         "catch {$excel=New-Object -ComObject Excel.Application}; "
+        "Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class CertificateExcelFocus { "
+        "[DllImport(\"user32.dll\")] public static extern bool ShowWindow(IntPtr h, int c); "
+        "[DllImport(\"user32.dll\")] public static extern bool SetForegroundWindow(IntPtr h); }'; "
+        "$windowHandle=[IntPtr]::Zero; $deadline=[DateTime]::UtcNow.AddSeconds(18); "
+        "while($true){try{ "
         "$excel.Visible=$true; $book=$null; "
+        "if($windowHandle -eq [IntPtr]::Zero){$windowHandle=[IntPtr]$excel.Hwnd}; "
         "foreach($candidate in $excel.Workbooks){if($candidate.FullName -ieq $path){$book=$candidate;break}}; "
         "if($null -eq $book){$book=$excel.Workbooks.Open($path)}; "
         "$sheet=$book.Worksheets.Item($sheetName); "
-        "$lastColumn=$sheet.Cells.Item($headerRow,16384).End(-4159).Column; "
+        "$book.Activate() | Out-Null; $sheet.Activate() | Out-Null; "
+        "$cells=$sheet.Cells; "
+        "$lastColumn=$cells.Item($headerRow,16384).End(-4159).Column; "
         "if($lastColumn -lt 2){throw 'The Excel headings changed. Save the workbook and refresh the dashboard.'}; "
-        "$headings=$sheet.Range($sheet.Cells.Item($headerRow,1),$sheet.Cells.Item($headerRow,$lastColumn)).Value2; "
+        "$headings=$sheet.Range($cells.Item($headerRow,1),$cells.Item($headerRow,$lastColumn)).Value2; "
         "$mapping=@{}; foreach($property in $aliases.PSObject.Properties){ "
         "$found=@(); for($col=1;$col -le $lastColumn;$col++){ "
         "$heading=([string]$headings[1,$col]).ToLowerInvariant() -replace '[^a-z0-9]',''; "
@@ -380,48 +401,56 @@ def open_excel_record(workbook, sheet_name, row_number, *, case_id=None, header_
         "if(-not $mapping.ContainsKey('sn')){throw 'The Serial Number heading moved. Save the workbook and refresh.'}; "
         "$lastRow=$sheet.UsedRange.Row+$sheet.UsedRange.Rows.Count-1; "
         "if($lastRow -le $headerRow){throw 'This client is no longer in the workbook.'}; "
-        "$values=$sheet.Range($sheet.Cells.Item($headerRow+1,1),$sheet.Cells.Item($lastRow,$lastColumn)).Value2; "
-        "$matches=@(); for($index=1;$index -le $lastRow-$headerRow;$index++){ "
-        "$value=([string]$values[$index,$mapping['sn']]).Trim(); "
-        "$serialCell=$sheet.Cells.Item($headerRow+$index,$mapping['sn']); "
-        "$serialFormat=[string]$serialCell.NumberFormat; $serialRaw=$values[$index,$mapping['sn']]; "
-        "if($serialRaw -is [double] -and $serialFormat -match '^0+$' -and [Math]::Truncate($serialRaw) -eq $serialRaw){ "
+        "$values=$sheet.Range($cells.Item($headerRow+1,1),$cells.Item($lastRow,$lastColumn)).Value2; "
+        "$matchingRows=@(); for($index=1;$index -le $lastRow-$headerRow;$index++){ "
+        "$serialRaw=$values[$index,$mapping['sn']]; $value=([string]$serialRaw).Trim(); "
+        "if($serialRaw -is [double] -and [Math]::Truncate($serialRaw) -eq $serialRaw){ "
+        "$serialFormat=[string]$cells.Item($headerRow+$index,$mapping['sn']).NumberFormat; "
+        "if($serialFormat -match '^0+$'){ "
         "$value=$serialRaw.ToString('0',[Globalization.CultureInfo]::InvariantCulture); "
         "if($value.StartsWith('-')){$value='-'+$value.Substring(1).PadLeft([Math]::Max(0,$serialFormat.Length-1),'0')} "
-        "else{$value=$value.PadLeft($serialFormat.Length,'0')}}; "
-        "if([string]::Equals($value,$clientId,[StringComparison]::OrdinalIgnoreCase)){$matches+=$index}}; "
+        "else{$value=$value.PadLeft($serialFormat.Length,'0')}}}; "
+        "if([string]::Equals($value,$clientId,[StringComparison]::OrdinalIgnoreCase)){$matchingRows+=$index}}; "
         "if($preferredRow -gt $headerRow){$preferredIndex=$preferredRow-$headerRow; "
-        "if($matches -notcontains $preferredIndex){throw 'The selected client moved in Excel. Refresh the work list and try again.'}; "
-        "$firstIndex=$preferredIndex} elseif($matches.Count -eq 1){$firstIndex=$matches[0]} "
+        "if($matchingRows -notcontains $preferredIndex){throw 'The selected client moved in Excel. Refresh the work list and try again.'}; "
+        "$firstIndex=$preferredIndex} elseif($matchingRows.Count -eq 1){$firstIndex=$matchingRows[0]} "
         "else{throw 'This Serial Number appears more than once. Open a specific list entry or correct the Serial Number in Excel.'}; "
         "$rowNumber=$headerRow+$firstIndex; "
         "$limit=$lastRow-$headerRow; for($index=$firstIndex+1;$index -le $limit;$index++){ "
         "if(([string]$values[$index,$mapping['sn']]).Trim()){$limit=$index-1;break}}; "
-        "$idCell=$sheet.Cells.Item($rowNumber,$mapping['sn']); "
+        "$idCell=$cells.Item($rowNumber,$mapping['sn']); "
         "$endRow=$idCell.MergeArea.Row+$idCell.MergeArea.Rows.Count-1; "
         "foreach($key in @('item','quantity','per_piece_weight')){if($mapping.ContainsKey($key)){ "
         "for($index=$firstIndex+1;$index -le $limit;$index++){ "
         "if(([string]$values[$index,$mapping[$key]]).Trim()){$endRow=[Math]::Max($endRow,$headerRow+$index)}}}}; "
         "if($mapping.ContainsKey('weight') -and $limit -gt $firstIndex){ "
-        "$weights=$sheet.Range($sheet.Cells.Item($headerRow+1,$mapping['weight']),$sheet.Cells.Item($lastRow,$mapping['weight'])).Formula; "
+        "$weights=$sheet.Range($cells.Item($headerRow+1,$mapping['weight']),$cells.Item($lastRow,$mapping['weight'])).Formula; "
         "for($index=$firstIndex+1;$index -le $limit;$index++){ "
         "$rawWeight=([string]$weights[$index,1]).Trim(); "
         "if($rawWeight -and -not $rawWeight.StartsWith('=')){$endRow=[Math]::Max($endRow,$headerRow+$index)}}}; "
         "$endRow=[Math]::Min([Math]::Max($endRow,$rowNumber),$headerRow+$limit); "
-        "$target=$sheet.Range($sheet.Cells.Item($rowNumber,1),$sheet.Cells.Item($endRow,$lastColumn)); "
-        "$book.Activate() | Out-Null; $sheet.Activate() | Out-Null; "
+        "$target=$sheet.Range($cells.Item($rowNumber,1),$cells.Item($endRow,$lastColumn)); "
         "if($sheet.FilterMode -and $idCell.EntireRow.Hidden){$sheet.ShowAllData() | Out-Null}; "
         "if($idCell.EntireRow.Hidden){throw 'This client is in a hidden Excel row. Unhide it in Excel and try again.'}; "
         "$excel.Goto($target,$true) | Out-Null; $target.Select() | Out-Null; "
         "$excel.ActiveWindow.ScrollRow=[Math]::Max($headerRow,$rowNumber-3); $excel.ActiveWindow.ScrollColumn=1; "
-        "if($excel.Selection.Address() -ne $target.Address() -or $excel.ActiveWorkbook.FullName -ine $path){ "
+        "if($excel.Selection.Address() -ne $target.Address() -or $excel.ActiveWorkbook.FullName -ine $path "
+        "-or $excel.ActiveSheet.Name -ine $sheetName){ "
         "throw 'Excel could not confirm the selected client. Try Open in Excel again.'}; "
-        "Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class CertificateExcelFocus { "
-        "[DllImport(\"user32.dll\")] public static extern bool ShowWindow(IntPtr h, int c); "
-        "[DllImport(\"user32.dll\")] public static extern bool SetForegroundWindow(IntPtr h); }'; "
         "[CertificateExcelFocus]::ShowWindow([IntPtr]$excel.Hwnd,9) | Out-Null; "
         "[CertificateExcelFocus]::SetForegroundWindow([IntPtr]$excel.Hwnd) | Out-Null; "
-        "@{row=$rowNumber;last_row=$endRow;selected=$true} | ConvertTo-Json -Compress"
+        "@{row=$rowNumber;last_row=$endRow;selected=$true} | ConvertTo-Json -Compress; break "
+        "} catch { "
+        # Excel can briefly return a null COM object while switching worksheets.
+        "$busy=$_.FullyQualifiedErrorId -eq 'InvokeMethodOnNull'; "
+        "for($cause=$_.Exception;$null -ne $cause;$cause=$cause.InnerException){ "
+        "if($cause.HResult -in @(-2147418111,-2147417846,-2146777998)){$busy=$true;break}}; "
+        "if(-not $busy){throw}; "
+        "if($windowHandle -ne [IntPtr]::Zero){ "
+        "[CertificateExcelFocus]::ShowWindow($windowHandle,9) | Out-Null; "
+        "[CertificateExcelFocus]::SetForegroundWindow($windowHandle) | Out-Null}; "
+        "if([DateTime]::UtcNow -ge $deadline){throw 'Excel is not ready to highlight this entry. Close any Excel message or finish editing the cell, then click Open in Excel again.'}; "
+        "Start-Sleep -Milliseconds 350}}"
     )
     command = [powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden",
                "-EncodedCommand", base64.b64encode(script.encode("utf-16le")).decode("ascii")]
@@ -474,7 +503,8 @@ def open_alert_workbook(result, selected_row=None):
 
 def _notice_text(rows):
     due = [row for row in rows if row.get("reminder_due")]
-    urgent = [row for row in rows if row.get("system_alert") and not row.get("reminder_due")]
+    urgent = [row for row in rows if not row.get("reminder_due")
+              and (row.get('system_alert') or row.get('attention_pending') or row.get('destruction_pending'))]
     parts = []
     if due:
         parts.append(f"{len(due)} certificate{'s' if len(due) != 1 else ''} pending.")
@@ -501,7 +531,16 @@ def notify_once(root, result, notifier, today=None, enabled=True, repeat_pending
     if (state.get('dismissed_day') == today.isoformat()
             and state.get('dismissed_time', reminder_time) == reminder_time):
         return False
-    signature = ",".join(sorted(f"{row.get('plant')}|{row.get('sn')}|{row.get('certificate_status')}|{row.get('age_days')}" for row in rows))
+    from certificate_templates import current_warnings
+    signature = json.dumps(sorted(json.dumps({
+        'source_kind': row.get('source_kind'), 'plant': row.get('plant'),
+        'key': row.get('record_id') or row.get('sn'), 'status': row.get('certificate_status'),
+        'age': row.get('age_days'), 'issue_code': row.get('issue_code'),
+        'warnings': sorted(set(current_warnings(row.get('warnings', [])))),
+        'detail': row.get('detail') if row.get('system_alert') and not row.get('warnings') and not row.get('pdf_missing') else None,
+        'system_alert': bool(row.get('system_alert')), 'pdf_missing': bool(row.get('pdf_missing')),
+        'pending_hdd': bool(row.get('attention_pending') or row.get('destruction_pending')),
+    }, sort_keys=True, default=str) for row in rows))
     if (not repeat_pending and state.get("last_day") == today.isoformat()
             and state.get('last_time') == reminder_time and state.get("signature") == signature):
         return False
@@ -528,7 +567,8 @@ def _powershell(root, mode, extra=()):
     command = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script), "-Mode", mode]
     for key, value in extra:
         command.extend([key, str(value)])
-    return subprocess.run(command, capture_output=True, text=True, timeout=30, check=False)
+    return subprocess.run(command, capture_output=True, text=True, timeout=30, check=False,
+                          creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
 
 
 def schedule_one_hour_reminder(root, now=None):
@@ -536,12 +576,22 @@ def schedule_one_hour_reminder(root, now=None):
     completed = _powershell(root, "Snooze", (("-SnoozeAt", run_at.strftime("%Y-%m-%dT%H:%M:%S")),))
     if completed.returncode:
         raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or "Windows could not schedule the reminder.")
+    save_json(Path(root) / 'Data' / 'Snoozed Reminder.json', {'run_at': run_at.isoformat(timespec='seconds')})
 
 
 def cancel_snoozed_reminder(root, force=False):
+    marker = Path(root) / 'Data' / 'Snoozed Reminder.json'
+    if not marker.is_file():
+        # Dismissal state also suppresses any untracked legacy one-off task.
+        # Ordinary daily alerts do not need a PowerShell process just to close.
+        return False
     completed = _powershell(root, "CancelSnooze")
     if completed.returncode and not force:
         raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or "Windows could not clear the reminder.")
+    if completed.returncode == 0:
+        marker.unlink(missing_ok=True)
+        return True
+    return False
 
 
 def launch_review_app(root):
@@ -572,38 +622,54 @@ def dismiss_reminders_today(root, today=None):
 
 def show_centered_reminder(title, message, parent=None, *, on_snooze=None,
                            on_dismiss=None, on_open_workbook=None,
-                           on_open_automation=None, workbook_rows=None, workbook_plants=None):
+                           on_open_automation=None, workbook_rows=None, workbook_plants=None,
+                           error_root=None):
     own_root = parent is None
     window = tk.Tk() if own_root else tk.Toplevel(parent)
     window.title(title)
     has_excel = bool(on_open_workbook and workbook_plants)
-    window.geometry('560x320' if has_excel else '560x265')
+    window.geometry('500x265' if has_excel else '500x220')
     window.resizable(False, False)
-    window.attributes("-topmost", True)
     window.transient(parent) if parent else None
-    outer = tk.Frame(window, padx=28, pady=24)
+    outer = tk.Frame(window, padx=18, pady=16)
     outer.pack(fill="both", expand=True)
-    tk.Label(outer, text=title, font=("Segoe UI", 16, "bold"), anchor="w").pack(fill="x", pady=(0, 12))
-    tk.Label(outer, text=message, font=("Segoe UI", 11), justify="left", anchor="nw", wraplength=500).pack(fill="both", expand=True)
+    tk.Label(outer, text=title, font=("Segoe UI", 13, "bold"), anchor="w").pack(fill="x", pady=(0, 8))
+    tk.Label(outer, text=message, font=("Segoe UI", 10), justify="left", anchor="nw", wraplength=460).pack(fill="both", expand=True)
     actions = tk.Frame(outer)
     actions.pack(fill="x", pady=(18, 0))
-    result = {"action": "dismiss"}
+    result = {"action": "dismiss", "closed": False}
+
+    def perform(callback, args, action):
+        try:
+            callback(*args)
+            if error_root:
+                try:
+                    (Path(error_root) / 'Data' / 'Reports' / 'Reminder action error.txt').unlink(missing_ok=True)
+                except OSError:
+                    pass
+        except Exception as exc:
+            # The reminder has already closed. Keep a failed task update
+            # recoverable without putting another modal in the user's way.
+            import traceback
+            if error_root:
+                path = Path(error_root) / 'Data' / 'Reports' / 'Reminder action error.txt'
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(f'{action}: {exc}\n{traceback.format_exc()}', encoding='utf-8')
+            else:
+                if sys.stderr:
+                    sys.stderr.write(f'Reminder {action} failed: {exc}\n')
 
     def finish(action, callback, *args):
-        try:
-            if callback:
-                callback(*args)
-        except Exception as exc:
-            error_titles = {
-                "open_workbook": "Could not open Excel workbook",
-                "open_automation": "Could not open dashboard",
-                "snooze": "Could not schedule reminder",
-                "dismiss": "Could not dismiss reminder",
-            }
-            messagebox.showerror(error_titles.get(action, "Action failed"), str(exc), parent=window)
+        if result['closed']:
             return
-        result["action"] = action
+        result.update(action=action, closed=True)
         window.destroy()
+        if callback:
+            # A non-daemon worker survives the scheduled process returning,
+            # while the UI thread and window close immediately.
+            import threading
+            result['worker'] = threading.Thread(target=perform, args=(callback, args, action), daemon=False)
+            result['worker'].start()
 
     tk.Button(actions, text="Review now", font=("Segoe UI", 10, "bold"), background='#29343c', foreground='white', command=lambda: finish("open_automation", on_open_automation), padx=10, pady=6).pack(side="left")
     tk.Button(actions, text="Remind me in 1 hour", font=("Segoe UI", 10), command=lambda: finish("snooze", on_snooze), padx=8, pady=6).pack(side="left", padx=8)
@@ -620,9 +686,12 @@ def show_centered_reminder(title, message, parent=None, *, on_snooze=None,
     x = max(0, (window.winfo_screenwidth() - window.winfo_width()) // 2)
     y = max(0, (window.winfo_screenheight() - window.winfo_height()) // 2)
     window.geometry(f"+{x}+{y}")
-    window.focus_force()
     if own_root:
         window.mainloop()
     else:
         parent.wait_window(window)
+    if result.get('worker'):
+        # The window is gone; finish the hidden action before notify_once
+        # records its summary, preserving a dismissal saved by the callback.
+        result['worker'].join()
     return result["action"]

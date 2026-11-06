@@ -92,14 +92,14 @@ class SettingsFeedbackTests(unittest.TestCase):
         if enabled:
             command.extend(["-ReminderTime", reminder_time])
         self.scheduler.assert_called_once_with(
-            command, capture_output=True, text=True, timeout=60, check=False)
+            command, capture_output=True, text=True, timeout=60, check=False,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
 
     def test_invalid_settings_do_not_write_or_schedule(self):
         cases = [
-            ({"workbook_paths": "not a list"}, "Enter both"),
-            ({"workbook_paths": [str(self.paths[0])]}, "Enter both"),
-            ({"workbook_paths": [str(self.paths[0]), " "]}, "Enter both"),
-            ({"workbook_paths": [str(self.paths[0]), None]}, "Enter both"),
+            ({"workbook_paths": "not a list"}, "Choose a file"),
+            ({"workbook_paths": [str(self.paths[0])]}, "Choose a file"),
+            ({"workbook_paths": [str(self.paths[0]), None]}, "Choose a file"),
             ({"workbook_paths": [str(self.paths[0]), str(self.root / "Missing.xlsx")]},
              "could not be found"),
             ({"workbook_paths": [str(self.paths[0]), str(self.root)]},

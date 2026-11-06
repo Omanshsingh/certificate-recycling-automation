@@ -39,6 +39,10 @@ def small_pdf(path, text="Certificate No. 0001"):
     canvas.save()
 
 
+def column_for(sheet, heading):
+    return next(cell.column for cell in sheet[1] if cell.value == heading)
+
+
 class ProductionEdgeTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -47,6 +51,12 @@ class ProductionEdgeTests(unittest.TestCase):
         self.paths = [self.root / "plant1.xlsx", self.root / "plant2.xlsx"]
         write_register(self.paths[0])
         write_register(self.paths[1], case_id="OTHER", cod="0040", status="N/A")
+        # These cases exercise publication and recovery without a reference
+        # warning stopping preflight before it reaches the intended boundary.
+        other = load_workbook(self.paths[1])
+        other.active['J2'] = 'OTHER-REF'
+        other.save(self.paths[1])
+        other.close()
         native = self.root / "App" / "templates" / "certificate-types"
         native.mkdir(parents=True)
         shutil.copy2(APP / "templates" / "certificate-types" / "standard.pdf", native / "standard.pdf")
@@ -120,7 +130,8 @@ class ProductionEdgeTests(unittest.TestCase):
             return result
         with patch.object(workbook_store.os, "replace", side_effect=crash_after_replace):
             with self.assertRaises(SimulatedPowerLoss):
-                drafts.generate_draft(self.root, "plant1", self.details(), as_of=AS_OF)
+                drafts.generate_draft(self.root, "plant1", self.details(
+                    case_id="MANUAL-CRASH", form6="FORM-MANUAL-CRASH"), as_of=AS_OF)
         record = safety.audit_records(self.root)[0]
         self.assertEqual(record["source_expected"], safety.file_digest(drafts.register_path(self.root)))
         safety.recover_issuances(self.root)
@@ -175,15 +186,20 @@ class ProductionEdgeTests(unittest.TestCase):
     def test_generate_preflight_and_issuance_both_respect_selected_plant(self):
         write_register(self.paths[1], case_id="OTHER", status="Ready")
 
-        response = web_app.generate(plants=["plant2"])
+        response = web_app.generate(plants=["plant2"], starting_cod="0041")
 
         self.assertEqual(response["created"], 1)
         first = load_workbook(self.paths[0], data_only=True)
         second = load_workbook(self.paths[1], data_only=True)
         try:
-            self.assertEqual((first.active["M2"].value, first.active["K2"].value), ("Ready", None))
-            self.assertEqual(second.active["M2"].value, "Generated")
-            self.assertTrue(second.active["K2"].value)
+            first_status = column_for(first.active, "Certificate Issued")
+            first_cod = column_for(first.active, "COD No")
+            second_status = column_for(second.active, "Certificate Issued")
+            second_cod = column_for(second.active, "COD No")
+            self.assertEqual((first.active.cell(2, first_status).value,
+                              first.active.cell(2, first_cod).value), ("Ready", None))
+            self.assertEqual(second.active.cell(2, second_status).value, "Generated")
+            self.assertTrue(second.active.cell(2, second_cod).value)
         finally:
             first.close()
             second.close()
@@ -227,7 +243,9 @@ class ProductionEdgeTests(unittest.TestCase):
         self.assertFalse(safety.audit_records(self.root))
 
     def test_manual_endpoint_retains_success_if_postcommit_state_read_fails(self):
-        body = dict(plant="plant1", details=self.details(), expected_revision=workspace_revision(self.root))
+        body = dict(plant="plant1", details=self.details(
+            case_id="MANUAL-ENDPOINT", form6="FORM-MANUAL-ENDPOINT"),
+            expected_revision=workspace_revision(self.root))
         handler = object.__new__(web_app.Handler)
         handler.path = "/api/manual/generate"
         payload = json.dumps(body).encode("utf-8")

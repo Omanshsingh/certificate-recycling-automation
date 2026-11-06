@@ -5,6 +5,8 @@ hashes, not a potentially ambiguous COD/status match. Unknown edits are never
 overwritten by recovery. Completed journal entries are retained as audit records.
 """
 from datetime import datetime, timezone
+from copy import deepcopy
+from functools import lru_cache
 import getpass
 import hashlib
 import json
@@ -82,10 +84,11 @@ def _certificate_path(root, value):
     return path
 
 
-def audit_records(root):
-    folder = Path(root) / 'Data' / 'Issuance History'
+@lru_cache(maxsize=4)
+def _raw_records(stamp):
     records = []
-    for path in sorted(folder.glob('*.json')):
+    for name, signature in stamp:
+        path = Path(name)
         data = json.loads(path.read_text(encoding='utf-8'))
         if not isinstance(data, dict) or data.get('version') != 1:
             raise ValueError('The certificate save history is unreadable. Restore a backup before continuing.')
@@ -93,11 +96,65 @@ def audit_records(root):
     return sorted(records, key=lambda row: (row.get('started_at', ''), row.get('id', '')))
 
 
+@lru_cache(maxsize=4)
+def _projected_records(root, stamp, links_json, deletion_stamp=()):
+    from inward_serials import project_receipts
+    records = project_receipts(root, deepcopy(_raw_records(stamp)), links=json.loads(links_json))
+    # Ownership follows an explicitly converted PDF; historical files stay immutable.
+    transfers = {identifier: row for row in records if row.get('state') == 'complete'
+                 for identifier in (row.get('converted_from') or {}).get('receipt_ids', [])}
+    for row in records:
+        owner = transfers.get(row.get('id'))
+        if owner and row.get('source_kind') == 'workbook':
+            row.update(recorded_source_kind='workbook', recorded_key=row['key'],
+                       source_kind='manual', key=owner['key'])
+    deleted = {}
+    for name, signature in deletion_stamp:
+        removal = json.loads(Path(name).read_text(encoding='utf-8'))
+        if removal.get('state') == 'complete':
+            deleted.update({identifier:removal['id'] for identifier in removal.get('receipt_ids', [])})
+    for row in records:
+        if row.get('id') in deleted:
+            row.update(state='deleted', deleted_by=deleted[row['id']])
+    index = {(row.get('source_kind'), row.get('plant'),
+              str(row.get('key')).strip().casefold() if row.get('source_kind') == 'workbook' else str(row.get('key'))): row
+             for row in records if row.get('state') == 'complete'}
+    return records, index
+
+
+def _receipt_snapshot(root):
+    from file_fingerprints import file_signature
+    from inward_serials import workspace_links
+    root = Path(root).resolve()
+    stamp = tuple((str(path), file_signature(path)) for path in sorted((root / 'Data' / 'Issuance History').glob('*.json')))
+    links_json = json.dumps(workspace_links(root), sort_keys=True)
+    deletions = tuple((str(path), file_signature(path)) for path in sorted((root/'Data'/'Entry Deletions').glob('*.json')))
+    return _projected_records(str(root), stamp, links_json, deletions)
+
+
+def audit_records(root):
+    records = deepcopy(_receipt_snapshot(root)[0])
+    from certificate_drafts import read_register
+    from manual_ownership import record_plant
+    try:
+        local = {row['id']:row for row in read_register(root)['records']}
+    except (OSError, ValueError):
+        # Recovery/audit must still inspect immutable history when the current
+        # register is damaged. Normal edit/creation paths validate it separately.
+        local = {}
+    for row in records:
+        if row.get('source_kind') == 'manual':
+            row['plant'] = record_plant(local.get(str(row.get('key')), {'details':row.get('after') or {}}))
+    return records
+
+
 def latest_issuance(root, source_kind, plant, key):
+    if source_kind == 'manual':
+        return next((row for row in reversed(audit_records(root)) if row.get('source_kind') == 'manual'
+                     and row.get('state') == 'complete' and str(row.get('key')) == str(key)
+                     and (row.get('plant') is None or row.get('plant') == plant)), None)
     identity = lambda value: str(value).strip().casefold() if source_kind == 'workbook' else str(value)
-    return next((row for row in reversed(audit_records(root))
-                 if row.get('state') == 'complete' and row.get('source_kind') == source_kind
-                 and row.get('plant') == plant and identity(row.get('key')) == identity(key)), None)
+    return deepcopy(_receipt_snapshot(root)[1].get((source_kind, plant, identity(key))))
 
 
 def workbook_receipt_conflict(batch, receipt):
@@ -139,7 +196,8 @@ def workbook_receipt_conflict(batch, receipt):
 class IssuanceTransaction:
     def __init__(self, root, destination, temporary, source_path, source_before,
                  *, source_kind, plant, key, cod, issued_date, before, after,
-                 warnings=(), override_reason='', old_paths=(), template_path=None):
+                 warnings=(), override_reason='', old_paths=(), template_path=None,
+                 companion_source=None, converted_from=None):
         self.root = Path(root).resolve()
         self.id = uuid.uuid4().hex
         self.folder = self.root / 'Data' / 'Issuance Recovery' / self.id
@@ -172,8 +230,22 @@ class IssuanceTransaction:
             'pdf_sha256': file_digest(self.folder / 'new.pdf'), 'previous_pdfs': old,
             'before': before, 'after': after, 'accepted_warnings': list(warnings),
             'override_reason': str(override_reason or '').strip(),
+            'voided_certificate': None,
             'template_sha256': file_digest(template_path) if template_path else None,
         }
+        if converted_from:
+            self.data['converted_from'] = deepcopy(converted_from)
+        if companion_source:
+            path, before_payload, after_payload = companion_source
+            path = Path(path).resolve()
+            if path != self.root / 'Data' / 'Custom Certificates.json':
+                raise ValueError('Invalid companion certificate register.')
+            if before_payload is not None:
+                _write_bytes(self.folder / 'companion-before.bin', before_payload)
+            _write_bytes(self.folder / 'companion-after.bin', after_payload)
+            self.data['companion_source'] = {'path': str(path),
+                'before': digest_bytes(before_payload) if before_payload is not None else None,
+                'after': digest_bytes(after_payload)}
         self._save()
 
     def _save(self):
@@ -190,6 +262,28 @@ class IssuanceTransaction:
         os.replace(stage, destination)
         self.data['state'] = 'published'
         self._save()
+
+    def sync_companion(self, committed):
+        companion = self.data.get('companion_source')
+        if not companion:
+            return
+        path = Path(companion['path']).resolve()
+        if path != self.root / 'Data' / 'Custom Certificates.json':
+            raise ValueError('Invalid companion certificate recovery path.')
+        actual = file_digest(path)
+        target = companion['after' if committed else 'before']
+        if actual == target:
+            return
+        if actual not in {companion['before'], companion['after']}:
+            raise ValueError('The local certificate register changed during saving. Recovery copies were preserved.')
+        if target is None:
+            # Retain the register created by an uncommitted conversion for recovery.
+            saved = self.folder / ('uncommitted-register-' + uuid.uuid4().hex + '.json')
+            os.replace(path, saved)
+        else:
+            stage = path.with_name('.' + self.id + '.register.json')
+            _replace_snapshot(self.folder / ('companion-after.bin' if committed else 'companion-before.bin'),
+                              path, stage, target)
 
     def mark_source_committed(self):
         self.data['state'] = 'source_committed'
@@ -221,6 +315,7 @@ class IssuanceTransaction:
         return archive
 
     def _finish_committed(self):
+        self.sync_companion(True)
         destination = _certificate_path(self.root, self.data['pdf_path'])
         if not destination.exists():
             # Completed receipts are never auto-restored. This is only for an
@@ -257,6 +352,7 @@ class IssuanceTransaction:
         self._save()
 
     def rollback(self):
+        self.sync_companion(False)
         destination = _certificate_path(self.root, self.data['pdf_path'])
         current = file_digest(destination)
         previous = next((old for old in self.data['previous_pdfs'] if old['path'] == self.data['pdf_path']), None)
@@ -283,9 +379,10 @@ def recover_issuances(root):
     check_restore_health(root)
     from workflow_support import load_settings
     configured = {str(Path(value).resolve()) for value in load_settings(root).get('workbook_paths', []) if value}
-    recovered = []
+    from entry_deletion import recover_entry_deletions
+    recovered = recover_entry_deletions(root)
     for data in audit_records(root):
-        if data.get('state') in {'complete', 'rolled_back'}:
+        if data.get('state') in {'complete', 'rolled_back', 'deleted'}:
             continue
         identifier = data.get('id', '')
         if not isinstance(identifier, str) or not __import__('re').fullmatch(r'[a-f0-9]{32}', identifier):

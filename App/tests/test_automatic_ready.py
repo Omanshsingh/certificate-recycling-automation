@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 from openpyxl import load_workbook
 
-from certificate_core import read_batches
+from certificate_core import read_batches, register_header
 from workbook_store import WorkbookSession
 import web_app
 from tests.test_certificate_workflow import AutomationTestBase, AS_OF, make_workbook
@@ -18,7 +18,8 @@ class AutomaticReadyTests(AutomationTestBase):
     def statuses(self):
         book = load_workbook(self.plant1)
         try:
-            return [book.active.cell(row, 13).value for row in range(2, book.active.max_row + 1)]
+            column=register_header(book.active)[1]['issued']+1
+            return [book.active.cell(row, column).value for row in range(2, book.active.max_row + 1)]
         finally:
             book.close()
 
@@ -51,14 +52,15 @@ class AutomaticReadyTests(AutomationTestBase):
         self.assertEqual(self.statuses(), ['Alert', 'Ready', 'Alert'])
         book = load_workbook(self.plant1)
         try:
-            validation = next(v for v in book.active.data_validations.dataValidation if 'M2:M10000' in str(v.sqref))
+            column=book.active.cell(1,register_header(book.active)[1]['issued']+1).column_letter
+            validation = next(v for v in book.active.data_validations.dataValidation if f'{column}2:{column}10000' in str(v.sqref))
             self.assertNotIn('Blank', validation.formula1)
             self.assertTrue(validation.allowBlank)
         finally:
             book.close()
 
     def test_missing_or_invalid_source_details_never_get_auto_approved(self):
-        changes = [{'supplier':''}, {'date':None}, {'form6':''},
+        changes = [{'supplier':''}, {'date':None},
                    {'weight':-1}, {'weight':0}, {'item':''},
                    {'date':AS_OF + timedelta(days=1)}, {'cod_date':'bad date'},
                    {'cod_date':AS_OF + timedelta(days=1)}, {'cod':'=1+1'}]
@@ -67,7 +69,7 @@ class AutomaticReadyTests(AutomationTestBase):
         self.assertEqual(self.statuses(), ['Alert'] * len(changes))
 
     def test_explicit_statuses_are_preserved(self):
-        statuses = ['Ready', 'Alert', 'N/A', 'Generated', 'Generated Manual', 'Completed', 'User value']
+        statuses = ['Ready', 'Alert', 'N/A', 'Generated', 'Generated Externally', 'Completed', 'User value']
         make_workbook(self.plant1, [dict(sn=str(i), status=status,
                                          supplier='' if status == 'Alert' else 'Client')
                                     for i, status in enumerate(statuses)])
@@ -84,14 +86,14 @@ class AutomaticReadyTests(AutomationTestBase):
         self.assertEqual(self.statuses(), ['N/A'])
 
         book = load_workbook(self.plant1)
-        book.active['M2'] = 'Ready'
+        book.active.cell(2,register_header(book.active)[1]['issued']+1).value = 'Ready'
         book.save(self.plant1)
         book.close()
         self.refresh_sheet()
         self.assertEqual(self.statuses(), ['N/A'])
         self.assertEqual(read_batches(self.plant1)[0]['issued'], 'N/A')
 
-    def test_form6_is_required_even_for_sita_and_siemens_templates(self):
+    def test_form6_can_be_entered_at_creation_for_each_template(self):
         make_workbook(self.plant1, [dict(sn=kind, status='', form6='') for kind in ('sita', 'siemens', 'standard')])
         book = load_workbook(self.plant1)
         book.active['N1'] = 'Certificate Type'
@@ -100,14 +102,14 @@ class AutomaticReadyTests(AutomationTestBase):
         book.save(self.plant1)
         book.close()
         self.refresh_sheet()
-        self.assertEqual(self.statuses(), ['Alert', 'Alert', 'Alert'])
+        self.assertEqual(self.statuses(), ['Ready', 'Ready', 'Ready'])
         book = load_workbook(self.plant1)
         book.active['I2'] = 'SITA-F6'
         book.active['I3'] = 'SIEMENS-F6'
         book.save(self.plant1)
         book.close()
         self.refresh_sheet()
-        self.assertEqual(self.statuses(), ['Ready', 'Ready', 'Alert'])
+        self.assertEqual(self.statuses(), ['Ready', 'Ready', 'Ready'])
 
     def test_protected_merged_and_formula_status_cells_are_kept(self):
         for kind in ('protected', 'merged', 'formula'):
@@ -139,7 +141,8 @@ class AutomaticReadyTests(AutomationTestBase):
         self.assertEqual(self.statuses(), ['Ready', None])
         book = load_workbook(self.plant1)
         try:
-            self.assertIn('M2:M3', {str(area) for area in book.active.merged_cells.ranges})
+            column=book.active.cell(1,register_header(book.active)[1]['issued']+1).column_letter
+            self.assertIn(f'{column}2:{column}3', {str(area) for area in book.active.merged_cells.ranges})
         finally:
             book.close()
 

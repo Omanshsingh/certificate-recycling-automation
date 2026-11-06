@@ -58,6 +58,7 @@ class DashboardReviewTests(unittest.TestCase):
         connection = Mock()
         response = Mock(status=200)
         response.getheader.return_value = 'application/json'
+        response.read.return_value = b'{"application":"ecoreco-certificates","changed":false}'
         connection.getresponse.return_value = response
         with patch.object(web_app, 'HTTPConnection', return_value=connection), \
                 patch.object(web_app, 'ensure_certificate_folders'), \

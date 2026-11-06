@@ -11,7 +11,8 @@ NS = 'http://schemas.openxmlformats.org/officeDocument/2006/custom-properties'
 VT = 'http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes'
 PROPERTY = 'EcorecoCertificateDetails'
 PROPERTY_V2 = 'EcorecoCertificateDetailsV2_'
-KEYS = {'form6', 'reference', 'certificate_type', 'certificate_fields', 'certificate_weight'}
+KEYS = {'form6', 'reference', 'certificate_type', 'certificate_fields', 'certificate_weight',
+        '_pdf_recovery_pending', '_hdd_cod_no', '_hdd_cod_date'}
 PROPERTY_CHUNK_SIZE = 180  # Excel limits each custom-property value to 255 characters.
 
 
@@ -144,6 +145,18 @@ def write_details(data, sheet, case_id, details):
     for old_key in previous:
         saved.pop(old_key)
     saved[key] = {**existing, **updates}
+    return _replace_details(data, saved)
+
+
+def remove_details(data, sheet, case_id, *, original_data=None):
+    """Forget this inward's private settings so a future entry cannot inherit them."""
+    saved = read_details(BytesIO(data))
+    aliases = _physical_serial_aliases(original_data or data, sheet, case_id)
+    keys = _matching_detail_keys(saved, sheet, case_id, aliases)
+    if not keys:
+        return data
+    for key in keys:
+        saved.pop(key)
     return _replace_details(data, saved)
 
 

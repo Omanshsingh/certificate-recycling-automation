@@ -22,7 +22,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 
-TEMPLATE_NAMES = {"standard": "Standard COD", "sita": "Sita International", "siemens": "Siemens Medical", "destruction": "Secured Data Destruction"}
+TEMPLATE_NAMES = {"standard": "Recycling", "sita": "International", "siemens": "Medical", "destruction": "Data Destruction"}
 TEMPLATE_ROOT = Path(__file__).resolve().parent / "templates" / "certificate-types"
 SHAPE_KEYS = {5: ("certificate_title", "Certificate title"), 6: ("intro", "Introduction"),
               7: ("from_line", "From line"), 8: ("statement", "Recycling statement"),
@@ -51,7 +51,7 @@ def template_id(value):
                "secured data destruction": "destruction", "data destruction": "destruction", "hdd cod": "destruction"}
     key = aliases.get(key, key)
     if key not in TEMPLATE_NAMES:
-        raise ValueError("Choose Standard COD, Sita International, Siemens Medical, or Secured Data Destruction.")
+        raise ValueError("Choose Recycling, Data Destruction, Medical, or International.")
     return key
 
 
@@ -113,6 +113,8 @@ def template_specs():
 def obsolete_template_warning(message):
     """Retire display warnings for controls that no longer exist, not data warnings."""
     message = str(message).casefold()
+    if message.startswith('reference ') and (' already appears in ' in message or ' is also used by ' in message):
+        return True
     if "disposal date" in message or "date of e-waste disposal" in message:
         return True
     if "extends beyond the page" in message or "may overlap " in message:
@@ -345,9 +347,7 @@ def layout_warnings(batch, cod, issued_date):
     return list(dict.fromkeys(warnings))
 
 
-def _original_region(source, region, height):
-    layer = copy(source)
-    left, top, width, box_height = (float(region[k]) for k in ("left", "top", "width", "height"))
+def _original_groups(source):
     # PowerPoint marks each text run as a content group. Keep only the runs
     # in this field, rather than merely hiding all the other original text
     # behind a clip (which would leave old client names in PDF text searches).
@@ -363,6 +363,14 @@ def _original_region(source, region, height):
             depth -= 1
             if depth == 0:
                 groups.append(group)
+    return groups
+
+
+def _original_region(source, region, height, groups=None):
+    layer = copy(source)
+    left, top, width, box_height = (float(region[k]) for k in ("left", "top", "width", "height"))
+    if groups is None:
+        groups = _original_groups(source)
     kept = []
     for group in groups:
         positions = [args for args, op in group if op == b"Tm"]
@@ -422,6 +430,7 @@ def make_template_certificate(batch, cod, issued_date, destination, allow_warnin
     if warnings and not allow_warnings:
         raise ValueError("; ".join(warnings))
     original = PdfReader(TEMPLATE_ROOT / f"{kind}.pdf").pages[0]
+    original_groups = None
     writer = PdfWriter()
     writer.add_page(PdfReader(TEMPLATE_ROOT / f"{kind}.background.pdf").pages[0])
     background = writer.pages[0]
@@ -444,7 +453,11 @@ def make_template_certificate(batch, cod, issued_date, destination, allow_warnin
     for region in placed:
         value = values.get(region["key"], region["text"])
         if value == region["text"] and value and not region.get("moved"):
-            background.merge_page(_original_region(original, region, data["height"]))
+            if original_groups is None:
+                # All fixed labels share the same original page. Parse it once
+                # for this PDF while keeping every output layer independent.
+                original_groups = _original_groups(original)
+            background.merge_page(_original_region(original, region, data["height"], groups=original_groups))
             continue
         if not value:
             continue
@@ -486,18 +499,14 @@ def make_template_certificate(batch, cod, issued_date, destination, allow_warnin
         pdf.restoreState()
     pdf.save()
     background.merge_page(PdfReader(overlay).pages[0])
-    writer.add_metadata({"/Title": f"{TEMPLATE_NAMES[kind]} - {cod}", "/Subject": kind})
+    writer.add_metadata({"/Title": f"{TEMPLATE_NAMES[kind]} - {cod}", "/Subject": kind,
+                         '/CertificateDate': issued_date.isoformat(),
+                         '/CertificatePlant': str(batch.get('source_id') or '')})
     annexure = values.get("_annexure")
     if annexure:
         from app_paths import DATA_ROOT
-        annexure_path = Path(batch.get("_data_root", DATA_ROOT)) / "Data" / "Attachments" / f"{annexure}.pdf"
-        if not annexure_path.is_file():
-            raise ValueError("The attached annexure is missing. Choose its PDF again before creating the certificate.")
-        attached = PdfReader(annexure_path)
-        if attached.is_encrypted:
-            raise ValueError("The annexure PDF is password protected. Choose an unlocked PDF.")
-        for page in attached.pages:
-            writer.add_page(page)
+        from pdf_attachments import append_attachment
+        append_attachment(writer, batch.get('_data_root', DATA_ROOT), annexure)
     destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     with destination.open("wb") as stream:

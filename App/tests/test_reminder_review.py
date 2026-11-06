@@ -27,16 +27,16 @@ class ReminderReviewTests(unittest.TestCase):
                     self.assertEqual([call.args[0] for call in opener.call_args_list], [str(path) for path in expected])
             self.assertEqual([path.read_bytes() for path in paths], [b'test file; native opening is mocked'] * 2)
 
-    def test_unknown_alert_files_cannot_open_unconfigured_files_and_missing_files_fail_before_opening(self):
+    def test_unknown_alert_files_cannot_open_unconfigured_files_and_missing_files_reported_after_available_files_open(self):
         with tempfile.TemporaryDirectory() as folder:
             first = Path(folder) / 'Plant 1.xlsx'; first.write_bytes(b'test')
             paths = [str(first), str(Path(folder) / 'Missing Plant 2.xlsx')]
             with patch.object(support.os, 'startfile', create=True) as opener:
                 with self.assertRaisesRegex(FileNotFoundError, 'No plant Excel file'):
                     support.open_alert_workbooks({'rows':[{'system_alert':True,'file':str(Path(folder) / 'unrelated.xlsx')}]}, paths)
-                with self.assertRaisesRegex(FileNotFoundError, 'Plant 2 Excel file'):
+                with self.assertRaisesRegex(FileNotFoundError, 'Plant 2 could not be found'):
                     support.open_alert_workbooks({'rows':[{'plant':'plant1','system_alert':True}, {'plant':'plant2','system_alert':True}]}, paths)
-                opener.assert_not_called()
+                opener.assert_called_once_with(str(first))
             targets = support.alert_workbook_targets({'rows':[{'system_alert':True,'file':str(first)}]}, paths)
             self.assertEqual(targets, [('plant1',first)])
 
@@ -106,7 +106,7 @@ class ReminderReviewTests(unittest.TestCase):
             notices = Mock()
             with patch.object(support, 'cancel_snoozed_reminder') as cancel:
                 support.dismiss_reminders_today(root, today=today)
-                cancel.assert_called_once_with(root)
+                cancel.assert_called_once_with(root, force=True)
             for repeat in (False, True):
                 self.assertFalse(support.notify_once(root, result, notices, today=today, repeat_pending=repeat))
             result['rows'].append({'system_alert': True, 'sn': '2'})
@@ -126,6 +126,7 @@ class ReminderReviewTests(unittest.TestCase):
     def test_review_reuses_existing_dashboard_at_its_actual_port(self):
         response = Mock(status=200)
         response.getheader.return_value = 'application/json'
+        response.read.return_value = b'{"application":"ecoreco-certificates","changed":false}'
         connection = Mock()
         connection.getresponse.return_value = response
         with patch.object(web_app, 'HTTPConnection', return_value=connection), \
@@ -145,13 +146,16 @@ class ReminderReviewTests(unittest.TestCase):
         with patch.object(support.tk, 'Tk', return_value=window), \
                 patch.object(support.tk, 'Frame'), patch.object(support.tk, 'Label'), \
                 patch.object(support.tk, 'Button') as button, patch.object(support.tk, 'OptionMenu') as dropdown:
+            window.mainloop.side_effect = lambda: button.call_args_list[0].kwargs['command']()
             support.show_centered_reminder('Needs attention', 'Review now', on_open_automation=review,
                                            on_snooze=snooze, on_dismiss=dismiss)
         self.assertEqual([call.kwargs['text'] for call in button.call_args_list],
                          ['Review now', 'Remind me in 1 hour', 'Dismiss for today'])
         for call in button.call_args_list:
             call.kwargs['command']()
-        review.assert_called_once(); snooze.assert_called_once(); dismiss.assert_called_once()
+        review.assert_called_once(); snooze.assert_not_called(); dismiss.assert_not_called()
+        window.destroy.assert_called_once()
+        window.focus_force.assert_not_called()
         dropdown.assert_not_called()
         window.grab_set.assert_not_called()
 

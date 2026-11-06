@@ -37,7 +37,7 @@ def reminder_time_from_picker(hour, minute, period):
 
 
 class App:
-    FILTERS = ("All rows", "Alerts due (day 25+)", "Ready", "Alert", "Generated", "Generated Manual", "Completed", "No status selected", "N/A")
+    FILTERS = ("All rows", "Alerts due (day 25+)", "Ready", "Alert", "Generated", "Generated Externally", "Completed", "No status selected", "N/A")
 
     def __init__(self, root, base=None):
         self.root = root
@@ -114,7 +114,7 @@ class App:
 
         columns = ("plant", "sn", "status", "client", "reference", "cod", "age", "details")
         self.table = ttk.Treeview(outer, columns=columns, show="headings", selectmode="browse")
-        headings = {"plant": "Plant", "sn": "Serial Number", "status": "Status", "client": "Client", "reference": "Reference", "cod": "COD", "age": "Inward age", "details": "What to do"}
+        headings = {"plant": "Plant", "sn": "SN", "status": "Status", "client": "Client", "reference": "Reference", "cod": "COD", "age": "Inward age", "details": "What to do"}
         widths = {"plant": 70, "sn": 82, "status": 110, "client": 175, "reference": 125, "cod": 75, "age": 86, "details": 390}
         for column in columns:
             self.table.heading(column, text=headings[column])
@@ -297,7 +297,7 @@ class App:
 
     def _show_details_dialog(self, path, plant):
         fields = (
-            ("case_id", "Serial Number"), ("inward_date", "Inward date (DD.MM.YYYY)"),
+            ("case_id", "SN"), ("inward_date", "Inward date (DD.MM.YYYY)"),
             ("supplier", "Company / supplier"), ("location", "City"),
             ("item", "Item"), ("quantity", "Quantity"),
             ("per_piece_weight", "Per-piece weight (KG)"), ("weight", "Inward weight (KG)"),
@@ -364,7 +364,7 @@ class App:
             "ready": "Ready",
             "alert": "Alert",
             "generated": "Generated",
-            "generated_manual": "Generated Manual",
+            "generated_manual": "Generated Externally",
             "completed": "Completed",
             "na": "N/A",
             "blank": "",
@@ -380,7 +380,7 @@ class App:
         if selected_filter == "Alert":
             return bool(row.get("outcome") == "needs_review" or row.get("system_alert")
                         or state in {"alert", "unknown", "blank"})
-        expected = {"Ready": "ready", "Generated": "generated", "Generated Manual": "generated_manual",
+        expected = {"Ready": "ready", "Generated": "generated", "Generated Externally": "generated_manual",
                     "Completed": "completed", "No status selected": "blank", "N/A": "na"}.get(selected_filter)
         return state == expected
 
@@ -400,7 +400,7 @@ class App:
         state_counts = {state: sum(status_value(row.get("certificate_status")) == state for row in rows)
                         for state in ("ready", "alert", "generated", "generated_manual", "completed", "na")}
         due_count = sum(bool(row.get("reminder_due")) for row in rows)
-        self.summary.configure(text=f"Due: {due_count}  |  Ready: {state_counts['ready']}  |  Alert: {state_counts['alert']}  |  Generated: {state_counts['generated']}  |  Generated Manual: {state_counts['generated_manual']}  |  Completed: {state_counts['completed']}  |  N/A: {state_counts['na']}")
+        self.summary.configure(text=f"Due: {due_count}  |  Ready: {state_counts['ready']}  |  Alert: {state_counts['alert']}  |  Generated: {state_counts['generated']}  |  Generated Externally: {state_counts['generated_manual']}  |  Completed: {state_counts['completed']}  |  N/A: {state_counts['na']}")
         selected_filter = self.filter_value.get()
         for row in rows:
             if not self._filter_match(row, selected_filter):
@@ -441,7 +441,7 @@ class App:
             self.status.set("Select a generated certificate row first.")
             return
         if status_value(row.get("certificate_status")) not in {"generated", "generated_manual"}:
-            self.status.set("Only a Generated or Generated Manual certificate can be marked Completed.")
+            self.status.set("Only a Generated or Generated Externally certificate can be marked Completed.")
             return
         if not messagebox.askyesno("Mark certificate Completed?", f"Have you sent COD {row.get('certificate_no')} to {row.get('supplier')}?\n\nThis only updates Excel. The automation does not send email.", parent=self.root):
             return

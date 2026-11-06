@@ -29,7 +29,7 @@ class SimpleCertificateFlowTests(unittest.TestCase):
         make_workbook(self.paths[0], [{'sn':'1001', 'supplier':'Different inward name',
             'location':'Pune site', 'date':date(2026, 9, 1), 'weight':12.345678901,
             'quantity':1, 'per_piece_weight':12.345678901, 'form6':'FORM6-1001'}])
-        make_workbook(self.paths[1], [{'sn':'2001', 'status':'N/A'}])
+        make_workbook(self.paths[1], [{'sn':'2001', 'status':'N/A', 'reference':'REF-OTHER-PLANT'}])
         shutil.copytree(APP / 'templates', self.root / 'App' / 'templates')
         save_json(self.root / 'settings.local.json', {'workbook_paths':[str(path) for path in self.paths],
             'certificate_number_prefix':'', 'certificate_number_width':4,
@@ -47,8 +47,14 @@ class SimpleCertificateFlowTests(unittest.TestCase):
         details['certificate_type'] = kind
         details['certificate_fields'] = {'model_name':'Scanner', 'model_serial':'M-123', 'tube_serial':'T-456'} if kind == 'siemens' else {}
         details.update(changes)
+        from run_certificates import numbering_plan
+        from workflow_support import load_settings
+        batches=[batch for path in self.paths for batch in read_batches(path)]
+        plan=numbering_plan(batches,load_settings(self.root),self.root/'Certificates')
         return {'plant':'plant1', 'source_sn':'1001', 'source_plant':'plant1', 'source_kind':'workbook',
-                'details':details, 'edit_scope':'update_excel', 'expected_revision':workspace_revision(self.root)}
+                'details':details, 'edit_scope':'update_excel', 'expected_revision':workspace_revision(self.root),
+                **({'confirmed_excel':True} if kind != self.source()['certificate_type'] else {}),
+                **({'starting_cod':'0001'} if plan['needs_start'] else {})}
 
     def create(self, body=None):
         return web_app.create_certificate(self.body() if body is None else body)
@@ -67,13 +73,14 @@ class SimpleCertificateFlowTests(unittest.TestCase):
         after = self.cells()
         for row, original in enumerate(before):
             for column, value in enumerate(original):
-                if row == 1 and column in {10, 11, 12}:
+                if row > 0 and before[0][column] in {'COD No', 'COD Date', 'Certificate Issued'}:
                     continue
-                self.assertEqual(after[row][column], value)
+                current_column=after[0].index(before[0][column])
+                self.assertEqual(after[row][current_column], value)
         self.assertEqual(self.paths[1].read_bytes(), other)
         receipt = latest_issuance(self.root, 'workbook', 'plant1', '1001')
         self.assertEqual(receipt['after']['certificate_type'], 'sita')
-        self.assertEqual(receipt['after']['edit_scope'], 'certificate_only')
+        self.assertEqual(receipt['after']['edit_scope'], 'update_excel')
         self.assertFalse(any('Form 6' in warning for warning in receipt['accepted_warnings']))
         text = PdfReader(self.root / receipt['pdf_path']).pages[0].extract_text()
         self.assertIn('SITA INFORMATION', text)
@@ -81,13 +88,12 @@ class SimpleCertificateFlowTests(unittest.TestCase):
         row = web_app.target_row(response['state'], ('plant1', '1001'))
         self.assertTrue(row['has_issued_certificate'])
         self.assertEqual(row['last_certificate_details']['certificate_type'], 'sita')
-        self.assertEqual(self.source()['certificate_type'], 'standard')
+        self.assertEqual(self.source()['certificate_type'], 'sita')
 
-    def test_sita_certificate_cannot_be_created_when_inward_form6_is_missing(self):
+    def test_sita_certificate_does_not_require_a_recycling_form6(self):
         book = load_workbook(self.paths[0]); book.active['I2'] = ''; book.save(self.paths[0]); book.close()
-        with self.assertRaisesRegex(ValueError, 'Form 6'):
-            self.create(self.body('sita'))
-        self.assertFalse(list((self.root / 'Certificates').rglob('*.pdf')))
+        self.assertEqual(self.create(self.body('sita'))['created'], 1)
+        self.assertEqual(self.source()['form6'], '')
 
     def test_form6_entered_at_creation_is_saved_and_printed_with_other_inward_facts_kept(self):
         book = load_workbook(self.paths[0])
@@ -189,8 +195,9 @@ class SimpleCertificateFlowTests(unittest.TestCase):
                 'model_name': 'Scanner', 'model_serial': 'MODEL-1', 'tube_serial': 'TUBE-1'}
                 if kind == 'siemens' else {})
             body = {'plant': 'plant1', 'source_sn': source['case_id'], 'source_plant': 'plant1',
-                    'source_kind': 'workbook', 'edit_scope': 'certificate_only',
-                    'details': details, 'expected_revision': workspace_revision(self.root)}
+                    'source_kind': 'workbook', 'edit_scope': 'update_excel', 'confirmed_excel': True,
+                    'details': details, 'expected_revision': workspace_revision(self.root),
+                    **({'starting_cod':'0001'} if not seen else {})}
             result = self.create(body)
             if result.get('requires_confirmation'):
                 self.assertTrue(any('Reference SHARED-REFERENCE' in warning
@@ -254,9 +261,10 @@ class SimpleCertificateFlowTests(unittest.TestCase):
         after = self.cells()
         for row, original in enumerate(before):
             for column, value in enumerate(original):
-                if row == 1 and column in {10, 11, 12}:
+                if row > 0 and before[0][column] in {'COD No', 'COD Date', 'Certificate Issued'}:
                     continue
-                self.assertEqual(after[row][column], value)
+                current_column=after[0].index(before[0][column])
+                self.assertEqual(after[row][current_column], value)
         receipt = latest_issuance(self.root, 'workbook', 'plant1', '1001')
         text = PdfReader(self.root / receipt['pdf_path']).pages[0].extract_text()
         self.assertIn('CORRECTED PDF COMPANY', text)
@@ -278,7 +286,7 @@ class SimpleCertificateFlowTests(unittest.TestCase):
                 self.assertEqual(self.paths[0].read_bytes(), before)
 
     def test_local_pdf_open_and_reveal_accept_only_valid_certificate_paths(self):
-        folder = self.root / 'Certificates' / 'Created in App'
+        folder = self.root / 'Certificates' / 'Auto Generated'
         folder.mkdir(parents=True)
         pdf = folder / '0001_Test.pdf'
         writer = PdfWriter(); writer.add_blank_page(width=200, height=200)
@@ -287,11 +295,11 @@ class SimpleCertificateFlowTests(unittest.TestCase):
         with (patch.object(web_app, 'ROOT', self.root),
               patch.object(web_app, 'open_path') as open_path,
               patch.object(web_app, 'reveal_file_in_explorer') as select_file):
-            self.assertEqual(web_app.open_certificate_locally('Created in App/0001_Test.pdf'), pdf)
+            self.assertEqual(web_app.open_certificate_locally('Auto Generated/0001_Test.pdf'), pdf)
             select_file.assert_called_once_with(pdf)
             open_path.assert_called_once_with(pdf)
             select_file.reset_mock(); open_path.reset_mock()
-            web_app.open_certificate_locally('Created in App/0001_Test.pdf', open_document=False)
+            web_app.open_certificate_locally('Auto Generated/0001_Test.pdf', open_document=False)
             select_file.assert_called_once_with(pdf)
             open_path.assert_not_called()
             select_file.reset_mock()
@@ -443,7 +451,10 @@ class SimpleCertificateFlowTests(unittest.TestCase):
         self.assertEqual(row['last_certificate_details']['certificate_type'], 'siemens')
 
     def test_bulk_recreation_retains_app_only_type_and_siemens_identifiers(self):
-        self.create(self.body('siemens'))
+        payload = self.body('siemens')
+        details, _ = web_app.workbook_form(payload, payload['details'], self.paths)
+        self.assertEqual(runner.run(self.paths, self.root, selected=('plant1', '1001'),
+            details=details, update_excel=False, starting_cod='0001', progress=None)[0], 1)
         first = latest_issuance(self.root, 'workbook', 'plant1', '1001')
         (self.root / first['pdf_path']).unlink()
         runner.run(self.paths, self.root, check_only=True, progress=None)

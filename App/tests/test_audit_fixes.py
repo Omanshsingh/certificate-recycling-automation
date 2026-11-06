@@ -50,6 +50,9 @@ class AuditFixTests(unittest.TestCase):
             book.close()
 
     def execute(self, **options):
+        # These disposable workspaces start without historical CODs; the
+        # test operator explicitly chooses the first number, as the UI does.
+        options.setdefault('starting_cod', '0001')
         return run(self.paths, self.root, as_of=AS_OF, progress=None, **options)
 
     def report(self):
@@ -77,7 +80,8 @@ class AuditFixTests(unittest.TestCase):
                 self.assertTrue(inward_details_complete(source, AS_OF))
                 before = self.paths[0].read_bytes()
                 details = web_app.editor_details(source)
-                body = dict(plant='plant1', source_kind='workbook', source_sn='A', source_plant='plant1', details=details)
+                body = dict(plant='plant1', source_kind='workbook', source_sn='A', source_plant='plant1',
+                            details=details, starting_cod='0001')
                 preview = web_app.preview_certificate(body)
                 self.assertEqual(preview['printed_details']['certificate_weight'].strip(), '13 KG')
                 self.assertEqual(self.paths[0].read_bytes(), before)
@@ -181,7 +185,7 @@ class AuditFixTests(unittest.TestCase):
         before = self.paths[0].read_bytes()
         with patch.object(web_app, 'make_template_certificate', wraps=web_app.make_template_certificate) as render:
             preview = web_app.preview_certificate(dict(plant='plant1', source_sn='A', source_plant='plant1',
-                                                       details=web_app.editor_details(source)))
+                                                       details=web_app.editor_details(source), starting_cod='0001'))
         self.assertEqual(render.call_args.args[0]['form6'], 'FORM6-2')
         self.assertTrue(preview['preview_url'])
         self.assertEqual(self.paths[0].read_bytes(), before)
@@ -189,8 +193,9 @@ class AuditFixTests(unittest.TestCase):
         self.assertIn('FORM6-2', self.pdf_text())
         book = load_workbook(self.paths[0])
         try:
-            self.assertEqual(book.active['O1'].value, 'Form 6 POG Copies Mail sent date')
-            self.assertEqual(book.active['O2'].value.date(), date(2026, 9, 20))
+            tracking_column = next(cell.column for cell in book.active[1]
+                                   if cell.value == 'Form 6 POG Copies Mail sent date')
+            self.assertEqual(book.active.cell(2, tracking_column).value.date(), date(2026, 9, 20))
         finally:
             book.close()
 
@@ -209,9 +214,11 @@ class AuditFixTests(unittest.TestCase):
                                  setattr(book.active['O2'], 'value', date(2026, 9, 20)),
                                  setattr(book.active['I2'], 'value', None)))
         source = read_batches(self.paths[0])[0]
-        self.assertEqual(source['blocking_issues'], ['missing Form 6 number / manifest number'])
+        # Form 6 is collected on the create-certificate step. A mail timestamp
+        # must never be mistaken for it, but an incomplete inward can be saved.
+        self.assertEqual(source['blocking_issues'], [])
         self.assertEqual(source['form6'], '')
-        self.assertFalse(inward_details_complete(source, AS_OF))
+        self.assertTrue(inward_details_complete(source, AS_OF))
         for heading in ('Form 6 alternate number', 'Site region', 'Reference Email Sent Date / Reference No'):
             with self.subTest(heading=heading):
                 self.mutate(lambda book:setattr(book.active['P1'], 'value', heading))
@@ -265,17 +272,23 @@ class AuditFixTests(unittest.TestCase):
                 source=read_batches(self.paths[0])[0]
                 details=web_app.editor_details(source);details['certificate_type']=kind
                 if kind=='siemens': details['certificate_fields']=dict(model_name='Scanner',model_serial='M1',tube_serial='T1')
-                body=dict(plant='plant1',source_kind='workbook',source_sn='A',source_plant='plant1',details=details)
+                body=dict(plant='plant1',source_kind='workbook',source_sn='A',source_plant='plant1',
+                          details=details,starting_cod='0001')
                 before=self.paths[0].read_bytes()
                 preview=web_app.preview_certificate(body)
                 self.assertFalse([message for message in preview['warnings'] if 'Form 6' in message])
                 self.assertEqual(self.paths[0].read_bytes(),before)
+                with self.assertRaisesRegex(ValueError,'certificate type differs from Excel'):
+                    web_app.create_certificate(body)
+                self.assertEqual(self.paths[0].read_bytes(),before)
+                body.update(edit_scope='update_excel',confirmed_excel=True)
                 result=web_app.create_certificate(body)
                 self.assertEqual(result['created'],1)
                 after=read_batches(self.paths[0])[0]
                 self.assertEqual((after['supplier'],after['location'],after['form6']),
                                  (source['supplier'],source['location'],source['form6']))
                 self.assertEqual(after['issued'],'Generated')
+                self.assertEqual(after['certificate_type'],kind)
                 text=self.pdf_text()
                 if kind=='siemens':
                     for value in ('M1','T1','Mumbai'): self.assertIn(value,text)
@@ -312,7 +325,8 @@ class AuditFixTests(unittest.TestCase):
 
                 # Correcting the source date makes this automatic Alert Ready
                 # on the next review; confirmation cannot approve a bad date.
-                self.mutate(lambda book:setattr(book.active['L2'],'value',AS_OF))
+                # COD Date is in column P after the register layout migration.
+                self.mutate(lambda book:setattr(book.active['P2'],'value',AS_OF))
                 self.execute(check_only=True)
                 reviewed = next(row for row in self.report()['rows'] if row['sn']=='A')
                 self.assertEqual(reviewed['certificate_status'], 'ready')
@@ -333,12 +347,12 @@ class AuditFixTests(unittest.TestCase):
             session.ensure_alert_formatting('Inward Register',as_of=AS_OF)
         book=load_workbook(self.paths[0]);sheet=book.active
         validations={str(rule.sqref):rule.formula1 for rule in sheet.data_validations.dataValidation}
-        self.assertEqual(validations['L2:L20'],'L2>0')
-        self.assertEqual(validations['N25:O30'],'M2>0')
-        self.assertIn('M2:M10000',validations)
+        self.assertEqual(validations['P2:P20'],'P2>0')
+        self.assertEqual(validations['K25:L30'],'P2>0')
+        self.assertIn('Q2:Q10000',validations)
         colours={str(ref.sqref):[rule.formula for rule in rules] for ref,rules in sheet.conditional_formatting._cf_rules.items()}
-        self.assertEqual(colours['J2:L20'],[['$M2="Ready"']])
-        self.assertEqual(colours['N25:O30'],[['$M2="Ready"']])
+        self.assertEqual(colours['J2:J20 O2:P20'],[['$Q2="Ready"']])
+        self.assertEqual(colours['K25:L30'],[['$Q2="Ready"']])
         book.close()
 
     def test_bad_other_plant_keeps_readable_companies_visible_and_blocks_issuance(self):

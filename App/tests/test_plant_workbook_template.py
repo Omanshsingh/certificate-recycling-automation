@@ -43,9 +43,9 @@ class PlantWorkbookTemplateTests(unittest.TestCase):
                 self.assertEqual(sheet["H2"].border.bottom.style, "medium")
                 self.assertEqual(sheet["A2"].border.left.style, "medium")
                 self.assertEqual(sheet["A2"].border.bottom.style, "medium")
-                self.assertEqual(sheet["A2"].alignment.horizontal, "center")
-                self.assertEqual(sheet["C2"].alignment.horizontal, "center")
-                self.assertEqual(sheet["O2"].alignment.horizontal, "center")
+                self.assertEqual(sheet["A2"].alignment.horizontal, "left")
+                self.assertEqual(sheet["C2"].alignment.horizontal, "left")
+                self.assertEqual(sheet["O2"].alignment.horizontal, "left")
                 self.assertTrue(any("R2:R10000" in str(rule.sqref)
                                     for rule in sheet.conditional_formatting))
                 self.assertEqual(len(sheet.data_validations.dataValidation), 1)
@@ -69,9 +69,9 @@ class PlantWorkbookTemplateTests(unittest.TestCase):
         self.assertEqual(sheet["R2"].value, "Ready")
         self.assertEqual(sheet["H2"].value, 12.5)
         self.assertEqual(sheet["H3"].value, 8)
-        self.assertEqual(sheet["A2"].alignment.horizontal, "center")
-        self.assertEqual(sheet["E2"].alignment.horizontal, "center")
-        self.assertEqual(sheet["E3"].alignment.horizontal, "center")
+        self.assertEqual(sheet["A2"].alignment.horizontal, "left")
+        self.assertEqual(sheet["E2"].alignment.horizontal, "left")
+        self.assertEqual(sheet["E3"].alignment.horizontal, "left")
         self.assertIn("A2:A3", {str(area) for area in sheet.merged_cells.ranges})
         book.close()
 
@@ -108,7 +108,7 @@ class PlantWorkbookTemplateTests(unittest.TestCase):
         })
         book = load_workbook(BytesIO(updated), data_only=False)
         sheet = book["Sheet1"]
-        self.assertEqual([sheet.cell(2, column).value for column in range(11, 15)],
+        self.assertEqual([sheet.cell(2, column).value for column in range(12, 16)],
                          ["Call before pickup", "ABC Logistics", "DCK-101", "Scale ticket 44"])
         self.assertEqual(sheet["F2"].value, 2)
         self.assertEqual(sheet["G2"].value, 3.5)

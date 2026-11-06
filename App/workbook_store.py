@@ -31,6 +31,7 @@ from openpyxl.utils.datetime import to_excel
 from openpyxl.styles.stylesheet import write_stylesheet
 from openpyxl.xml.functions import tostring
 
+from register_protection import externally_protected, protect_issued_inwards
 from certificate_core import (batch_content, columns, inward_details_complete, material_items, number,
                               parse_date, read_batches, register_header, select_register, status_value,
                               source_value_issues, supplier_is_always_not_applicable, text)
@@ -91,7 +92,7 @@ def formatted_client_template(sheet, header_row, cols, multi_line=False):
 
 
 def copy_client_row_styles(sheet, source_row, target_rows, width=None):
-    """Copy cell formatting and row height, centering a newly appended block."""
+    """Copy cell formatting and row height, left-aligning a newly appended block."""
     width = width or sheet.max_column
     source_height = sheet.row_dimensions[source_row].height
     for target_row in target_rows:
@@ -100,22 +101,22 @@ def copy_client_row_styles(sheet, source_row, target_rows, width=None):
             source = sheet.cell(source_row, column)
             target._style = copy(source._style)
             alignment = copy(source.alignment)
-            alignment.horizontal = 'center'
-            alignment.vertical = alignment.vertical or 'center'
+            alignment.horizontal = 'left'
+            alignment.vertical = 'top'
             target.alignment = alignment
         if source_height is not None:
             sheet.row_dimensions[target_row].height = source_height
 
 
-def center_client_row_alignment(sheet, rows, width=None):
-    """Center copied template rows while preserving wrapping and other alignment."""
+def left_align_client_rows(sheet, rows, width=None):
+    """Left-align copied rows while preserving wrapping and vertical alignment."""
     width = width or sheet.max_column
     for row in set(rows):
         for column in range(1, width + 1):
             cell = sheet.cell(row, column)
             alignment = copy(cell.alignment)
-            alignment.horizontal = 'center'
-            alignment.vertical = alignment.vertical or 'center'
+            alignment.horizontal = 'left'
+            alignment.vertical = 'top'
             cell.alignment = alignment
 
 
@@ -182,25 +183,171 @@ def _inward_blocks(sheet, batches):
 
 
 def _style_inward_dividers(sheet, blocks):
-    """Draw each horizontal rule once: dark between records, light within them."""
+    """Give every physical edge a style, including merged-cell placeholders."""
     light = Side(style='thin', color='FFD1D5DB')
+    dark = Side(style='medium', color='FF000000')
     no_border = Side(style=None)
+    merged_cells = {(row, col): area for area in sheet.merged_cells.ranges
+                    for row in range(area.min_row, area.max_row + 1)
+                    for col in range(area.min_col, area.max_col + 1)}
     for first, last in blocks:
         for row in range(first, last + 1):
             for cell in sheet[row]:
-                if isinstance(cell, MergedCell):
-                    continue
-                merged = next((area for area in sheet.merged_cells.ranges
-                               if cell.coordinate in area), None)
-                bottom_row = merged.max_row if merged else row
+                merged = merged_cells.get((row, cell.column))
                 border = copy(cell.border)
-                # Put each divider on the preceding row's bottom edge only.
-                # Matching top and bottom edges on adjacent rows can render as
-                # a doubled border that protrudes at vertical intersections.
-                border.top = no_border if row == first else light
-                border.bottom = (Side(style=getattr(border.bottom, 'style', None) or 'thin', color='FF000000')
-                                 if bottom_row == last else light)
+                border.left = dark if not merged or cell.column == merged.min_col else no_border
+                border.right = dark if not merged or cell.column == merged.max_col else no_border
+                border.top = (dark if row == first else light) if not merged or row == merged.min_row else no_border
+                border.bottom = (dark if row == last else light) if not merged or row == merged.max_row else no_border
+                if merged and row == merged.min_row and cell.column == merged.min_col:
+                    # Excel also stores the complete rectangle on its anchor.
+                    border.bottom = dark if merged.max_row == last else light
                 cell.border = border
+
+
+def _register_border_styles(book, sheet, blocks, xml, styles_xml):
+    # COD/date need physical rows for recycling and HDD tracking. Vertical
+    # merges hide even explicitly styled internal borders in Excel.
+    _, _, cols = select_register(book)
+    tracking_cols = {cols[key] + 1 for key in ('cod_no', 'cod_date') if key in cols}
+    tracking_merges = {str(area) for area in sheet.merged_cells.ranges
+                       if area.min_col == area.max_col and area.min_col in tracking_cols
+                       and area.min_row < area.max_row
+                       and any(first <= area.min_row <= area.max_row <= last for first, last in blocks)}
+    if tracking_merges:
+        section = _element(xml, 'mergeCells').search(xml)
+        if section:
+            block = _element(section.group(), 'mergeCell').sub(
+                lambda match: '' if _attributes(match.group())['ref'] in tracking_merges else match.group(), section.group())
+            count = len(list(_element(block, 'mergeCell').finditer(block)))
+            block = re.sub(r'\bcount=(["\x27]).*?\1', f'count="{count}"', block, count=1) if count else ''
+            xml = xml[:section.start()] + block + xml[section.end():]
+        for area in tracking_merges:
+            sheet.unmerge_cells(area)
+    # openpyxl discards non-border formatting on merged placeholders when
+    # reading. Start from their original styles so a border repair cannot
+    # change fonts, fills, number formats, alignment or protection.
+    originals = {}
+    for match in _element(xml, 'c').finditer(xml):
+        attrs = _attributes(match.group())
+        cell = sheet[attrs['r']]
+        originals[cell.coordinate] = int(attrs.get('s', 0))
+        cell._style = copy(book._cell_styles[originals[cell.coordinate]])
+    _style_inward_dividers(sheet, blocks)
+    formats = _element(styles_xml, 'cellXfs').search(styles_xml)
+    definitions = [m.group() for m in _element(formats.group(), 'xf').finditer(formats.group())]
+    original_count = len(definitions)
+    known = {value: index for index, value in enumerate(definitions)}
+    ids = {}
+    for first, last in blocks:
+        for row in sheet.iter_rows(min_row=first, max_row=last):
+            for cell in row:
+                definition = definitions[originals.get(cell.coordinate, 0)]
+                # Clone the actual XML format, changing only borderId. Some
+                # Excel flags (e.g. applyNumberFormat) are lost on an openpyxl
+                # round trip even though its style objects appear identical.
+                if re.search(r'\bborderId=', definition):
+                    definition = re.sub(r'\bborderId=(["\x27]).*?\1', f'borderId="{cell._style.borderId}"', definition, count=1)
+                else:
+                    definition = re.sub(r'(<(?:[\w.-]+:)?xf)\b', rf'\1 borderId="{cell._style.borderId}"', definition, count=1)
+                if definition not in known:
+                    known[definition] = len(definitions)
+                    definitions.append(definition)
+                ids[cell.coordinate] = known[definition]
+    if len(definitions) == original_count:
+        return ids, styles_xml, xml
+    emitted = sync_generated_styles(book, styles_xml)
+    emitted_formats = _element(emitted, 'cellXfs').search(emitted)
+    block = formats.group()
+    block = block[:block.rfind('</')] + ''.join(definitions[original_count:]) + block[block.rfind('</'):]
+    block = re.sub(r'\bcount=(["\x27]).*?\1', f'count="{len(definitions)}"', block, count=1)
+    return ids, emitted[:emitted_formats.start()] + block + emitted[emitted_formats.end():], xml
+
+
+def _patch_cell_styles(xml, style_ids):
+    """Change only cell style references; emit missing blank border-edge cells."""
+    pending = {}
+    for coordinate, style in style_ids.items():
+        row_number = int(re.search(r'\d+$', coordinate).group())
+        pending.setdefault(row_number, {})[coordinate] = style
+
+    def patch_row(match):
+        fragment = match.group()
+        row_number = int(_attributes(fragment)['r'])
+        row_styles = pending.pop(row_number, {})
+
+        def patch_cell(cell_match):
+            cell_xml = cell_match.group()
+            coordinate = _attributes(cell_xml)['r']
+            style = row_styles.pop(coordinate, None)
+            if style is None:
+                return cell_xml
+            end = cell_xml.index('>')
+            opening = cell_xml[:end]
+            if re.search(r'\bs=', opening):
+                opening = re.sub(r'\bs=(["\x27]).*?\1', f's="{style}"', opening, count=1)
+            else:
+                opening = opening.rstrip('/') + f' s="{style}"' + ('/' if opening.endswith('/') else '')
+            return opening + cell_xml[end:]
+
+        fragment = _element(fragment, 'c').sub(patch_cell, fragment)
+        missing = row_styles
+        if missing:
+            if fragment.rstrip().endswith('/>'):
+                fragment = fragment.rstrip()[:-2] + f'></{match.group("p")}row>'
+            # Insert backwards so original fragments, including formulas and
+            # cached values, remain byte-for-byte intact.
+            for coord in sorted(missing, key=lambda c: column_index_from_string(re.match(r'[A-Z]+', c).group()), reverse=True):
+                col = column_index_from_string(re.match(r'[A-Z]+', coord).group())
+                following = next((c for c in _element(fragment, 'c').finditer(fragment)
+                                  if column_index_from_string(re.match(r'[A-Z]+', _attributes(c.group())['r']).group()) > col), None)
+                position = following.start() if following else fragment.rfind('</')
+                fragment = fragment[:position] + f'<{match.group("p")}c r="{coord}" s="{missing.pop(coord)}"/>' + fragment[position:]
+        return fragment
+
+    xml = _element(xml, 'row').sub(patch_row, xml)
+    if pending:
+        section = _element(xml, 'sheetData').search(xml)
+        rows = {int(_attributes(m.group())['r']): m.group() for m in _element(section.group(), 'row').finditer(section.group())}
+        for row in pending:
+            rows.setdefault(row, f'<{section.group("p")}row r="{row}"></{section.group("p")}row>')
+        block = section.group()
+        block = block[:block.index('>') + 1] + ''.join(rows[row] for row in sorted(rows)) + block[block.rfind('</'):]
+        xml = xml[:section.start()] + block + xml[section.end():]
+        return _patch_cell_styles(xml, {coord: style for cells in pending.values() for coord, style in cells.items()})
+    return xml
+
+
+def repair_register_borders(data):
+    """Repair borders without moving rows or rewriting any cell payloads."""
+    batches = read_batches(BytesIO(data))
+    book = load_workbook(BytesIO(data), data_only=False)
+    try:
+        sheet, _, _ = select_register(book)
+        if externally_protected(sheet):
+            return data
+        blocks = _inward_blocks(sheet, [b for b in batches if b['source_sheet'] == sheet.title])
+        if not blocks:
+            return data
+        with ZipFile(BytesIO(data)) as archive:
+            member = _sheet_member(archive, sheet.title)
+            xml = archive.read(member).decode('utf-8')
+            style_ids, styles, unmerged = _register_border_styles(book, sheet, blocks, xml, archive.read('xl/styles.xml').decode('utf-8'))
+            patched = _patch_cell_styles(unmerged, style_ids)
+            if patched == xml:
+                return data
+            changes = {member: patched.encode('utf-8'),
+                       'xl/styles.xml': styles.encode('utf-8')}
+            if all(archive.read(name) == value for name, value in changes.items()):
+                return data
+            output = BytesIO()
+            with ZipFile(output, 'w') as target:
+                target.comment = archive.comment
+                for info in archive.infolist():
+                    target.writestr(info, changes.get(info.filename, archive.read(info.filename)))
+            return output.getvalue()
+    finally:
+        book.close()
 
 
 class UnsupportedReorderError(ValueError):
@@ -209,6 +356,18 @@ class UnsupportedReorderError(ValueError):
 
 def order_register_for_save(data, session):
     """Keep a verified record save usable when only automatic sorting is unsafe."""
+    from register_column_order import normalize_register_columns, UnsupportedColumnOrderError
+    try:
+        data = normalize_register_columns(data)
+    except UnsupportedColumnOrderError as exc:
+        session.order_warning = str(exc)
+    from register_presentation import normalize_register_presentation
+    from register_rows import compact_register_gaps
+    try:
+        data = compact_register_gaps(data)
+    except UnsupportedReorderError as exc:
+        session.order_warning = str(exc)
+    data = repair_register_borders(normalize_register_presentation(data))
     try:
         return sort_register_by_inward_date(data)
     except UnsupportedReorderError as exc:
@@ -280,7 +439,7 @@ def sort_register_by_inward_date(data, *, source_rows=None):
             if moved:
                 if any(name.casefold() == 'xl/vbaproject.bin' for name in archive.namelist()):
                     unsafe('the workbook contains VBA macros whose row references cannot be verified')
-                if sheet.protection.sheet:
+                if externally_protected(sheet):
                     unsafe('the register worksheet is protected')
                 # These features carry row anchors/dependencies outside sheetData.
                 # A normal plant register does not need any of them.
@@ -315,12 +474,8 @@ def sort_register_by_inward_date(data, *, source_rows=None):
                     if serial and row not in by_start and not any(row in batch['summary_rows'] for batch in records):
                         unsafe(f'Excel row {row} contains a note or unrecognised Serial Number')
 
-            _style_inward_dividers(sheet, blocks)
-            # Register newly synthesized cell formats without resaving unrelated
-            # workbook members through openpyxl (which can discard extensions).
-            style_ids = {cell.coordinate: cell.style_id for row in sheet for cell in row
-                         if not isinstance(cell, MergedCell) and cell.row in row_map}
-            styles = sync_generated_styles(book, archive.read('xl/styles.xml').decode('utf-8'))
+            style_ids, styles, xml = _register_border_styles(book, sheet, blocks, xml, archive.read('xl/styles.xml').decode('utf-8'))
+            xml = _patch_cell_styles(xml, style_ids)
             rows_section = _element(xml, 'sheetData').search(xml)
             rows = []
             for match in _element(rows_section.group(), 'row').finditer(rows_section.group()):
@@ -677,7 +832,7 @@ def _ensure_status_validation(xml, status_column, row_limit, first_row=2):
     prefix = match.group("p") if match else (root_prefix_match.group("p") if root_prefix_match else "")
     validation = (f'<{prefix}dataValidation type="list" allowBlank="1" showErrorMessage="1" '
                   f'sqref="{status_column}{first_row}:{status_column}{row_limit}">'
-                  f'<{prefix}formula1>",Ready,Alert,N/A,Generated,Generated Manual,Completed"</{prefix}formula1>'
+                  f'<{prefix}formula1>",Ready,Alert,N/A,Generated,Generated Externally,Completed"</{prefix}formula1>'
                   f'</{prefix}dataValidation>')
     if match:
         block = match.group()
@@ -859,7 +1014,7 @@ def _is_status_color_rule(fragment, status_column):
         return False
     return any(f'"{status}"' in formula for status in (
         "READY", "ALERT", "CHECK DETAILS", "WORKING DRAFT", "N/A", "BLANK",
-        "GENERATED", "GENERATED MANUAL", "CREATED", "DRAFTED", "COMPLETED", "SENT",
+        "GENERATED", "GENERATED MANUAL", "GENERATED EXTERNALLY", "CREATED", "DRAFTED", "COMPLETED", "SENT",
     ))
 
 
@@ -913,7 +1068,7 @@ def _add_status_conditional_formatting(sheet_xml, status_column, sn_column, dxf_
         ("NA", f'SUBSTITUTE(UPPER(TRIM(${status_column}2))," ","")="N/A"'),
         ("BLANK", f'AND(${sn_column}2<>"",OR(${status_column}2="",UPPER(TRIM(${status_column}2))="BLANK"))'),
         ("GENERATED", f'UPPER(TRIM(${status_column}2))="GENERATED"'),
-        ("GENERATED MANUAL", f'UPPER(TRIM(${status_column}2))="GENERATED MANUAL"'),
+        ("GENERATED EXTERNALLY", f'UPPER(TRIM(${status_column}2))="GENERATED EXTERNALLY"'),
         ("COMPLETED", f'UPPER(TRIM(${status_column}2))="COMPLETED"'),
     )
     prefix_match = re.search(r"<(?P<p>(?:[A-Za-z_][\w.-]*:)?)worksheet\b", sheet_xml)
@@ -1207,14 +1362,22 @@ def _sheet_member(archive, sheet_name):
     return target.lstrip("/") if target.startswith("/") else posixpath.normpath(posixpath.join("xl", target))
 
 
-def add_tracking_column(data):
-    """Add only Certificate Issued, preserving the existing register package."""
+def add_tracking_column(data, *, on_order_warning=None):
+    """Keep operational fields before the final COD/date/status columns."""
+    from register_column_order import normalize_register_columns, UnsupportedColumnOrderError
     book = load_workbook(BytesIO(data), data_only=False)
     try:
         sheet, header_row, cols = select_register(book)
         if 'issued' in cols:
-            return data
-        if sheet.protection.sheet:
+            try:
+                return normalize_register_columns(data)
+            except UnsupportedColumnOrderError as exc:
+                # Reading/refreshing a valid register must remain possible
+                # when only its automatic column move needs Excel.
+                if on_order_warning:
+                    on_order_warning(str(exc))
+                return data
+        if externally_protected(sheet):
             raise ValueError('Unprotect the register before adding Certificate Issued.')
         last_column = max(cell.column for cell in sheet[header_row] if text(cell.value))
         column = checked_register_column(last_column + 1)
@@ -1275,7 +1438,7 @@ def add_tracking_column(data):
                 for info in source.infolist():
                     payload = xml.encode('utf-8') if info.filename == member else styles.encode('utf-8') if info.filename == 'xl/styles.xml' else source.read(info.filename)
                     target.writestr(copy(info), payload)
-            return output.getvalue()
+            return normalize_register_columns(output.getvalue())
     finally:
         book.close()
 
@@ -1310,6 +1473,8 @@ class WorkbookSession:
         self.stream = self.context.__enter__()
         try:
             self.data = self.stream.read()
+            from inward_serials import bind_workbook
+            bind_workbook(self.path, self.data)
             return self
         except Exception:
             self.context.__exit__(None, None, None)
@@ -1321,25 +1486,55 @@ class WorkbookSession:
                 self.context.__exit__(*args)
             finally:
                 self.context = None
+                from inward_serials import unbind_workbook
+                unbind_workbook(self.path)
 
-    def ensure_alert_formatting(self, sheet_name, batches=None, as_of=None):
+    def ensure_alert_formatting(self, sheet_name, batches=None, as_of=None, *, root=None, plant=None):
         """Refresh colors and promote complete, unselected inwards to Ready."""
-        prepared = add_tracking_column(self.data)
-        self.order_warning = None
-        source_rows = {}
+        check = load_workbook(BytesIO(self.data), data_only=False)
         try:
-            prepared = sort_register_by_inward_date(prepared, source_rows=source_rows)
+            if sheet_name in check and externally_protected(check[sheet_name]):
+                self.order_warning = 'This Excel sheet is protected. Unprotect it to update its status or layout.'
+                return None
+        finally:
+            check.close()
+        self.order_warning = None
+        from register_presentation import normalize_register_presentation
+        prepared = repair_register_borders(normalize_register_presentation(add_tracking_column(self.data,
+            on_order_warning=lambda warning: setattr(self, 'order_warning', warning))))
+        source_rows = {}
+        from register_rows import compact_register_gaps
+        try:
+            prepared = compact_register_gaps(prepared, source_rows=source_rows)
+        except UnsupportedReorderError as exc:
+            self.order_warning = str(exc)
+        sorted_rows = {}
+        serial_changes = {}
+        before_sort, rows_before_sort = prepared, source_rows
+        try:
+            prepared = sort_register_by_inward_date(prepared, source_rows=sorted_rows)
+            source_rows = ({identity: sorted_rows.get((identity[0], row), row) for identity, row in source_rows.items()}
+                           if source_rows else sorted_rows)
+            if root is not None and plant is not None:
+                from inward_serials import resequence_date_ordered_inwards
+                try:
+                    prepared, serial_changes = resequence_date_ordered_inwards(prepared, self.data, root=root, plant=plant)
+                except ValueError as exc:
+                    prepared, source_rows = before_sort, rows_before_sort
+                    self.order_warning = str(exc)
         except UnsupportedReorderError as exc:
             # Manual edits can introduce cross-record formulas or row-anchored
             # objects. Keep their order intact and let the app explain why.
             self.order_warning = str(exc)
         if prepared != self.data:
             self._persist(prepared)
-            fresh = {(b['source_sheet'], b['source_row']): b for b in read_batches(BytesIO(self.data))}
+            identity_field = 'case_id' if serial_changes else 'source_row'
+            fresh = {(b['source_sheet'], b[identity_field]): b for b in read_batches(BytesIO(self.data))}
             for batch in batches or []:
                 if batch['source_sheet'] == sheet_name:
                     previous = (batch['source_sheet'], batch['source_row'])
-                    current = (batch['source_sheet'], source_rows.get(previous, batch['source_row']))
+                    current = ((batch['source_sheet'], serial_changes.get(batch['case_id'], batch['case_id']))
+                               if serial_changes else (batch['source_sheet'], source_rows.get(previous, batch['source_row'])))
                     if current in fresh:
                         history_conflict = batch.get('record_identity_conflict')
                         batch.update(fresh[current])
@@ -1370,13 +1565,13 @@ class WorkbookSession:
             row_limit = max(10000, sheet.max_row + 2000)
             status_labels = {
                 "ready": "Ready", "alert": "Alert", "na": "N/A", "blank": "",
-                "generated": "Generated", "generated_manual": "Generated Manual",
+                "generated": "Generated", "generated_manual": "Generated Externally",
                 "completed": "Completed",
             }
             status_updates = []
             for row_number in range(first_row, sheet.max_row + 1):
                 cell = sheet.cell(row_number, cols["issued"] + 1)
-                if cell.data_type == "f" or (sheet.protection.sheet and cell.protection.locked):
+                if cell.data_type == "f" or (externally_protected(sheet) and cell.protection.locked):
                     continue
                 batch = sheet_batches.get(row_number)
                 # A history conflict belongs to this inward. Preserve its
@@ -1414,14 +1609,14 @@ class WorkbookSession:
                 updated_styles, "FFC00000", "FFFFFFFF")
             status_dxf_ids = {"READY": None, "ALERT": None, "NA": None,
                               "BLANK": None, "GENERATED": None,
-                              "GENERATED MANUAL": None, "COMPLETED": None}
+                              "GENERATED EXTERNALLY": None, "COMPLETED": None}
             for label, fill, font in (
                 ("READY", "FFB6D7A8", "FF006100"),
                 ("ALERT", "FFC00000", "FFFFFFFF"),
                 ("NA", "FFFFFFFF", "FF000000"),
                 ("BLANK", "FFFFFFFF", "FF000000"),
                 ("GENERATED", "FFFFE699", "FF7F6000"),
-                ("GENERATED MANUAL", "FFDDEBF7", "FF1F4E78"),
+                ("GENERATED EXTERNALLY", "FFDDEBF7", "FF1F4E78"),
                 ("COMPLETED", "FFFFE699", "FF7F6000"),
             ):
                 updated_styles, status_dxf_ids[label] = _add_color_dxf(updated_styles, fill, font)
@@ -1441,7 +1636,8 @@ class WorkbookSession:
                 row_limit=row_limit, first_row=first_row,
             )
             if updated_styles == styles_xml and updated_sheet == original_sheet_xml:
-                return self.backup_path
+                protected = protect_issued_inwards(self.data)
+                return self._persist(protected, exact=True) if protected != self.data else self.backup_path
             ET.fromstring(updated_styles)
             ET.fromstring(updated_sheet)
             changed = {"xl/styles.xml": updated_styles.encode("utf-8"),
@@ -1483,7 +1679,7 @@ class WorkbookSession:
             cells = [sheet.cell(current["source_row"], cols[key] + 1) for key in ("cod_no", "cod_date", "issued")]
             for cell in cells:
                 _check_batch_merge(sheet, cell, current['source_row'], cols)
-                if cell.data_type == "f" or (sheet.protection.sheet and cell.protection.locked):
+                if cell.data_type == "f" or (externally_protected(sheet) and cell.protection.locked):
                     raise ValueError(f"{cell.coordinate} is a formula or protected cell; it was not overwritten.")
             return (current, cells[0].coordinate, cells[1].coordinate, cells[2].coordinate,
                     cells[1].style_id, is_date_format(cells[1].number_format), book.epoch)
@@ -1491,7 +1687,7 @@ class WorkbookSession:
             book.close()
 
     def commit(self, batch, certificate_no, certificate_date, target_status="Generated", overrides=None,
-               staged_data=None, allow_reissue=False, new_batch=False, deferred_form6=None):
+               staged_data=None, allow_reissue=False, new_batch=False, deferred_form6=None, deferred_reference=None):
         if status_value(target_status) != "generated":
             raise ValueError("The app writes Generated after it creates the PDF. Set Completed only after the certificate has been sent.")
         if self.context is None:
@@ -1530,7 +1726,7 @@ class WorkbookSession:
                         continue
                     cell = sheet.cell(current["source_row"], cols[key] + 1)
                     _check_batch_merge(sheet, cell, current['source_row'], cols)
-                    if cell.data_type == "f" or (sheet.protection.sheet and cell.protection.locked):
+                    if cell.data_type == "f" or (externally_protected(sheet) and cell.protection.locked):
                         raise ValueError(f"{cell.coordinate} is a formula or protected cell; it was not overwritten.")
             finally:
                 original.close()
@@ -1555,6 +1751,11 @@ class WorkbookSession:
                     or status_value(current.get('issued')) in {'generated', 'generated_manual', 'completed'}):
                 raise ValueError('The Form 6 number changed. Refresh and review this certificate again.')
             persisted_overrides = dict(persisted_overrides or {}, form6=text(deferred_form6))
+        if deferred_reference is not None:
+            if (text(current.get('reference')) or not text(deferred_reference)
+                    or status_value(current.get('issued')) in {'generated', 'generated_manual', 'completed'}):
+                raise ValueError('The reference number changed. Refresh and review this certificate again.')
+            persisted_overrides = dict(persisted_overrides or {}, reference=text(deferred_reference))
 
         # Use openpyxl for this one transactional update so missing headers
         # and operator overrides can be added together, then persist the
@@ -1583,7 +1784,7 @@ class WorkbookSession:
 
             def check_cell(cell):
                 _check_batch_merge(sheet, cell, current['source_row'], cols)
-                if cell.data_type == "f" or (sheet.protection.sheet and cell.protection.locked):
+                if cell.data_type == "f" or (externally_protected(sheet) and cell.protection.locked):
                     raise ValueError(f"{cell.coordinate} is a formula or protected cell; it was not overwritten.")
 
             row = current["source_row"]
@@ -1613,7 +1814,7 @@ class WorkbookSession:
                 else:
                     cell.value = value
                 if key == "cod_date" and not is_date_format(cell.number_format):
-                    cell.number_format = "dd.mm.yyyy"
+                    cell.number_format = "dd/mm/yy"
             buffer = BytesIO()
             book.save(buffer)
             updated = buffer.getvalue()
@@ -1621,7 +1822,8 @@ class WorkbookSession:
             book.close()
 
         updated = write_details(updated, current['source_sheet'], current['case_id'],
-                                {key:value for key,value in (persisted_overrides or {}).items() if key not in cols})
+                                {**{key:value for key,value in (persisted_overrides or {}).items() if key not in cols},
+                                 '_pdf_recovery_pending': False})
         updated = order_register_for_save(updated, self)
 
         verified_matches = [b for b in read_batches(BytesIO(updated))
@@ -1653,9 +1855,9 @@ class WorkbookSession:
         expected = {status_value(value) for value in expected_status}
         target = status_value(new_status)
         target_labels = {"ready": "Ready", "generated": "Generated",
-                         "generated_manual": "Generated Manual", "completed": "Completed"}
+                         "generated_manual": "Generated Externally", "completed": "Completed"}
         if target not in target_labels:
-            raise ValueError("Only Ready, Generated, Generated Manual or Completed can be recorded by this action.")
+            raise ValueError("Only Ready, Generated, Generated Externally or Completed can be recorded by this action.")
         new_status = target_labels[target]
         matches = [batch for batch in read_batches(BytesIO(self.data))
                    if text(batch['case_id']).casefold() == text(case_id).casefold()
@@ -1677,7 +1879,7 @@ class WorkbookSession:
                 raise ValueError("Add a Certificate Issued column before updating the completion status.")
             cell = sheet.cell(current["source_row"], cols["issued"] + 1)
             _check_batch_merge(sheet, cell, current['source_row'], cols)
-            if cell.data_type == "f" or (sheet.protection.sheet and cell.protection.locked):
+            if cell.data_type == "f" or (externally_protected(sheet) and cell.protection.locked):
                 raise ValueError(f"{cell.coordinate} is a formula or protected cell; its status was not changed.")
             coordinate = cell.coordinate
         finally:
@@ -1695,6 +1897,9 @@ class WorkbookSession:
                     target_archive.writestr(info, xml.encode("utf-8") if info.filename == member
                                              else source.read(info.filename))
         updated = buffer.getvalue()
+        if target == 'ready' and status_value(current['issued']) in {'generated', 'generated_manual', 'completed'}:
+            updated = write_details(updated, current['source_sheet'], current['case_id'],
+                                    {'_pdf_recovery_pending': True})
         verified = next(batch for batch in read_batches(BytesIO(updated))
                         if batch["case_id"] == current['case_id']
                         and batch["source_sheet"] == source_sheet
@@ -1705,7 +1910,9 @@ class WorkbookSession:
             raise ValueError("The workbook status update could not be verified; the original file was kept.")
         return self._persist(updated)
 
-    def _persist(self, updated):
+    def _persist(self, updated, *, exact=False):
+        if not exact:
+            updated = protect_issued_inwards(updated)
         if self.before_persist:
             self.before_persist(updated)
         if not self.backup_path:
@@ -1748,6 +1955,8 @@ class WorkbookSession:
                 self.data = self.stream.read()
                 raise
             self.context, self.stream, self.data = new_context, new_stream, updated
+            from inward_serials import bind_workbook
+            bind_workbook(self.path, self.data)
             new_context = None
         finally:
             if new_context:
@@ -1816,6 +2025,19 @@ def stage_certificate_details(session, details, validate_cells=True):
     if not case_id:
         raise ValueError("Serial Number is required.")
     source_batches = read_batches(BytesIO(session.data))
+    if validate_cells and 'items' in details:
+        from register_rows import ensure_material_capacity
+        from types import SimpleNamespace
+        required = len(material_items(details)[0])
+        current = next((b for b in source_batches if text(b['case_id']).casefold() == source_case_id.casefold()), None)
+        expanded = (ensure_material_capacity(session.data, source_case_id, required)
+                    if current and required > len(current['items']) else session.data)
+        if expanded != session.data:
+            shadow = SimpleNamespace(data=expanded, path=session.path, order_warning=None)
+            result = stage_certificate_details(shadow, details, validate_cells=True)
+            if shadow.order_warning:
+                session.order_warning = shadow.order_warning
+            return result
     if source_case_id != case_id and any(
             text(batch['case_id']).casefold() == source_case_id.casefold() for batch in source_batches):
         raise ValueError('The existing Serial Number contains unsupported control characters. '
@@ -1855,7 +2077,7 @@ def stage_certificate_details(session, details, validate_cells=True):
             for key, entered in entered_columns.items():
                 if key in cols or not entered:
                     continue
-                if sheet.protection.sheet:
+                if externally_protected(sheet):
                     raise ValueError(f'Unprotect the register before adding the missing {labels[key]} column.')
                 column = next_register_column(sheet, header_row)
                 heading = sheet.cell(header_row, column, labels[key])
@@ -1975,7 +2197,7 @@ def stage_certificate_details(session, details, validate_cells=True):
                 if (not removing and desired is not None and computed is not None
                         and math.isclose(computed, desired, rel_tol=1e-9, abs_tol=1e-8)):
                     return
-                if sheet.protection.sheet and cell.protection.locked:
+                if externally_protected(sheet) and cell.protection.locked:
                     raise ValueError(f'{cell.coordinate} is a protected weight formula. '
                                      'Keep this correction in the PDF only, or unlock that weight cell in Excel before saving.')
                 # Prove that this is the same bounded, same-row arithmetic the
@@ -1991,7 +2213,7 @@ def stage_certificate_details(session, details, validate_cells=True):
                                      'Keep this correction in the PDF only, or enter a confirmed weight in that Excel cell before saving.')
                 cell.value = None if removing else desired
                 return
-            if sheet.protection.sheet and cell.protection.locked:
+            if externally_protected(sheet) and cell.protection.locked:
                 raise ValueError(f'{cell.coordinate} is a protected weight cell; it was not changed.')
             cell.value = None if removing or desired in (None, '') else desired
 
@@ -2024,7 +2246,7 @@ def stage_certificate_details(session, details, validate_cells=True):
                         raise ValueError('Excel material lines share merged cells. Choose PDF only, or separate the material cells in Excel before saving there.')
                 else:
                     _check_batch_merge(sheet, cell, target_row, cols)
-                if cell.data_type == "f" or (sheet.protection.sheet and cell.protection.locked):
+                if cell.data_type == "f" or (externally_protected(sheet) and cell.protection.locked):
                     raise ValueError(f"{cell.coordinate} is a formula or protected cell; it was not overwritten.")
             cell.value = value
         if material_override is not None and not render_material_only:
@@ -2040,7 +2262,7 @@ def stage_certificate_details(session, details, validate_cells=True):
                         if key == 'weight':
                             write_material_weight(cell, material, removing=index >= len(material_override))
                             continue
-                        if cell.data_type == "f" or (sheet.protection.sheet and cell.protection.locked):
+                        if cell.data_type == "f" or (externally_protected(sheet) and cell.protection.locked):
                             raise ValueError(f"{cell.coordinate} is a formula or protected cell; it was not overwritten.")
                     value = material.get(key)
                     cell.value = value if value not in (None, "") else None
@@ -2056,7 +2278,7 @@ def stage_certificate_details(session, details, validate_cells=True):
                 elif 'weight' in cols:
                     cell = sheet.cell(row_number, cols['weight'] + 1)
                     if cell.data_type != 'f':
-                        if sheet.protection.sheet and cell.protection.locked:
+                        if externally_protected(sheet) and cell.protection.locked:
                             raise ValueError(f'{cell.coordinate} is protected; its total was not changed.')
                         cell.value = sum(material['weight'] or 0 for position, material in zip(material_rows, material_override)
                                          if position < row_number)
@@ -2135,6 +2357,11 @@ def stage_certificate_details(session, details, validate_cells=True):
         default = "standard" if key == "certificate_type" else {}
         if matches[0].get(key, default) != expected:
             raise ValueError(f"Excel {key} could not be verified; the original workbook was kept.")
+    if validate_cells:
+        from inward_followup import FIELDS, stage_followup
+        if any(key in details for key in FIELDS):
+            values = {key:details.get(key, matches[0].get(key, '')) for key in FIELDS}
+            updated, matches[0] = stage_followup(updated, case_id, values)
     return updated, matches[0]
 
 

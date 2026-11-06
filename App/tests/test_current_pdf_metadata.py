@@ -32,6 +32,7 @@ class CurrentPdfMetadataTests(unittest.TestCase):
         with run_lock(self.root):
             pass
         self.records = []
+        save_json(self.root / 'settings.local.json', {'workbook_paths': [str(self.root/'plant1.xlsx'), str(self.root/'plant2.xlsx')]})
 
     def pdf(self, name, *, pages=1, encrypted=False):
         path = self.folder / name
@@ -105,10 +106,10 @@ class CurrentPdfMetadataTests(unittest.TestCase):
 
     def test_category_subfolders_keep_saved_pdf_links_and_manual_register_in_sync(self):
         workbook = self.pdf('Auto Generated/0001_Workbook_Client_Pune_1.pdf')
-        manual = self.pdf('Created in App/0002_Manual company_Pune_2.pdf')
+        manual = self.pdf('Auto Generated/0002_Manual company_Pune_2.pdf')
         self.receipt(workbook)
         self.receipt(manual, source_kind='manual', plant='plant2', key='manual-1', cod='0002')
-        record = self.manual_record(manual.name, relative_path='Created in App/' + manual.name)
+        record = self.manual_record(manual.name, relative_path='Auto Generated/' + manual.name)
         self.cache([self.workbook_row()])
 
         rows = web_app.workspace_state()['rows']
@@ -116,15 +117,15 @@ class CurrentPdfMetadataTests(unittest.TestCase):
 
         self.assertEqual([row['pdf_relative_path'] for row in rows], [
             'Auto Generated/' + workbook.name,
-            'Created in App/' + manual.name,
+            'Auto Generated/' + manual.name,
         ])
         self.assertEqual([output['relative_path'] for output in outputs], [
             'Auto Generated/' + workbook.name,
-            'Created in App/' + manual.name,
+            'Auto Generated/' + manual.name,
         ])
         self.assertEqual(outputs[0]['pdf_url'], '/api/certificates/' + quote('Auto Generated/' + workbook.name, safe='/'))
-        self.assertEqual(outputs[1]['pdf_url'], '/api/certificates/' + quote('Created in App/' + manual.name, safe='/'))
-        self.assertEqual(drafts.read_register(self.root)['records'][0], record)
+        self.assertEqual(outputs[1]['pdf_url'], '/api/certificates/' + quote('Auto Generated/' + manual.name, safe='/'))
+        self.assertEqual(drafts.read_register(self.root)['records'][0], dict(record, plant=None))
 
     def test_latest_reissue_wins_over_obsolete_files_and_cached_filenames(self):
         old_workbook = self.pdf('0001_Old_company_1.pdf')
@@ -141,7 +142,7 @@ class CurrentPdfMetadataTests(unittest.TestCase):
         rows = web_app.workspace_state()['rows']
         self.assertEqual([row['pdf_filename'] for row in rows], [current_workbook.name, current_manual.name])
         self.assertEqual(self.snapshot(), before)
-        self.assertEqual(drafts.read_register(self.root)['records'][0], record)
+        self.assertEqual(drafts.read_register(self.root)['records'][0], dict(record, plant=None))
 
     def test_missing_latest_is_not_replaced_by_an_obsolete_same_cod_file(self):
         old_workbook = self.pdf('0001_Old_company_1.pdf')
@@ -202,7 +203,7 @@ class CurrentPdfMetadataTests(unittest.TestCase):
         before = self.snapshot()
         with patch.object(web_app, 'refresh', return_value=recovered) as refresh:
             self.assertIs(web_app.workspace_state(), recovered)
-        refresh.assert_called_once_with()
+        refresh.assert_called_once_with(force=True)
         self.assertEqual(self.snapshot(), before)
 
     def test_missing_manual_keeps_recovery_identity_and_returns_no_pdf_metadata(self):
@@ -267,8 +268,8 @@ class CurrentPdfMetadataTests(unittest.TestCase):
     def test_unsafe_manual_saved_paths_are_not_exposed(self):
         outside = self.pdf('../Outside.pdf')
         nested = self.pdf('nested/Inside.pdf')
-        for filename in ('../Outside.pdf', str(outside.resolve()), 'nested/Inside.pdf',
-                         '..\\Outside.pdf', 'nested\\Inside.pdf', 123):
+        for filename in ('../Outside.pdf', str(outside.resolve()),
+                         '..\\Outside.pdf', 123):
             with self.subTest(filename=filename):
                 record = self.manual_record(filename)
                 row = dict(source_kind='manual', plant='plant2', record_id=record['id'],
@@ -279,8 +280,8 @@ class CurrentPdfMetadataTests(unittest.TestCase):
                 self.assertEqual(self.snapshot(), before)
         self.assertTrue(nested.is_file())
 
-    def test_escaped_nested_or_non_pdf_receipt_paths_are_not_exposed(self):
-        for name in ('../Outside.pdf', 'nested/0001_Current_1.pdf', '0001_Current_1.txt'):
+    def test_escaped_or_non_pdf_receipt_paths_are_not_exposed(self):
+        for name in ('../Outside.pdf', '0001_Current_1.txt'):
             with self.subTest(name=name):
                 path = self.pdf(name)
                 receipt = self.receipt(path)
@@ -292,6 +293,14 @@ class CurrentPdfMetadataTests(unittest.TestCase):
                 rows = web_app.current_pdf_rows([self.workbook_row(pdf_filename='stale.pdf')])
                 self.assertNotIn('pdf_filename', rows[0])
                 self.assertEqual(self.snapshot(), before)
+
+    def test_safe_nested_pdf_paths_remain_available(self):
+        current=self.pdf('nested/0001_Current_1.pdf')
+        self.receipt(current)
+        before=self.snapshot()
+        row=web_app.current_pdf_rows([self.workbook_row()])[0]
+        self.assertEqual(row['pdf_relative_path'],'nested/0001_Current_1.pdf')
+        self.assertEqual(self.snapshot(),before)
 
     def test_missing_unreadable_and_encrypted_pdfs_have_no_metadata(self):
         for kind in ('missing', 'unreadable', 'encrypted'):

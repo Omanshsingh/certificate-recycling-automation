@@ -480,7 +480,6 @@ class BackupServiceTests(unittest.TestCase):
     def test_pending_issuance_and_recovery_snapshots_are_preserved(self):
         path, journal = self.pending_issuance()
         item = self.create()
-        path.write_bytes(b'{"state":"complete"}')
         self.restore(item)
         self.assertEqual(json.loads(path.read_bytes()), journal)
         self.assertEqual((self.root / f"Data/Issuance Recovery/{journal['id']}/source-before.bin").read_bytes(), b"previous source")

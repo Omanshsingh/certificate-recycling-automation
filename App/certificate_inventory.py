@@ -14,21 +14,23 @@ from workflow_support import save_json, load_settings
 
 MAX_PDF_BYTES = 50 * 1024 * 1024
 MAX_PAGES = 8
-INSPECTION_VERSION = 3
+INSPECTION_VERSION = 6
 CERTIFICATE_FOLDERS = {
     'workbook': 'Auto Generated',
-    'manual': 'Created in App',
+    'manual': 'Auto Generated',
     'external': 'Manually Added',
 }
 
 
 def ensure_certificate_folders(root):
-    """Create the three source folders while keeping the parent as the watched root."""
+    """Keep two output folders and migrate the former app-only folder safely."""
     base = Path(root) / 'Certificates'
     base.mkdir(parents=True, exist_ok=True)
     folders = {kind: base / name for kind, name in CERTIFICATE_FOLDERS.items()}
     for folder in folders.values():
         folder.mkdir(parents=True, exist_ok=True)
+    from certificate_folder_migration import migrate_certificate_folder
+    migrate_certificate_folder(root)
     return folders
 
 
@@ -42,7 +44,7 @@ def certificate_destination(root, source_kind, filename):
     return Path(root) / 'Certificates' / CERTIFICATE_FOLDERS[source_kind] / name
 
 
-def safe_certificate_path(root, relative_path):
+def safe_certificate_path(root, relative_path, *, expected_sha=None):
     """Resolve a path beneath Certificates, rejecting traversal and escaping symlinks."""
     base = (Path(root) / 'Certificates').resolve()
     raw = str(relative_path or '').replace('\\', '/')
@@ -51,7 +53,9 @@ def safe_certificate_path(root, relative_path):
                        or any(ord(char) < 32 for char in part) for part in parts)
             or not raw.lower().endswith('.pdf')):
         raise ValueError('Invalid certificate path.')
-    destination = base.joinpath(*parts).resolve()
+    from certificate_folder_migration import moved_relative_path
+    raw = moved_relative_path(root, raw, expected_sha)
+    destination = base.joinpath(*raw.split('/')).resolve()
     if not destination.is_relative_to(base) or destination.suffix.casefold() != '.pdf':
         raise ValueError('Invalid certificate path.')
     return destination
@@ -66,13 +70,13 @@ def identity(value):
 
 def filename_cod(path):
     stem = Path(path).stem
-    legacy = re.match(r'^(?:cod|certificate)[ _-]*(\d+)(?=_|$)', stem, re.I)
+    legacy = re.match(r'^(?:cod|certificate|hdd)[ _-]*(\d+)(?=_|$)', stem, re.I)
     if legacy:
         return legacy[1]
     if '_' not in stem:
         return stem if re.search(r'\d$', stem) else None
     first = stem.split('_', 1)[0]
-    if first.casefold() not in {'cod', 'certificate'} and re.fullmatch(r'[A-Za-z0-9.-]+', first):
+    if first.casefold() not in {'cod', 'certificate', 'hdd'} and re.fullmatch(r'[A-Za-z0-9.-]+', first):
         return first
     return None
 
@@ -80,7 +84,7 @@ def filename_cod(path):
 def text_identifiers(text, *, number_prefix=''):
     """Read labelled values, never an arbitrary date/weight/serial number."""
     cods, references = set(), set()
-    cod_label = r'(?:certificate|cod)[ \t]*(?:no\.?|number)[ \t]*(?:&[ \t]*date)?'
+    cod_label = r'(?:certificate|cod|hdd)[ \t]*(?:no\.?|number)[ \t]*(?:&[ \t]*date)?'
     ref_label = r'(?:reference|ref)[ \t]*(?:no\.?|number)'
     for label, found in ((cod_label, cods), (ref_label, references)):
         for match in re.finditer(rf'(?im)\b{label}[ \t]*[:\-]?[ \t]*([^\n\r]*)', text):
@@ -104,9 +108,14 @@ def text_identifiers(text, *, number_prefix=''):
 
 
 def inspect_pdf(path, *, pdf_data=None, number_prefix=''):
+    return _inspect_pdf(path, pdf_data=pdf_data, number_prefix=number_prefix)[:3]
+
+
+def _inspect_pdf(path, *, pdf_data=None, number_prefix='', certificate_pages=None, issued_cod=None):
     named = filename_cod(path)
-    cods, references = set(filter(None, [named])), set()
+    cods, references = (set() if issued_cod else set(filter(None, [named]))), set()
     warnings = []
+    attachment_cods = set()
     try:
         if pdf_data is None:
             with path.open('rb') as stream:
@@ -127,24 +136,30 @@ def inspect_pdf(path, *, pdf_data=None, number_prefix=''):
             raise ValueError('PDF has no pages')
         printed = set()
         readable = False
-        for page in reader.pages[:MAX_PAGES]:
+        for index, page in enumerate(reader.pages[:MAX_PAGES]):
             for mode in ('plain', 'layout'):
                 text = page.extract_text(extraction_mode=mode) or ''
-                readable = readable or bool(text.strip())
+                attached = certificate_pages is not None and index >= certificate_pages
+                if not attached:
+                    readable = readable or bool(text.strip())
                 found, refs = text_identifiers(text, number_prefix=number_prefix)
-                printed.update(found)
+                (attachment_cods if attached else printed).update(found)
                 references.update(refs)
         cods.update(printed)
+        if issued_cod:
+            cods.add(str(issued_cod))
         # COD prefixes may themselves contain underscores. The first filename
         # token is then only a fragment, not an additional conflicting COD.
         filename_matches = [value for value in printed if identity(value) != identity(named) and (
             path.stem.casefold() == identity(value)
             or path.stem.casefold().startswith(identity(value) + '_'))]
-        if named and len(filename_matches) == 1:
+        if not issued_cod and named and len(filename_matches) == 1:
             cods.discard(named)
             named = filename_matches[0]
             cods.add(named)
-        if named and printed and any(identity(value) != identity(named) for value in printed):
+        if issued_cod and printed and any(identity(value) != identity(issued_cod) for value in printed):
+            warnings.append('Printed COD differs from the recorded certificate number. Check this PDF.')
+        elif not issued_cod and named and printed and any(identity(value) != identity(named) for value in printed):
             warnings.append('Filename COD and printed COD differ; both numbers are treated as used. Check this PDF.')
         if len({identity(value) for value in printed}) > 1:
             warnings.append('More than one printed COD was found; all are treated as used. Check this PDF.')
@@ -156,10 +171,61 @@ def inspect_pdf(path, *, pdf_data=None, number_prefix=''):
             warnings.append(f'Only the first {MAX_PAGES} PDF pages were inspected; check any later certificates manually.')
     except Exception as exc:
         warnings.append(f'Could not read PDF details: {exc}. The filename COD is still treated as used; verify other numbers manually.')
-    return sorted(cods), sorted(references), warnings
+    return sorted(cods), sorted(references), warnings, sorted(attachment_cods)
 
 
-def scan_inventory(root, persist=False):
+def _issued_certificate_facts(root):
+    """Read COD and attachment boundaries only from committed PDF receipts.
+
+    Do not infer this from a filename, editable draft or PDF metadata. Older
+    issued PDFs already have the template and receipt details in their journal,
+    so they can be read correctly without rewriting the certificate.
+    """
+    from issuance_safety import audit_records
+    try:
+        records = audit_records(root)
+    except (OSError, ValueError):
+        return {}  # Without evidence, inspect every page and retain warnings.
+    facts_by_digest = {}
+    for record in records:
+        if record.get('state') not in {'complete', 'source_committed'}:
+            continue
+        details = record.get('after')
+        if not isinstance(details, dict):
+            continue
+        digest = record.get('pdf_sha256')
+        if not isinstance(digest, str) or not re.fullmatch(r'[a-f0-9]{64}', digest):
+            continue
+        cod = str(record.get('cod') or '').strip()
+        if not cod:
+            continue
+        fields = details.get('certificate_fields') or {}
+        pages = None
+        if isinstance(fields, dict) and re.fullmatch(r'[a-f0-9]{32}', str(fields.get('_annexure') or '')):
+            kind = details.get('certificate_type', 'standard')
+            if kind == 'destruction':
+                from destruction_certificate import receipts
+                try:
+                    # Older issued PDFs could contain continuation pages. Their
+                    # immutable receipt proves where the attachment begins.
+                    pages = 1 + max(1, (len(receipts(fields.get('device_receipts'), maximum=100)) + 8) // 9)
+                except ValueError:
+                    continue
+            elif kind in {'standard', 'sita', 'siemens'}:
+                pages = 1
+            else:
+                continue
+        facts_by_digest.setdefault(digest, set()).add((cod, pages))
+    return {digest: next(iter(facts)) for digest, facts in facts_by_digest.items() if len(facts) == 1}
+
+
+def _issued_certificate_pages(root):
+    """Return page boundaries for PDFs proven by exact committed receipts."""
+    return {digest: pages for digest, (_cod, pages) in _issued_certificate_facts(root).items()
+            if pages is not None}
+
+
+def scan_inventory(root, persist=False, *, force=False):
     root = Path(root)
     number_prefix = load_settings(root).get('certificate_number_prefix', '')
     ledger_path = root / 'Data' / 'Certificate Inventory.json'
@@ -176,6 +242,15 @@ def scan_inventory(root, persist=False):
         except (OSError, ValueError, TypeError, KeyError) as exc:
             raise ValueError(f'The certificate number inventory is unreadable. Restore its backup before allocating a COD: {exc}') from exc
     entries = {entry['path'].casefold(): dict(entry, present=False) for entry in previous['entries']}
+    issued = _issued_certificate_facts(root)
+    from issuance_safety import audit_records
+    owners_by_digest = {record.get('pdf_sha256'):{'source_kind':record.get('source_kind'),
+                        'plant':record.get('plant'), 'key':str(record.get('key')), 'cod':str(record.get('cod'))}
+                        for record in audit_records(root) if record.get('state') == 'complete'
+                        and record.get('pdf_sha256')}
+    for entry in entries.values():
+        if entry.get('sha256') in owners_by_digest:
+            entry['managed_owner'] = owners_by_digest[entry['sha256']]
     folder = root / 'Certificates'
     if folder.is_dir():
         for path in sorted(folder.rglob('*')):
@@ -191,25 +266,15 @@ def scan_inventory(root, persist=False):
             old = entries.get(relative.casefold())
             pdf_data = None
             try:
-                with path.open('rb') as stream:
-                    # The parsing limit is not a file identity. Distinct large
-                    # PDFs must never share a synthetic digest/cache entry.
-                    if stat.st_size <= MAX_PDF_BYTES:
-                        candidate = stream.read(MAX_PDF_BYTES + 1)
-                        if len(candidate) <= MAX_PDF_BYTES:
-                            pdf_data = candidate
-                            digest = hashlib.sha256(candidate).hexdigest()
-                        else:
-                            checksum = hashlib.sha256(candidate)
-                            for chunk in iter(lambda: stream.read(1024 * 1024), b''):
-                                checksum.update(chunk)
-                            digest = checksum.hexdigest()
-                    else:
-                        digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+                from file_fingerprints import fingerprint
+                digest, pdf_data = fingerprint(path, force=force, payload_limit=MAX_PDF_BYTES)
             except OSError:
                 digest = None
+            issued_cod, certificate_pages = issued.get(digest, (None, None))
             if (old and old.get('inspection_version') == INSPECTION_VERSION
                     and old.get('inspection_prefix') == number_prefix
+                    and old.get('inspection_certificate_pages') == certificate_pages
+                    and old.get('inspection_issued_cod') == issued_cod
                     and digest is not None and old.get('sha256') == digest and old.get('size') == stat.st_size):
                 # A restored byte-identical PDF remains the same issuance even
                 # though atomic rollback changed its filesystem timestamp.
@@ -217,16 +282,40 @@ def scan_inventory(root, persist=False):
             else:
                 # Parse the same bytes we hashed. A PDF replaced in Explorer
                 # between separate reads must not mix one hash with another COD.
-                cods, refs, warnings = inspect_pdf(path, pdf_data=pdf_data, number_prefix=number_prefix)
+                if digest is not None and pdf_data is None and stat.st_size <= MAX_PDF_BYTES:
+                    digest, pdf_data = fingerprint(path, force=True, payload_limit=MAX_PDF_BYTES)
+                cods, refs, warnings, attachment_cods = _inspect_pdf(
+                    path, pdf_data=pdf_data, number_prefix=number_prefix, certificate_pages=certificate_pages,
+                    issued_cod=issued_cod)
+                previous_cods = set((old or {}).get('certificate_cods', (old or {}).get('cods', [])))
+                previous_numbers = set((old or {}).get('cods', []))
+                if old and digest is not None and old.get('sha256') == digest:
+                    # An older inspection counted attached certificates as this
+                    # PDF's own numbers. Correct that attribution, but reserve all
+                    # observed numbers below for future number allocation.
+                    previous_cods.difference_update(set(attachment_cods) - set(cods))
+                    if issued_cod:
+                        # A filename changed on an exact copy cannot assign a
+                        # second COD to the byte-identical issued certificate.
+                        filename_number = filename_cod(path)
+                        if filename_number and identity(filename_number) != identity(issued_cod) and not any(
+                                identity(value) == identity(filename_number) for value in cods):
+                            previous_cods.discard(filename_number)
+                            previous_numbers.discard(filename_number)
                 # Corrections do not make a previously observed number free.
-                entry = {'path': relative, 'cods': sorted(set(cods) | set((old or {}).get('cods', []))),
+                entry = {'path': relative, 'cods': sorted(set(cods) | set(attachment_cods) | previous_numbers),
+                         'certificate_cods': sorted(set(cods) | previous_cods),
+                         'attachment_cods': attachment_cods,
                          'references': sorted(set(refs) | set((old or {}).get('references', []))),
                          'current_cods': cods, 'warnings': warnings, 'present': True,
                          'size': len(pdf_data) if pdf_data is not None else stat.st_size,
                          'mtime_ns': stat.st_mtime_ns, 'sha256': digest,
-                         'inspection_version': INSPECTION_VERSION, 'inspection_prefix': number_prefix}
+                         'inspection_version': INSPECTION_VERSION, 'inspection_prefix': number_prefix,
+                         'inspection_certificate_pages': certificate_pages, 'inspection_issued_cod': issued_cod}
                 if old and digest is not None and old.get('sha256') == digest and old.get('managed_owner'):
                     entry['managed_owner'] = old['managed_owner']
+            if digest in owners_by_digest:
+                entry['managed_owner'] = owners_by_digest[digest]
             entries[relative.casefold()] = entry
     result = {'version': 1, 'entries': sorted(entries.values(), key=lambda entry: entry['path'].casefold())}
     if persist and result != previous and (result['entries'] or ledger_path.exists()):
@@ -243,18 +332,23 @@ def scan_inventory(root, persist=False):
     owners = {}
     for entry in result['entries']:
         if entry['present']:
+            content_id = entry.get('sha256') or f"path:{entry['path'].casefold()}"
             for cod in {identity(value) for value in entry.get('current_cods', entry['cods'])}:
-                owners.setdefault(cod, []).append(entry['path'])
+                owners.setdefault(cod, {}).setdefault(content_id, entry['path'])
     for cod, paths in owners.items():
         if len(paths) > 1:
-            result['warnings'].append(f"COD {cod} appears in multiple PDFs ({', '.join(Path(path).name for path in paths[:3])}). Verify which certificate is current before sending.")
+            result['warnings'].append(f"COD {cod} appears in different PDFs ({', '.join(Path(path).name for path in list(paths.values())[:3])}). Verify which certificate is current before sending.")
     return result
 
 
 def cod_conflicts(inventory, cod, allowed_paths=(), owned=False):
     allowed = {str(path).replace('\\', '/').casefold() for path in allowed_paths}
+    allowed_hashes = {entry.get('sha256') for entry in inventory['entries']
+                      if entry['path'].casefold() in allowed and entry.get('sha256')
+                      and all(identity(value) == identity(cod) for value in entry.get('current_cods', entry['cods']))}
     return [entry for entry in inventory['entries']
-            if any(identity(value) == identity(cod) for value in entry['cods'])
+            if any(identity(value) == identity(cod) for value in entry.get('certificate_cods', entry['cods']))
+            and entry.get('sha256') not in allowed_hashes
             and not (entry['path'].casefold() in allowed
                      and all(identity(value) == identity(cod) for value in entry.get('current_cods', entry['cods'])))]
 
@@ -274,16 +368,8 @@ def cod_recovery_message(relative_path):
 
 
 def reference_warnings(inventory, reference, allowed_paths=(), owned=False):
-    if not str(reference or '').strip():
-        return []
-    allowed = {str(path).replace('\\', '/').casefold() for path in allowed_paths}
-    found = [entry for entry in inventory['entries']
-             if any(identity(value) == identity(reference) for value in entry['references'])
-             and entry['path'].casefold() not in allowed]
-    if not found:
-        return []
-    names = ', '.join(Path(entry['path']).name for entry in found[:3])
-    return [f'Reference {reference} already appears in {names}. This may be the same inward or an already-created certificate. Review it; continuing keeps this reference unchanged.']
+    """Compatibility API: references can be reused without a notice."""
+    return []
 
 
 def issuance_paths(inventory, cod, source_kind, plant, key):
@@ -292,7 +378,8 @@ def issuance_paths(inventory, cod, source_kind, plant, key):
     return [entry['path'] for entry in inventory['entries']
             if isinstance(entry.get('managed_owner'), dict)
             and entry['managed_owner'].get('source_kind') == source_kind
-            and entry['managed_owner'].get('plant') == plant
+            and (entry['managed_owner'].get('plant') == plant
+                 or source_kind == 'manual' and entry['managed_owner'].get('plant') is None)
             and record_key(entry['managed_owner'].get('key')) == record_key(key)
             and identity(entry['managed_owner'].get('cod')) == identity(cod)]
 
@@ -307,9 +394,9 @@ def record_issuance(root, path, cod, source_kind, plant, key):
     return inventory
 
 
-def verify_publication(root, snapshot, cod, reference, allowed_paths=(), owned=False, allow_warnings=False):
+def verify_publication(root, snapshot, cod, reference=None, allowed_paths=(), owned=False, allow_warnings=False):
     """Recheck Explorer/PowerPoint changes made while the PDF was rendering."""
-    current = scan_inventory(root)
+    current = scan_inventory(root, force=True)
     unknown = unresolved_cod_entries(current)
     if unknown:
         messages = [cod_recovery_message(entry['path']) for entry in unknown[:3]]
@@ -330,14 +417,3 @@ def verify_publication(root, snapshot, cod, reference, allowed_paths=(), owned=F
                          and entry.get('size') == previous.get('size'))
             if not unchanged:
                 raise ValueError('The existing certificate changed while this PDF was being prepared. Nothing was overwritten. Refresh and review it first.')
-    def reference_owners(inventory):
-        if not str(reference or '').strip():
-            return {}
-        return {entry['path'].casefold(): (entry.get('sha256'), entry.get('size'))
-                for entry in inventory['entries']
-                if entry['path'].casefold() not in allowed
-                and any(identity(value) == identity(reference) for value in entry['references'])}
-    before = reference_owners(snapshot)
-    after = reference_owners(current)
-    if any(path not in before or signature != before[path] for path, signature in after.items()):
-        raise ValueError('Another PDF with this reference appeared while rendering. Nothing was overwritten. Refresh and confirm the duplicate-reference warning first.')

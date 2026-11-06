@@ -75,8 +75,8 @@ node --max-semi-space-size=4 --max-old-space-size=192 --test --test-reporter=dot
   certifying that every manually edited Excel structure is supported.
 - Generation still needs both numbering workbooks readable and write access
   to their files. Save and close Excel before issuance. Unreadable COD history
-  and duplicate Serial Numbers still require correction. Shared references
-  are allowed after reviewing the warning.
+  and duplicate Serial Numbers still require correction. References may be
+  reused without an alert.
 - Hidden duplicate registers and worksheet renames affecting saved optional
   settings remain documented edge cases in the audit. They were not migrated
   or repaired in this creation pass.

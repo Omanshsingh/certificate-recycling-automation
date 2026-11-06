@@ -1,4 +1,4 @@
-"""Confirm the two saved plant workbooks before enabling reminders."""
+"""Confirm connected plant files, or allow a local-certificate-only workspace."""
 from pathlib import Path
 
 from workflow_support import load_settings
@@ -8,8 +8,10 @@ def validate_daily_setup(root):
     root = Path(root)
     settings_path = root / "settings.local.json"
     if not settings_path.is_file():
-        raise ValueError("Open Prepare Certificates.bat and save both plant workbook locations first.")
+        raise ValueError("Open Prepare Certificates.bat and save Settings first.")
     paths = load_settings(root)["workbook_paths"]
+    if not any(paths):
+        return ()
     if not all(paths):
         raise ValueError("Save both plant Excel file locations in the app before enabling reminders.")
     files = tuple(Path(item).expanduser().resolve() for item in paths)
@@ -26,4 +28,4 @@ if __name__ == "__main__":
     except (OSError, ValueError, KeyError) as exc:
         print(str(exc))
         raise SystemExit(1)
-    print("Reminder setup is ready: both plant workbooks are saved.")
+    print("Reminder setup is ready for connected workbooks and local certificate requests.")
