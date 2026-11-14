@@ -45,7 +45,7 @@ def load_settings(root):
     merged = read(defaults_path)
     merged.update(read(local_path))
     allowed = {"workbook_paths", "certificate_number_prefix", "certificate_number_start",
-               "certificate_number_width", "reminder_time", "reminders_enabled", "backup_destination"}
+               "certificate_number_width", "next_cod", "reminder_time", "reminders_enabled", "backup_destination"}
     settings = {key: value for key, value in merged.items() if key in allowed}
     paths = settings.get("workbook_paths", ["", ""])
     if not isinstance(paths, list) or len(paths) > 2 or any(not isinstance(item, str) for item in paths):
@@ -57,6 +57,9 @@ def load_settings(root):
         if type(value) is not int or not low <= value <= high:
             raise ValueError(f"{key} must be a whole number from {low} to {high}.")
         settings[key] = value
+    if settings.get('next_cod') is not None and (type(settings['next_cod']) is not int
+                                               or not 1 <= settings['next_cod'] <= 999999999999):
+        raise ValueError('The next COD must be a whole number from 1 to 999999999999.')
     prefix = settings.get("certificate_number_prefix", "")
     if not isinstance(prefix, str) or any(ord(ch) < 32 for ch in prefix):
         raise ValueError("The COD prefix must be plain text.")
@@ -122,6 +125,7 @@ class Report:
         self.run_id = uuid.uuid4().hex
         self.observed_sources = []
         self.scan_complete = False
+        self.pending_recovery = ''
         self.rows = []
         self.created = 0
         self.maintenance_notes = []
@@ -196,6 +200,7 @@ class Report:
             "outcome": outcome,
             "detail": detail,
             "certificate_no": str(batch.get("cod_no", "") or ""),
+            "external_pdf": batch.get('external_pdf'),
             "hdd_cod_no": batch.get('hdd_cod_no', ''),
             "certificate_date": parse_date(batch.get("cod_date")).isoformat() if parse_date(batch.get("cod_date")) else "",
             "certificate_status": status,
@@ -217,6 +222,19 @@ class Report:
             row.update(inward_date_quality='unavailable', warnings=list(warnings or [detail]))
         self.rows.append(row)
 
+    def add_saved_inward(self, batch, outcome, detail):
+        # Saving an inward does not require the identifiers needed to issue its PDF.
+        warnings = []
+        if outcome == 'ready':
+            if batch.get('certificate_type', 'standard') == 'standard' and not batch.get('form6'):
+                warnings.append('Form 6 number is required to create the certificate.')
+            if not str(batch.get('reference') or '').strip():
+                warnings.append('Reference number is required to create the certificate.')
+        if warnings:
+            outcome = 'needs_review'
+            detail += ' Open Review & edit to finish the certificate details.'
+        self.add(batch, outcome, detail, warnings=warnings)
+
     def finish(self):
         needs_review = sum(row["outcome"] == "needs_review" for row in self.rows)
         result = {
@@ -237,6 +255,8 @@ class Report:
             result['certificate_inventory'] = self.certificate_inventory
         if hasattr(self, 'numbering'):
             result['numbering'] = self.numbering
+        if self.pending_recovery:
+            result.update(refresh_pending=True, recovery_note=self.pending_recovery)
         if hasattr(self, 'result_sink') and self.result_sink is not None:
             self.result_sink.clear()
             self.result_sink.update(result)
@@ -439,6 +459,7 @@ def open_excel_record(workbook, sheet_name, row_number, *, case_id=None, header_
         "throw 'Excel could not confirm the selected client. Try Open in Excel again.'}; "
         "[CertificateExcelFocus]::ShowWindow([IntPtr]$excel.Hwnd,9) | Out-Null; "
         "[CertificateExcelFocus]::SetForegroundWindow([IntPtr]$excel.Hwnd) | Out-Null; "
+        "if($book.ReadOnly){throw 'Excel opened this workbook read-only. Close the other copy or release the file lock, then reopen it to edit.'}; "
         "@{row=$rowNumber;last_row=$endRow;selected=$true} | ConvertTo-Json -Compress; break "
         "} catch { "
         # Excel can briefly return a null COM object while switching worksheets.

@@ -28,7 +28,8 @@ class RegisterProtectionTests(unittest.TestCase):
             root = ET.fromstring(archive.read('xl/worksheets/sheet1.xml'))
         self.assertIsNotNone(root.find('{*}sheetProtection'))
         return [(top, bottom) for _, top, _, bottom in
-                (range_boundaries(item.get('sqref')) for item in root.findall('.//{*}protectedRange'))]
+                (range_boundaries(item.get('sqref')) for item in root.findall('.//{*}protectedRange')
+                 if item.get('name').startswith('EcorecoEditable'))]
 
     def test_issuance_locks_the_inward_and_its_materials_and_app_can_keep_writing(self):
         book = load_workbook(self.path)
@@ -46,9 +47,17 @@ class RegisterProtectionTests(unittest.TestCase):
             self.assertEqual(self.editable_rows(session.data), [(4, 1048576)])
             book = load_workbook(BytesIO(session.data))
             self.assertTrue(book.active['C2'].protection.locked)
+            self.assertFalse(book.active.protection.formatRows)
             book.close()
-            self.assertEqual(protect_issued_inwards(session.data), session.data)
             batch = read_batches(BytesIO(session.data))[0]
+            with ZipFile(BytesIO(session.data)) as archive:
+                root = ET.fromstring(archive.read('xl/worksheets/sheet1.xml'))
+            editable_details = {item.get('sqref') for item in root.findall('.//{*}protectedRange')
+                                if item.get('name').startswith('EcorecoDetails')}
+            for key in ('comments', 'transporter_details', 'docket_vehicle_no', 'weight_slip_scale'):
+                column = batch['column_mapping'][key]['column']
+                self.assertIn(f'{column}2:{column}3', editable_details)
+            self.assertEqual(protect_issued_inwards(session.data), session.data)
             session.set_issued_status('1', batch['source_sheet'], batch['source_row'], '0001', 'Generated', 'Completed')
             updated, _ = stage_new_client(session, {'supplier':'New intake'})
             session._persist(updated)

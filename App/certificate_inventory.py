@@ -20,6 +20,12 @@ CERTIFICATE_FOLDERS = {
     'manual': 'Auto Generated',
     'external': 'Manually Added',
 }
+EXTERNAL_FOLDERS = {'manually added', 'externally created', 'generated externally', 'external certificates'}
+
+
+def is_external_path(path):
+    parts = str(path).replace('\\', '/').casefold().removeprefix('certificates/').split('/')
+    return len(parts) > 1 and parts[0] in EXTERNAL_FOLDERS
 
 
 def ensure_certificate_folders(root):
@@ -174,7 +180,7 @@ def _inspect_pdf(path, *, pdf_data=None, number_prefix='', certificate_pages=Non
     return sorted(cods), sorted(references), warnings, sorted(attachment_cods)
 
 
-def _issued_certificate_facts(root):
+def _issued_certificate_facts(root, *, history=None):
     """Read COD and attachment boundaries only from committed PDF receipts.
 
     Do not infer this from a filename, editable draft or PDF metadata. Older
@@ -183,7 +189,7 @@ def _issued_certificate_facts(root):
     """
     from issuance_safety import audit_records
     try:
-        records = audit_records(root)
+        records = audit_records(root) if history is None else history
     except (OSError, ValueError):
         return {}  # Without evidence, inspect every page and retain warnings.
     facts_by_digest = {}
@@ -242,11 +248,12 @@ def scan_inventory(root, persist=False, *, force=False):
         except (OSError, ValueError, TypeError, KeyError) as exc:
             raise ValueError(f'The certificate number inventory is unreadable. Restore its backup before allocating a COD: {exc}') from exc
     entries = {entry['path'].casefold(): dict(entry, present=False) for entry in previous['entries']}
-    issued = _issued_certificate_facts(root)
     from issuance_safety import audit_records
+    history = audit_records(root)
+    issued = _issued_certificate_facts(root, history=history)
     owners_by_digest = {record.get('pdf_sha256'):{'source_kind':record.get('source_kind'),
                         'plant':record.get('plant'), 'key':str(record.get('key')), 'cod':str(record.get('cod'))}
-                        for record in audit_records(root) if record.get('state') == 'complete'
+                        for record in history if record.get('state') == 'complete'
                         and record.get('pdf_sha256')}
     for entry in entries.values():
         if entry.get('sha256') in owners_by_digest:
@@ -316,6 +323,7 @@ def scan_inventory(root, persist=False, *, force=False):
                     entry['managed_owner'] = old['managed_owner']
             if digest in owners_by_digest:
                 entry['managed_owner'] = owners_by_digest[digest]
+            entry['external'] = is_external_path(relative)
             entries[relative.casefold()] = entry
     result = {'version': 1, 'entries': sorted(entries.values(), key=lambda entry: entry['path'].casefold())}
     if persist and result != previous and (result['entries'] or ledger_path.exists()):

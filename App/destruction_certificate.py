@@ -95,6 +95,8 @@ def make_certificate(batch, cod, issued_date, destination):
     from certificate_core import parse_date
     from certificate_templates import TEMPLATE_ROOT
     template = PdfReader(TEMPLATE_ROOT / 'destruction.pdf')
+    if len(template.pages) < 2:
+        raise ValueError('The Data Destruction template needs both its certificate and device receipt pages.')
     fields = batch.get('certificate_fields') or {}
     # An incomplete preview shows blanks and its validation messages, never invented dates/counts.
     try:
@@ -157,55 +159,60 @@ def make_certificate(batch, cod, issued_date, destination):
 
 def request_for_inward(root, plant, case_id, expected_revision=None, *, needed=True, confirmed=False, record_id=None):
     """Save an idempotent additional request without writing to the inward workbook."""
-    from certificate_core import read_batches
-    from certificate_drafts import read_register, save_draft, write_register, _manual_record_issued
+    from certificate_core import parse_date, read_batches
+    from certificate_drafts import (read_register, write_register, clean_details,
+                                    _manual_record_issued, _save_draft_locked)
+    from issuance_safety import recover_issuances
     from workflow_support import load_settings, run_lock
     from workspace_review import require_revision
-    if expected_revision is not None:
-        require_revision(root, expected_revision)
     if not isinstance(needed, bool):
         raise ValueError('Choose whether Data Destruction is needed.')
     if (plant not in {'plant1', 'plant2'} and not record_id) or (not record_id and not str(case_id or '').strip()):
         raise ValueError('Choose an inward client first.')
     case_id = str(case_id).strip()
-    if record_id:
-        records = read_register(root)['records']
-        record = next((entry for entry in records if entry['id'] == record_id and entry['plant'] == plant
-                       and entry.get('removed_inward')), None)
-        if not record:
-            raise ValueError('The linked local certificate was not found. Refresh and try again.')
-        source = record['details']
-        link = {'plant': plant, 'case_id': str(record['removed_inward']['case_id']), 'record_id': record_id}
-    else:
-        paths = load_settings(root)['workbook_paths']
-        path = paths[int(plant[-1]) - 1]
-        if not path or not Path(path).is_file():
-            raise ValueError('Connect this plant workbook and refresh before adding its data destruction request.')
-        matches = [batch for batch in read_batches(Path(path))
-                   if str(batch['case_id']).strip().casefold() == case_id.casefold()]
-        if len(matches) != 1:
-            raise ValueError('The inward Serial Number is missing or repeated. Correct Excel and refresh.')
-        source = matches[0]
-        link = {'plant': plant, 'case_id': str(source['case_id'])}
-    for record in read_register(root)['records']:
-        if record['details'].get('destruction_source') == link:
-            if record.get('destruction_requested', True) != needed:
-                with run_lock(root):
-                    if expected_revision is not None:
-                        require_revision(root, expected_revision)
-                    data = read_register(root)
-                    current = next(item for item in data['records'] if item['id'] == record['id'])
-                    if not needed and _manual_record_issued(root, current) and confirmed is not True:
-                        raise ValueError('An HDD certificate already exists. Confirm removing its request; its PDF and number will be kept.')
-                    current['destruction_requested'] = needed
-                    write_register(root, data)
-            return record['id']
-    if not needed:
-        return None
-    from certificate_core import parse_date
-    received = parse_date(source.get('inward_date'))
-    details = dict(source, certificate_type='destruction', certificate_fields={
-        'device_receipts': json.dumps([{'date': received.isoformat() if received else '', 'count': ''}])},
-                   destruction_source=link, cod_no='', cod_date='', reference='', items=[])
-    details.pop('certificate_weight', None)
-    return save_draft(root, plant, details, expected_revision=expected_revision)
+    with run_lock(root):
+        recover_issuances(root)
+        data = read_register(root)
+        if record_id:
+            record = next((entry for entry in data['records'] if entry['id'] == record_id
+                           and entry['plant'] == plant
+                           and entry['details'].get('certificate_type') != 'destruction'), None)
+            if not record:
+                raise ValueError('The linked local certificate was not found. Refresh and try again.')
+            source = record['details']
+            local_sn = (record.get('removed_inward') or {}).get('case_id') or source.get('case_id') or record_id
+            link = {'plant': None, 'case_id': str(local_sn), 'record_id': record_id}
+        else:
+            path = load_settings(root)['workbook_paths'][int(plant[-1]) - 1]
+            if not path or not Path(path).is_file():
+                raise ValueError('Connect this plant workbook and refresh before adding its data destruction request.')
+            path = Path(path).resolve()
+            source_bytes = path.read_bytes()
+            matches = [batch for batch in read_batches(BytesIO(source_bytes))
+                       if str(batch['case_id']).strip().casefold() == case_id.casefold()]
+            if len(matches) != 1:
+                raise ValueError('The inward Serial Number is missing or repeated. Correct Excel and refresh.')
+            source = matches[0]
+            link = {'plant': plant, 'case_id': str(source['case_id'])}
+
+        if expected_revision is not None:
+            require_revision(root, expected_revision)
+            if not record_id and path.read_bytes() != source_bytes:
+                raise ValueError('The Excel files changed while opening Data Destruction. Refresh and try again.')
+        current = next((record for record in data['records']
+                        if record['details'].get('destruction_source') == link), None)
+        if current:
+            if current.get('destruction_requested', True) != needed:
+                if not needed and _manual_record_issued(root, current) and confirmed is not True:
+                    raise ValueError('An HDD certificate already exists. Confirm removing its request; its PDF and number will be kept.')
+                current['destruction_requested'] = needed
+                write_register(root, data)
+            return current['id']
+        if not needed:
+            return None
+        received = parse_date(source.get('inward_date'))
+        details = dict(source, certificate_type='destruction', certificate_fields={
+            'device_receipts': json.dumps([{'date': received.isoformat() if received else '', 'count': ''}])},
+                       destruction_source=link, cod_no='', cod_date='', reference='', items=[])
+        details.pop('certificate_weight', None)
+        return _save_draft_locked(root, plant, clean_details(details), data)

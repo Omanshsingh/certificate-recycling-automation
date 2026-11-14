@@ -17,9 +17,11 @@ class Node {
     this.listeners = {};
   }
   append(...nodes) { for (const node of nodes) { if (node.parentElement) node.parentElement.children = node.parentElement.children.filter(child => child !== node); node.parentElement = this; this.children.push(node); } }
+  insertBefore(node, before) { node.parentElement = this; this.children.splice(this.children.indexOf(before), 0, node); }
   replaceChildren(...nodes) { this.children = nodes; }
   contains(node) { return this === node || this.children.some(child => child.contains(node)); }
   setAttribute(key, value) { this.attributes[key] = value; }
+  getAttribute(key) { return this.attributes[key] ?? null; }
   querySelectorAll() { return []; }
   addEventListener(event, fn) { (this.listeners[event] ||= []).push(fn); }
   dispatch(event, detail = {}) { for (const fn of this.listeners[event] || []) fn({target: this, currentTarget: this, ...detail}); }
@@ -111,6 +113,37 @@ test('Saved certificates filter by the same certificate types as Companies', () 
   const html=fs.readFileSync(path.join(__dirname,'../web/index.html'),'utf8');
   const options=id=>html.match(new RegExp(`<select id="${id}"[^>]*>([\\s\\S]*?)<\\/select>`))[1];
   assert.equal(options('saved-template-filter'),options('template-filter'));
+});
+
+test('Inward search narrows large lists and requires an exact plant and SN selection', () => {
+  for (const id of ['upload-inward', 'external-inward']) {
+    const h = harness();
+    const picker = vm.runInContext(id === 'upload-inward' ? 'uploadInwardPicker' : 'externalInwardPicker', h.context);
+    const input = h.controls.get(`#${id}`);
+    const list = h.controls.get(`#${id}-options`);
+    const rows = Array.from({length:350}, (_, index) => ({supplier:`Client ${index}`, plant:'plant1', sn:index}));
+    const target = {supplier:'Northstar Electronics', plant:'plant2', sn:'349'};
+    rows[349].supplier = target.supplier;
+    picker.update([...rows, target]);
+    input.dispatch('focus');
+    assert.equal(list.children.length, 12);
+    input.value = 'northstar 349 plant 2';
+    input.dispatch('input');
+    assert.equal(list.children.length, 1);
+    assert.match(text(list.children[0]), /Northstar Electronics.*Plant 2.*SN 349/);
+    assert.equal(picker.selection(), null);
+    assert.equal(input.checkValidity(), false);
+    input.dispatch('keydown', {key:'ArrowDown', preventDefault() {}});
+    assert.equal(input.getAttribute('aria-activedescendant'), list.children[0].id);
+    input.dispatch('keydown', {key:'Enter', preventDefault() {}});
+    assert.deepEqual({...picker.selection()}, {plant:'plant2', sn:'349'});
+    assert.equal(input.checkValidity(), true);
+    assert.equal(list.hidden, true);
+    input.value = 'unknown company';
+    input.dispatch('input');
+    assert.equal(picker.selection(), null);
+    assert.equal(h.controls.get(`#${id}-results`).textContent, 'No matching inwards.');
+  }
 });
 
 test('App dates display DD/MM/YY and submit the correct ISO day', () => {
@@ -283,7 +316,7 @@ test('An inline inward save failure keeps the entered fields and error in Review
   await h.ui.saveInwardDetails();await h.ui.saveExcelChoice(true);
   assert.equal(form.values.comments,'Keep my text');
   assert.equal(h.controls.get('#details-modal').open,true);
-  assert.match(text(h.controls.get('#details-error')),/Excel is busy/);
+  assert.match(text(h.controls.get('#details-error')),/Excel file is in use.*Save and close it in Excel/);
 });
 
 function removalHarness(fail = false) {
@@ -591,9 +624,13 @@ test('Refresh does not announce success for an incomplete workbook scan', async 
 });
 
 test('Locked files, future dates and ambiguous totals have specific next steps', () => {
-  const {ui}=harness();
-  assert.match(ui.simpleWarning('plant1.xlsx is unavailable: Cannot update plant1.xlsx. Save and close it in Excel, then try again. (Windows error 32)'),
-    /Excel file is in use.*Close Excel or wait a moment.*retry/);
+  const h=harness(); editing(h);
+  const {ui}=h;
+  Object.assign(ui.app.editor,{sourcePlant:'plant1',sourceSn:'1001'});
+  ui.showDetailsError('plant1.xlsx is unavailable: Cannot update plant1.xlsx. Save and close it in Excel, then try again. (Windows error 32)');
+  const error = h.controls.get('#details-error');
+  assert.match(error.textContent,/plant1\.xlsx is in use.*Save and close it in Excel.*retry/);
+  assert.equal(all(error,node=>node.tag==='button').length,0);
   assert.match(ui.simpleWarning('COD Date is in the future; check this date before creating the certificate'),
     /COD date is in the future.*later than today.*confirm this future date deliberately/);
   assert.match(ui.simpleWarning('Excel row 4: total row needs checking. It does not clearly match the materials; correct or remove the summary row before generating.'),
@@ -970,8 +1007,9 @@ test('Open Excel action passes the selected alert plant and row ID', async () =>
 test('Optional form sections and bulk action are closed by default', () => {
   const html = fs.readFileSync(path.join(__dirname,'../web/index.html'),'utf8');
   for (const match of html.matchAll(/<details\b[^>]*>/g)) assert.doesNotMatch(match[0], /\bopen\b/);
-  assert.equal((html.match(/name="certificate_weight"/g)||[]).length,1);
-  assert.equal((html.match(/name="cod_no"/g)||[]).length,1);
+  const editor = html.match(/<form id="details-form"[^>]*>[\s\S]*?<\/form>/)?.[0] || '';
+  assert.equal((editor.match(/name="certificate_weight"/g)||[]).length,1);
+  assert.equal((editor.match(/name="cod_no"/g)||[]).length,1);
   const queueHeader = html.match(/<thead><tr><th>SN<\/th><th>Company<\/th>.*?<\/thead>/s)?.[0] || '';
   assert.equal((queueHeader.match(/<th>/g)||[]).length,6);
 });
@@ -1478,7 +1516,9 @@ test('Stale workspace errors keep the edited form and recoverable draft open', a
 
 test('Success shows actual server-issued certificates and safely encoded local PDF links', () => {
   const h = harness();
-  h.ui.showGenerationSuccess({created:2,certificates:[{filename:'0082_Acme_Long_Recovery_Services_Mumbai_India_1.pdf',certificate_no:'0082',supplier:'Acme',plant:'plant1'},
+  h.ui.showGenerationSuccess({created:2,state:{recovery_note:'Close the previous PDF, then refresh to finish.',
+    setup_warning:'Data Destruction request could not be updated. Open Review & edit and choose Save request.'},
+    certificates:[{filename:'0082_Acme_Long_Recovery_Services_Mumbai_India_1.pdf',certificate_no:'0082',supplier:'Acme',plant:'plant1'},
     {filename:'CUSTOM-84_Second_Company_Pune_2.pdf',certificate_no:'CUSTOM-84',supplier:'Second',plant:'plant2',pdf_url:'/api/certificates/CUSTOM-84_Second_Company_Pune_2.pdf'}]});
   const list = h.controls.get('#created-certificates');
   assert.match(text(list),/0082.*CUSTOM-84/); assert.doesNotMatch(text(list),/Suggested COD/);
@@ -1493,8 +1533,26 @@ test('Success shows actual server-issued certificates and safely encoded local P
   const links = all(list,node => node.tag === 'a'); assert.equal(links.length,2);
   assert.equal(links[0].href,'http://127.0.0.1:8000/api/certificates/0082_Acme_Long_Recovery_Services_Mumbai_India_1.pdf');
   assert.equal(h.controls.get('#success-modal').open,true);
+  assert.match(h.controls.get('#success-description').textContent,/Close the previous PDF, then refresh to finish/);
+  assert.match(h.controls.get('#success-description').textContent,/Data Destruction request.*Save request/);
   for (const certificate of [{filename:'../secret.pdf'},{filename:'a.pdf',pdf_url:'https://example.com/api/certificates/a.pdf'},
     {filename:'a.pdf',pdf_url:'/api/preview/a.pdf'},{filename:'a.pdf',pdf_url:'/api/certificates/b.pdf'}]) assert.equal(h.ui.certificateUrl(certificate),null);
+});
+
+test('Batch results show every unfinished company and explain how to retry it', async () => {
+  const unissued = [{plant:'plant2',sn:'21',supplier:'Northstar',detail:'The certificate output folder became read-only.'}];
+  const h = harness({fetch:async () => ({ok:true,json:async () => ({created:0,unissued})})});
+  h.ui.showGenerationSuccess({created:1,certificates:[{filename:'0082_Acme.pdf',supplier:'Acme'}],unissued});
+  assert.equal(h.controls.get('#success-title').textContent,'Some certificates were not created');
+  assert.match(h.controls.get('#success-description').textContent,/1 of 2 certificates saved.*Refresh.*only the unfinished companies/);
+  assert.match(text(h.controls.get('#created-certificates')),/Acme/);
+  assert.match(text(h.controls.get('#unissued-list')),/Northstar.*Plant 2.*SN 21.*read-only/);
+  h.controls.get('#success-modal').close();
+  await h.ui.submitGeneration({selections:[{plant:'plant2',sn:'21'}]});
+  assert.equal(h.controls.get('#success-modal').open,true);
+  assert.equal(h.controls.get('#success-title').textContent,'No certificates were created');
+  assert.match(h.controls.get('#success-description').textContent,/0 of 1/);
+  assert.match(text(h.controls.get('#unissued-list')),/Northstar.*read-only/);
 });
 
 test('Open PDF and filename clicks open the local document and select it; Open folder only selects it', async () => {
@@ -1976,9 +2034,10 @@ test('Invalid hidden fields reveal their disclosure and edit screen before previ
 test('Batch selection shows exact plants and Ready count without creating anything', () => {
   for (const [plant,count,description] of [['plant1',2,'Plant 1'],['plant2',1,'Plant 2'],['all',3,'Plant 1 and Plant 2']]) {
     const h = harness();
-    h.ui.app.state.rows = [{plant:'plant1',certificate_status:'ready'}, {plant:'plant1',certificate_status:'ready',warnings:['Missing name']},
-      {plant:'plant2',certificate_status:'ready'}, {plant:'plant2',certificate_status:'blank'}, {plant:'plant1',certificate_status:'na'},
-      {plant:'plant1',certificate_status:'ready',source_kind:'manual'}];
+    h.ui.app.state.rows = [{plant:'plant1',certificate_status:'ready',outcome:'ready'}, {plant:'plant1',certificate_status:'ready',outcome:'ready',warnings:['Check weight']},
+      {plant:'plant2',certificate_status:'ready',outcome:'ready'}, {plant:'plant2',certificate_status:'blank'}, {plant:'plant1',certificate_status:'na'},
+      {plant:'plant1',certificate_status:'ready',outcome:'needs_review',warnings:['Enter the Form 6 number']},
+      {plant:'plant1',certificate_status:'ready',outcome:'ready',source_kind:'manual'}];
     h.controls.get('#plant-filter').value = plant; h.controls.get('#search').value = 'Unrelated search';
     h.controls.get('#status-filter').value = 'completed'; h.controls.get('#template-filter').value = 'siemens';
     h.ui.app.workspaceRevision = 'reviewed-batch'; h.ui.openBulkGeneration();
@@ -1990,7 +2049,7 @@ test('Batch selection shows exact plants and Ready count without creating anythi
 
 test('Batch cancellation is harmless and creation retains the reviewed plant and revision', async () => {
   const h = harness(); h.ui.wire();
-  h.ui.app.state.rows = [{plant:'plant2',sn:'7',certificate_status:'ready',certificate_no:'0300'}];
+  h.ui.app.state.rows = [{plant:'plant2',sn:'7',certificate_status:'ready',outcome:'ready',certificate_no:'0300'}];
   h.controls.get('#plant-filter').value = 'plant2'; h.ui.app.workspaceRevision = 'reviewed-batch';
   h.ui.openBulkGeneration(); h.controls.get('#bulk-generation-modal').close();
   await h.ui.startBulkGeneration(); assert.equal(h.requests.length,0);
@@ -2006,9 +2065,9 @@ function searchableBulk() {
   h.controls.get('#plant-filter').value='all';h.ui.app.workspaceRevision='bulk-review';
   h.ui.app.state.numbering={needs_start:false,next_cod:'0209'};
   h.ui.app.state.rows=[
-    {plant:'plant1',sn:'13',supplier:'Siemens Healthcare',location:'Mumbai',reference:'REF-A',certificate_status:'ready'},
-    {plant:'plant2',sn:'21',supplier:'Northstar Technologies',location:'Pune',reference:'REF-B',certificate_status:'ready'},
-    {plant:'plant1',sn:'14',supplier:'Harbour Education',location:'Mumbai',reference:'REF-C',certificate_status:'ready'},
+    {plant:'plant1',sn:'13',supplier:'Siemens Healthcare',location:'Mumbai',reference:'REF-A',certificate_status:'ready',outcome:'ready'},
+    {plant:'plant2',sn:'21',supplier:'Northstar Technologies',location:'Pune',reference:'REF-B',certificate_status:'ready',outcome:'ready'},
+    {plant:'plant1',sn:'14',supplier:'Harbour Education',location:'Mumbai',reference:'REF-C',certificate_status:'ready',outcome:'ready'},
   ];
   h.ui.openBulkGeneration();return h;
 }
@@ -2134,6 +2193,8 @@ test('First issuance opens a preview with one edit control; PDF corrections leav
     if (kind === 'new') assert.equal(form.values.inward_date,'','A new certificate must not assume today was the receipt date.');
     assert.equal(h.controls.get('#editor-fields').hidden,false);
     assert.equal(h.controls.get('#excel-detail-fields').hidden,kind === 'existing');
+    assert.equal(h.context.previews.length,0,'The editor opens before starting its preview.');
+    if (kind === 'existing') await h.timers.get(h.ui.app.previewTimer).fn();
     assert.equal(h.context.previews.length,kind === 'existing' ? 1 : 0);
     assert.equal(h.requests.length,0);
     if (kind === 'existing') {
@@ -2245,6 +2306,7 @@ test('An explicit Edit details action starts an existing record in the form', as
   assert.equal(h.controls.get('#editor-fields').hidden,false);
   assert.equal(h.controls.get('#editor-summary').hidden,true);
   assert.match(h.controls.get('#details-title').textContent,/Review & edit: Northstar/);
+  await h.timers.get(h.ui.app.previewTimer).fn();
   assert.equal(h.context.previews.length,1,'The read-only preview remains available in the editor.');
   assert.equal(h.requests.length,0,'Opening edit mode never creates a PDF or saves Excel changes.');
 });
@@ -2339,7 +2401,7 @@ test('Status selection preserves search, plant and certificate type', () => {
 
 test('A delayed close event cannot erase a newly reopened batch selection', () => {
   const h = harness(); h.ui.wire();
-  h.ui.app.state.rows = [{plant:'plant2',sn:'7',certificate_status:'ready',certificate_no:'0300'}];
+  h.ui.app.state.rows = [{plant:'plant2',sn:'7',certificate_status:'ready',outcome:'ready',certificate_no:'0300'}];
   h.controls.get('#plant-filter').value = 'plant2'; h.ui.openBulkGeneration();
   const selection = h.ui.app.bulkSelection;
   h.controls.get('#bulk-generation-modal').dispatch('close');
@@ -2550,7 +2612,7 @@ test('Automatic preview cannot overlap another preview or hide warnings when an 
 
 test('Day-25 reminder appears as an alert without changing status or approving Blank/N/A for creation', () => {
   const h = harness(); h.controls.get('#status-filter').value = 'needs_attention';
-  const row = {plant:'plant2',certificate_status:'ready',reminder_due:true,age_days:25};
+  const row = {plant:'plant2',certificate_status:'ready',outcome:'ready',reminder_due:true,age_days:25};
   assert.equal(h.ui.matches(row),true); assert.equal(h.ui.stateLabel(row),'Ready');
   assert.match(text(h.ui.makeStatus(row)),/No certificate yet\. Received 25 days ago/);
   h.ui.app.state.rows = [row,{plant:'plant2',certificate_status:'blank',reminder_due:true},{plant:'plant2',certificate_status:'na'}];
@@ -3471,14 +3533,17 @@ test('Add client saves every material once and shows the new Excel entry in the 
   assert.equal(h.requests[0].payload.details.docket_vehicle_no,'D-123');
   assert.equal(h.requests[0].payload.details.weight_slip_scale,'18.5');
   assert.equal(Object.hasOwn(h.requests[0].payload.details,'certificate_type'),false);
-  resolveSave({ok:true,json:async () => ({client_added:true,client:{sn:'1002',plant:'plant1',supplier:'New company',status:'ready'},state:{rows:[],scan_complete:true},workspace_revision:'revision-2'})});
+  resolveSave({ok:true,json:async () => ({client_added:true,client:{sn:'1002',plant:'plant1',supplier:'New company',status:'ready'},
+    state:{rows:[{sn:'1002',plant:'plant1',supplier:'New company',certificate_status:'ready',outcome:'needs_review',
+      warnings:['Reference number is required to create the certificate.']}],scan_complete:true},workspace_revision:'revision-2'})});
   await pending;
   assert.equal(h.controls.get('#add-client-modal').open,false);
+  assert.match(h.controls.get('#toast-message').textContent,/Open Review & edit to finish the certificate details/);
   assert.equal(h.controls.get('#search').value,'1002');
   assert.equal(h.controls.get('#status-filter').value,'all');
   assert.equal(h.ui.app.workspaceRevision,'revision-2');
   assert.equal(h.ui.app.clientRequestId,null);
-  assert.match(h.controls.get('#toast-message').textContent,/Ready to create/);
+  assert.doesNotMatch(h.controls.get('#toast-message').textContent,/Ready to create/);
 });
 
 test('Failed Add client retains the form and stable request ID for a safe retry', async () => {
@@ -3692,10 +3757,11 @@ test('HDD can open before Recycling is issued or the HDD checkbox is selected', 
   assert.equal(h.ui.app.detailsBusy,false);assert.equal(h.ui.app.switchingCertificate,false);
 });
 
-test('A failed HDD request reopens the original certificate and shows the error', async () => {
+test('A failed HDD request keeps the original editor open and shows the error', async () => {
   const h=harness({fetch:async()=>({ok:false,status:409,json:async()=>({error:'Excel has changed.'})})});linkedEditor(h,[linkedBase]);
   h.ui.switchLinkedCertificate('destruction');await settleSwitch();
-  assert.equal(h.context.opened[0],linkedBase);assert.match(h.controls.get('#details-error').textContent,/Excel has changed/);
+  assert.equal(h.context.opened.length,0);assert.equal(h.controls.get('#details-modal').open,true);
+  assert.match(h.controls.get('#details-error').textContent,/Excel has changed/);
   assert.equal(h.controls.get('#details-error').hidden,false);assert.equal(h.ui.app.detailsBusy,false);
 });
 

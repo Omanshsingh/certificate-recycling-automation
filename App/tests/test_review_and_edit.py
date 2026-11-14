@@ -125,6 +125,10 @@ class ReviewAndEditTests(unittest.TestCase):
         self.assertTrue(result['saved'])
         self.assertEqual(result['created'], 0)
         self.assertEqual(self.source()['supplier'], 'Saved inward name')
+        row = web_app.target_row(result['state'], ('plant1', '1001'))
+        self.assertEqual(row['outcome'], 'needs_review')
+        self.assertIn('Form 6 number is required to create the certificate.', row['warnings'])
+        self.assertIn('Reference number is required to create the certificate.', row['warnings'])
         self.assertFalse(self.source()['cod_no'])
         self.assertFalse(list((self.root / 'Certificates').rglob('*.pdf')))
         self.assertIsNone(latest_issuance(self.root, 'workbook', 'plant1', '1001'))
@@ -151,6 +155,203 @@ class ReviewAndEditTests(unittest.TestCase):
         self.assertEqual(self.source()['issued'], 'Alert')
         self.assertEqual(self.source()['cod_no'], '')
         self.assertFalse(list((self.root / 'Certificates').rglob('*.pdf')))
+
+    def test_save_company_name_keeps_na_status_and_blocks_issuance(self):
+        from openpyxl import load_workbook
+
+        book = load_workbook(self.paths[0])
+        book.active['M2'] = 'N/A'
+        book.save(self.paths[0])
+        book.close()
+        self.assertEqual(self.source()['issued'], 'N/A')
+        payload = self.reviewed(supplier='Renamed N/A client', form6='', reference='')
+        payload['confirmed_excel'] = True
+        result = web_app.save_inward_changes(payload)
+        self.assertEqual(result['created'], 0)
+        self.assertEqual(self.source()['supplier'], 'Renamed N/A client')
+        self.assertEqual(self.source()['issued'], 'N/A')
+        self.assertEqual(web_app.target_row(result['state'], ('plant1', '1001'))['certificate_status'], 'na')
+        payload['expected_revision'] = workspace_revision(self.root)
+        with self.assertRaisesRegex(ValueError, 'marked N/A'):
+            web_app.preview_certificate(payload)
+
+    def test_mark_na_and_undo_restore_status_from_inward_details(self):
+        for complete, expected in ((True, 'Ready'), (False, 'Alert')):
+            with self.subTest(complete=complete):
+                if not complete:
+                    from openpyxl import load_workbook
+                    with self.paths[0].open('rb') as stream:
+                        book = load_workbook(stream)
+                    book.active['B2'] = None
+                    book.save(self.paths[0])
+                    book.close()
+                def change(action):
+                    return web_app.update_inward_status({
+                        'plant': 'plant1', 'sn': '1001', 'action': action,
+                        'expected_revision': workspace_revision(self.root)})
+                self.assertEqual(change('mark_na')['status'], 'N/A')
+                self.assertEqual(self.source()['issued'], 'N/A')
+                self.assertEqual(change('undo_na')['status'], expected)
+                self.assertEqual(self.source()['issued'], expected)
+                self.assertFalse(self.source()['cod_no'])
+        self.assertFalse(list((self.root / 'Certificates').rglob('*.pdf')))
+
+    def test_external_pdf_links_writes_tracking_and_keeps_pdf_bytes(self):
+        from datetime import date
+        from issuance_safety import file_digest
+        from run_certificates import find_certificate
+        from tests.test_certificate_inventory import external_pdf
+
+        folder = self.root / 'Certificates'
+        relative = 'Externally Created/Supplier Certificate.pdf'
+        path = external_pdf(folder / relative, cod='0419')
+        original = path.read_bytes()
+        result = web_app.link_external_certificate({
+            'plant':'plant1', 'sn':'1001', 'relative_path':relative, 'sha256':file_digest(path),
+            'certificate_date':'2026-10-14', 'expected_revision':workspace_revision(self.root),
+        })
+        self.assertTrue(result['saved'])
+        source = self.source()
+        self.assertEqual((source['issued'], source['cod_no'], source['cod_date']),
+                         ('Generated Externally', '0419', date(2026, 10, 14)))
+        self.assertEqual(find_certificate(folder, dict(source, source_id='plant1')), path)
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(list(folder.rglob('*.pdf')), [path])
+
+    def test_app_only_na_blocks_issuance_and_undo_restores_local_status(self):
+        from certificate_drafts import generate_draft, save_draft
+
+        details = dict(self.reviewed()['details'], case_id='LOCAL', form6='LOCAL-FORM6', reference='LOCAL-REF')
+        record_id = save_draft(self.root, None, details)
+        def change(action):
+            return web_app.update_inward_status({'record_id':record_id, 'action':action,
+                'expected_revision':workspace_revision(self.root)})
+        self.assertEqual(change('mark_na')['status'], 'N/A')
+        with self.assertRaisesRegex(ValueError, 'Undo N/A'):
+            generate_draft(self.root, record_id=record_id)
+        self.assertEqual(change('undo_na')['status'], 'Ready')
+        self.assertEqual(read_register(self.root)['records'][0]['status'], 'ready')
+
+    def test_uploaded_pdf_attaches_to_excel_or_creates_an_app_only_record(self):
+        from external_certificate_upload import save_upload, stage_upload
+        from tests.test_certificate_inventory import external_pdf
+        from run_certificates import find_certificate
+        from certificate_drafts import current_record_pdf
+
+        source_file = self.root / 'operator.pdf'
+        other_before = self.paths[1].read_bytes()
+        for cod, inward in (('0421', {'plant':'plant1', 'sn':'1001'}), ('0422', None)):
+            original = external_pdf(source_file, cod=cod).read_bytes()
+            stage = stage_upload(self.root, original)
+            self.assertEqual(stage['cod'], cod)
+            result = save_upload(self.root, web_app.BACKUP_DIR, {
+                'token':stage['token'], 'inward':inward, 'expected_revision':workspace_revision(self.root),
+                'details':{'supplier':'Independent client', 'certificate_type':'standard',
+                           'cod_no':cod, 'cod_date':'2026-10-14', 'location':'Pune', 'reference':'EXT-REF'},
+            })
+            saved = self.root / 'Certificates' / result['relative_path']
+            self.assertEqual(saved.read_bytes(), original)
+            self.assertTrue(result['relative_path'].startswith('Manually Added/'))
+            if inward:
+                batch = self.source()
+                self.assertEqual((batch['cod_no'], batch['issued']), (cod, 'Generated Externally'))
+                self.assertEqual(find_certificate(self.root / 'Certificates', dict(batch, source_id='plant1')), saved)
+                linked_before = self.paths[0].read_bytes()
+            else:
+                record = read_register(self.root)['records'][0]
+                self.assertEqual(record['details']['supplier'], 'Independent client')
+                self.assertEqual(record['status'], 'generated_manual')
+                self.assertEqual(current_record_pdf(self.root, record), saved)
+                self.assertEqual(self.paths[0].read_bytes(), linked_before)
+        self.assertEqual(self.paths[1].read_bytes(), other_before)
+
+    def test_uploaded_hdd_preserves_the_existing_recycling_certificate(self):
+        from external_certificate_upload import save_upload, stage_upload
+        from tests.test_certificate_inventory import external_pdf
+        from certificate_drafts import current_record_pdf
+
+        self.assertEqual(self.create(self.reviewed())['created'], 1)
+        original = self.source()
+        payload = external_pdf(self.root/'operator.pdf', cod='0423').read_bytes()
+        staged = stage_upload(self.root, payload)
+        result = save_upload(self.root, web_app.BACKUP_DIR, {
+            'token':staged['token'], 'inward':{'plant':'plant1','sn':'1001'},
+            'expected_revision':workspace_revision(self.root),
+            'details':{'certificate_type':'destruction', 'cod_no':'0423', 'cod_date':'2026-10-14'},
+        })
+        saved = self.source()
+        self.assertEqual((saved['cod_no'], saved['issued'], saved['certificate_type']),
+                         (original['cod_no'], original['issued'], original['certificate_type']))
+        self.assertEqual(saved['hdd_cod_no'], '0423')
+        self.assertEqual(current_record_pdf(self.root, read_register(self.root)['records'][0]).read_bytes(), payload)
+        self.assertTrue(result['saved'])
+
+    def test_external_upload_rejects_wrong_cod_and_rolls_back_failed_excel_save(self):
+        from external_certificate_upload import save_upload, stage_upload
+        from tests.test_certificate_inventory import external_pdf
+
+        staged = stage_upload(self.root, external_pdf(self.root/'operator.pdf', cod='0424').read_bytes())
+        body = {'token':staged['token'], 'inward':{'plant':'plant1','sn':'1001'},
+                'expected_revision':workspace_revision(self.root),
+                'details':{'certificate_type':'standard', 'cod_no':'0425', 'cod_date':'2026-10-14'}}
+        before = self.paths[0].read_bytes()
+        with self.assertRaisesRegex(ValueError, 'match the number printed'):
+            save_upload(self.root, web_app.BACKUP_DIR, body)
+        body['details']['cod_no'] = '0424'
+        with patch.object(web_app.WorkbookSession, '_persist', side_effect=OSError('Excel is busy')):
+            with self.assertRaisesRegex(OSError, 'Excel is busy'):
+                save_upload(self.root, web_app.BACKUP_DIR, body)
+        self.assertEqual(self.paths[0].read_bytes(), before)
+        self.assertFalse(list((self.root/'Certificates').rglob('*.pdf')))
+
+    def test_upload_without_readable_cod_uses_numbering_and_preserves_original_pdf(self):
+        from external_certificate_upload import save_upload, stage_upload
+        from tests.test_certificate_inventory import external_pdf
+        from workflow_support import load_settings, save_json
+
+        save_json(self.root/'settings.local.json', dict(load_settings(self.root), next_cod=451))
+        payload = external_pdf(self.root/'operator.pdf').read_bytes()
+        staged = stage_upload(self.root, payload)
+        self.assertEqual(staged['cod'], '')
+        self.assertFalse(list((self.root/'Certificates').rglob('*.pdf')))
+        body = {'token':staged['token'], 'inward':{'plant':'plant1','sn':'1001'},
+                'expected_revision':workspace_revision(self.root), 'automatic_cod':True,
+                'details':{'certificate_type':'standard', 'cod_no':'0450', 'cod_date':'2026-10-14'}}
+        before = self.paths[0].read_bytes()
+        with self.assertRaisesRegex(ValueError, 'suggested COD is now 0451'):
+            save_upload(self.root, web_app.BACKUP_DIR, body)
+        self.assertEqual(self.paths[0].read_bytes(), before)
+        body['details']['cod_no'] = '0451'
+        result = save_upload(self.root, web_app.BACKUP_DIR, body)
+        self.assertEqual(self.source()['cod_no'], '0451')
+        self.assertEqual((self.root/'Certificates'/result['relative_path']).read_bytes(), payload)
+
+        payload = external_pdf(self.root/'another.pdf', reference='Another certificate').read_bytes()
+        body.update(token=stage_upload(self.root, payload)['token'], inward=None,
+                    expected_revision=workspace_revision(self.root))
+        body['details'].update(supplier='App-only client', cod_no='')
+        result = save_upload(self.root, web_app.BACKUP_DIR, body)
+        self.assertEqual(result['certificate_no'], '0452')
+        self.assertEqual((self.root/'Certificates'/result['relative_path']).read_bytes(), payload)
+
+    def test_upload_without_readable_cod_uses_existing_inward_cod(self):
+        from external_certificate_upload import save_upload, stage_upload
+        from openpyxl import load_workbook
+        from tests.test_certificate_inventory import external_pdf
+
+        book = load_workbook(self.paths[0])
+        book.active['K2'] = '0426'
+        book.active['M2'] = 'Generated Externally'
+        book.save(self.paths[0])
+        book.close()
+        payload = external_pdf(self.root/'operator.pdf').read_bytes()
+        result = save_upload(self.root, web_app.BACKUP_DIR, {
+            'token':stage_upload(self.root, payload)['token'], 'inward':{'plant':'plant1','sn':'1001'},
+            'expected_revision':workspace_revision(self.root),
+            'details':{'certificate_type':'standard', 'cod_date':'2026-10-14'},
+        })
+        self.assertEqual(result['certificate_no'], '0426')
+        self.assertEqual(self.source()['cod_no'], '0426')
 
     def test_checking_hdd_marks_one_pending_task_and_does_not_create_its_pdf_or_cod(self):
         payload = self.reviewed()

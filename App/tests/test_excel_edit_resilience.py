@@ -132,6 +132,100 @@ class ExcelEditResilienceTests(unittest.TestCase):
         self.assertEqual(self.paths[0].read_bytes(), before)
         self.assertFalse(list((self.root / 'Certificates').rglob('*.pdf')))
 
+    @unittest.skipUnless(os.name == 'nt', 'Windows file sharing behavior')
+    def test_failed_issuance_names_locked_workbook_and_refresh_recovers_after_close(self):
+        def open_without_wait(path, backup_dir, **_):
+            return WorkbookSession(path, backup_dir, lock_timeout=0)
+
+        with patch.object(web_app, 'WORKBOOK_CHECK_STAMPS', {}), \
+                patch.object(runner, 'WorkbookSession', side_effect=open_without_wait):
+            self.assertTrue(web_app.refresh()['scan_complete'])
+            before = self.paths[0].read_bytes()
+            stamp = web_app.workbook_check_stamp(self.paths)
+            details = web_app.editor_details(read_batches(self.paths[0])[0])
+            body = {'plant': 'plant1', 'source_kind': 'workbook', 'source_sn': '1001',
+                    'source_plant': 'plant1', 'details': details, 'expected_revision': workspace_revision(self.root)}
+            with saved_workbook_open_for_reading(self.paths[0]):
+                with self.assertRaisesRegex(ValueError, r'Plant 1\.xlsx is unavailable: .* in use'):
+                    web_app.create_certificate(body)
+                with self.assertRaisesRegex(ValueError, r'Plant 1\.xlsx is unavailable: .* in use'):
+                    web_app.generate(selected=('plant1', '1001'), expected_revision=body['expected_revision'])
+            self.assertEqual(self.paths[0].read_bytes(), before)
+            self.assertEqual(web_app.workbook_check_stamp(self.paths), stamp)
+            self.assertFalse(list((self.root / 'Certificates').rglob('*.pdf')))
+            self.assertFalse(web_app.latest_result()['scan_complete'])
+
+            background = web_app.check_workbook_changes()
+            self.assertTrue(background['changed'])
+            self.assertTrue(background['state']['scan_complete'])
+            self.assertFalse(web_app.check_workbook_changes()['changed'])
+            body['expected_revision'] = workspace_revision(self.root)
+            self.assertEqual(web_app.create_certificate(body)['created'], 1)
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows preserves the workbook timestamp on rename')
+    def test_refresh_recovers_when_missing_workbook_returns_to_the_same_path(self):
+        workbook = self.paths[1]
+        moved = workbook.with_suffix('.moved')
+        with patch.object(web_app, 'WORKBOOK_CHECK_STAMPS', {}):
+            self.assertTrue(web_app.refresh()['scan_complete'])
+            stamp = web_app.workbook_check_stamp(self.paths)
+            workbook.rename(moved)
+            try:
+                self.assertFalse(web_app.refresh()['scan_complete'])
+            finally:
+                moved.rename(workbook)
+            self.assertEqual(web_app.workbook_check_stamp(self.paths), stamp)
+            recovered = web_app.refresh()
+            self.assertTrue(recovered['scan_complete'])
+            self.assertFalse(recovered.get('already_up_to_date'))
+            self.assertTrue(web_app.refresh()['already_up_to_date'])
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows file sharing behavior')
+    def test_locked_pdf_reissue_keeps_original_and_can_retry_after_closing_viewer(self):
+        web_app.refresh()
+        details = web_app.editor_details(read_batches(self.paths[0])[0])
+        body = {'plant': 'plant1', 'source_kind': 'workbook', 'source_sn': '1001',
+                'source_plant': 'plant1', 'details': details}
+        self.assertEqual(web_app.create_certificate(body)['created'], 1)
+        pdf, = (self.root / 'Certificates').rglob('*.pdf')
+        before = {path: path.read_bytes() for path in (pdf, *self.paths)}
+        details = web_app.editor_details(read_batches(self.paths[0])[0])
+        correction = {**body, 'details': {**details, 'reference': 'CORRECTED-REFERENCE'}}
+        with saved_workbook_open_for_reading(pdf):
+            with self.assertRaisesRegex(ValueError, r'Could not replace .*\.pdf\. Close the PDF .* then try again'):
+                web_app.create_certificate(correction)
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
+        self.assertEqual(list((self.root / 'Certificates').rglob('*.pdf')), [pdf])
+        self.assertEqual(web_app.create_certificate(correction)['created'], 1)
+        self.assertNotEqual(pdf.read_bytes(), before[pdf])
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows file sharing behavior')
+    def test_refresh_archives_old_named_pdf_after_viewer_releases_it(self):
+        with patch.object(web_app, 'WORKBOOK_CHECK_STAMPS', {}):
+            web_app.refresh()
+            details = web_app.editor_details(read_batches(self.paths[0])[0])
+            body = {'plant': 'plant1', 'source_kind': 'workbook', 'source_sn': '1001',
+                    'source_plant': 'plant1', 'details': details}
+            self.assertEqual(web_app.create_certificate(body)['created'], 1)
+            old_pdf, = (self.root / 'Certificates').rglob('*.pdf')
+            checked = web_app.refresh()
+            revision = workspace_revision(self.root)
+            details = web_app.editor_details(read_batches(self.paths[0])[0])
+            correction = {**body, 'expected_revision': revision,
+                          'details': {**details, 'supplier': 'Corrected PDF name'}}
+            with saved_workbook_open_for_reading(old_pdf), \
+                    patch.object(web_app, 'WORKSPACE_STATE_CACHE', (revision, checked)):
+                result = web_app.create_certificate(correction)
+                self.assertEqual(result['created'], 1)
+                self.assertTrue(result['state']['refresh_pending'])
+                self.assertIn('Close the PDF', result['state']['recovery_note'])
+                self.assertTrue(old_pdf.exists())
+            self.assertTrue(web_app.refresh()['scan_complete'])
+            self.assertFalse(old_pdf.exists())
+            current_pdf, = (self.root / 'Certificates').rglob('*.pdf')
+            self.assertIn('Corrected PDF name', current_pdf.name)
+            self.assertTrue(list((self.root / 'Data' / 'Archive').rglob(old_pdf.name)))
+
     def test_duplicate_serials_cannot_be_confirmed_into_a_certificate_or_source_write(self):
         make_workbook(self.paths[0], [{'sn': 'ABC', 'status': 'Generated', 'cod': '0001'},
                                     {'sn': 'abc', 'status': 'Ready'}])

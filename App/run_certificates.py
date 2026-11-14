@@ -36,7 +36,8 @@ from certificate_inventory import (scan_inventory, cod_conflicts, verify_publica
                                    issuance_paths, record_issuance, certificate_destination,
                                    unresolved_cod_entries, cod_recovery_message)
 from issuance_safety import (IssuanceTransaction, recover_issuances, latest_issuance,
-                             valid_pdf, file_digest, audit_records, workbook_receipt_conflict)
+                             audit_records, workbook_receipt_conflict,
+                             LOOKUP_RECEIPT, current_pdf_is_healthy)
 
 
 def _safe_cod_name(value: str) -> str:
@@ -165,8 +166,9 @@ def _read_sources(paths, sessions, report):
 def _highest_sequence(batches, settings, output_folder, legacy_history=None, inventory=None):
     highest = max(0, int(settings.get("certificate_number_start", 1)) - 1)
     for batch in batches:
-        if batch.get("cod_no"):
-            highest = max(highest, certificate_sequence(batch["cod_no"], settings))
+        for key in ('cod_no', 'hdd_cod_no'):
+            if batch.get(key):
+                highest = max(highest, certificate_sequence(batch[key], settings))
     # Existing flat output PDFs are the durable numbering floor if an old
     # workbook row is archived or its COD cell is cleared by the user.
     output_folder = Path(output_folder).resolve()
@@ -256,10 +258,15 @@ def numbering_plan(batches, settings, output_folder, *, inventory=None, starting
     highest = _highest_sequence(batches, dict(settings, certificate_number_start=1), folder,
                                 folder.parent / 'Data' / 'certificate-history.sqlite', inventory=inventory)
     start = starting_cod_sequence(starting_cod) if starting_cod is not None else None
+    configured = settings.get('next_cod')
     if start is not None and highest:
         raise ValueError('Existing CODs were found. Refresh to continue numbering automatically.')
-    sequence = start if start is not None else max(int(settings.get('certificate_number_start', 1)), highest + 1)
-    return {'needs_start': highest == 0, 'next_cod': certificate_number(sequence, settings),
+    if start is not None and configured is not None:
+        raise ValueError('The next COD is set in Settings. Refresh to use that sequence.')
+    minimum = max(int(settings.get('certificate_number_start', 1)), highest + 1)
+    sequence = start if start is not None else max(configured or 1, minimum)
+    return {'needs_start': not highest and configured is None, 'next_cod': certificate_number(sequence, settings),
+            'minimum_sequence': minimum,
             'prefix': settings.get('certificate_number_prefix', ''),
             'width': int(settings.get('certificate_number_width', 4)), 'sequence': sequence}
 
@@ -304,7 +311,7 @@ def _apply_overrides(batch, overrides):
     return view
 
 
-def find_certificate(output_folder, batch):
+def find_certificate(output_folder, batch, *, inventory=None, receipt=LOOKUP_RECEIPT):
     """Match stable COD + plant, even if the company/city was renamed in Excel."""
     folder = Path(output_folder)
     cod = str(batch.get("cod_no") or "").strip()
@@ -315,12 +322,24 @@ def find_certificate(output_folder, batch):
     except ValueError:
         return None
     plant = str(batch.get("source_id") or "")[-1:]
-    receipt = latest_issuance(folder.parent, 'workbook', batch.get('source_id'), batch.get('case_id'))
+    if receipt is LOOKUP_RECEIPT:
+        receipt = latest_issuance(folder.parent, 'workbook', batch.get('source_id'), batch.get('case_id'))
     if receipt and cod_identity(receipt.get('cod')) == cod_identity(cod):
         from certificate_inventory import safe_certificate_path
         relative = receipt['pdf_path'].removeprefix('Certificates/')
         current = safe_certificate_path(folder.parent, relative, expected_sha=receipt.get('pdf_sha256'))
-        return current if valid_pdf(current) and file_digest(current) == receipt['pdf_sha256'] else None
+        return current if current_pdf_is_healthy(current, receipt['pdf_sha256']) else None
+    if batch.get('external_pdf'):
+        from certificate_inventory import safe_certificate_path
+        link = batch['external_pdf']
+        try:
+            current = safe_certificate_path(folder.parent, link['path'])
+            if current_pdf_is_healthy(current, link['sha256']):
+                return current
+        except (KeyError, TypeError, ValueError, OSError):
+            pass
+        return None
+    from certificate_inventory import is_external_path, safe_certificate_path
     expected_name = certificate_filename(batch, cod=cod).casefold()
     valid_matches = []
     for path in folder.rglob("*"):
@@ -338,11 +357,24 @@ def find_certificate(output_folder, batch):
         candidate = candidate or path.stem.casefold() in {safe.casefold(), f"cod_{safe}".casefold(), f"certificate_{safe}".casefold()}
         candidate = candidate or (safe.isdecimal() and path.stem.isdecimal()
                                   and cod_identity(safe) == cod_identity(path.stem))
-        if candidate and valid_pdf(path):
+        if candidate and current_pdf_is_healthy(path):
             valid_matches.append(path)
     # A unique filename/COD match is safe to reuse. Duplicate PDFs with the
     # same COD need their issuance receipt to identify the owning inward.
-    return valid_matches[0] if len(valid_matches) == 1 else None
+    if valid_matches:
+        return valid_matches[0] if len(valid_matches) == 1 else None
+    if status_value(batch.get('issued')) not in {'generated_manual', 'completed'}:
+        return None
+    inventory = inventory if inventory is not None else scan_inventory(folder.parent)
+    matches = [entry for entry in inventory['entries']
+               if entry.get('present') and not entry.get('managed_owner') and not entry.get('warnings')
+               and is_external_path(entry['path'])
+               and {cod_identity(value) for value in entry.get('current_cods', [])} == {cod_identity(cod)}]
+    if len(matches) == 1:
+        current = safe_certificate_path(folder.parent, matches[0]['path'].removeprefix('Certificates/'))
+        if current_pdf_is_healthy(current):
+            return current
+    return None
 
 
 def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
@@ -476,7 +508,8 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
                                issue_code="source_unavailable", system_alert=True)
                     for batch in batches:
                         batch['_issuance_blocked'] = True
-                        existing = find_certificate(output_folder, batch)
+                        receipt = history.get((batch['source_id'], batch['case_id'].strip().casefold()))
+                        existing = find_certificate(output_folder, batch, inventory=inventory, receipt=receipt)
                         if existing:
                             batch.update(pdf_filename=existing.name, pdf_relative_path=existing.relative_to(output_folder).as_posix())
                         report.add(batch, 'source_check_incomplete',
@@ -591,14 +624,14 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
                     if state == "unknown":
                         report.add(batch, "needs_review", f"Unknown Certificate Issued value {batch.get('issued')!r}; review it, then choose Ready, Alert or N/A, or clear the cell.")
                         continue
+                    receipt = history.get((batch['source_id'], batch['case_id'].strip().casefold()))
                     if state == 'ready':
-                        receipt = history.get((batch['source_id'], batch['case_id'].strip().casefold()))
                         previously_issued = batch.get('pdf_recovery_pending') or (
                             receipt and cod_identity(receipt.get('cod')) == cod_identity(batch.get('cod_no')))
-                        if previously_issued and not find_certificate(output_folder, batch):
+                        if previously_issued and not find_certificate(output_folder, batch, inventory=inventory, receipt=receipt):
                             batch['_missing_pdf'] = True
                     if state in {"generated", "generated_manual", "completed"}:
-                        existing_pdf = find_certificate(output_folder, batch)
+                        existing_pdf = find_certificate(output_folder, batch, inventory=inventory, receipt=receipt)
                         if existing_pdf:
                             if state == "completed":
                                 report.add(batch, "completed", f"COD {batch.get('cod_no')} is marked Completed.")
@@ -606,6 +639,12 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
                                 report.add(batch, "generated_manual", f"COD {batch.get('cod_no')} has a manually generated PDF. Send it using your normal process, then mark Completed.")
                             else:
                                 report.add(batch, "generated", f"COD {batch.get('cod_no')} has a generated PDF. Send it using your normal process, then mark Completed.")
+                            continue
+                        if state == 'generated_manual' or batch.get('external_pdf'):
+                            detail = ('The external PDF could not be matched. Open Saved certificates and link the correct PDF.'
+                                      if state == 'generated_manual' else
+                                      'The externally created PDF linked to this completed inward is missing or has changed.')
+                            report.add(batch, 'needs_review', detail, system_alert=True)
                             continue
                         try:
                             if not (batch.get('_workbook_read_only') or read_only_preflight):
@@ -651,7 +690,6 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
                     source_batch = batch
                     remembered_choice = False
                     if details is None:
-                        receipt = latest_issuance(root, 'workbook', batch['source_id'], batch['case_id'])
                         previous = (receipt or {}).get('after', {})
                         if isinstance(previous, dict) and previous.get('edit_scope') == 'certificate_only':
                             # A type chosen on the first preview is retained locally, not in Excel.
@@ -758,7 +796,6 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
                         temporary = root / "Data" / "Previews" / f".{safe_cod}.{uuid.uuid4().hex}.tmp.pdf"
                         transaction = None
                         workbook_committed = False
-                        history_pending = False
                         session = sessions[int(batch["source_id"][-1]) - 1]
                         try:
                             make_certificate(batch, cod, issued_date, active_template, temporary,
@@ -820,7 +857,7 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
                                 transaction.mark_source_committed()
                                 transaction.complete()
                             except (OSError, ValueError) as recovery_error:
-                                history_pending = True
+                                report.pending_recovery = operation_error_message(recovery_error)
                                 issues.append(f'Certificate and Excel saved; final history update needs recovery on refresh: {recovery_error}')
                         except Exception as exc:
                             if transaction and not workbook_committed:
@@ -854,7 +891,7 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
                             detail += f" Workbook backup: {backup.name}."
                         report.add(batch, "generated_now", detail,
                                    system_alert=bool(issues), warnings=list(dict.fromkeys(issues)))
-                        if history_pending:
+                        if report.pending_recovery:
                             # Do not commit another row to this source until the
                             # pending transaction's exact source hash is recovered.
                             break
@@ -864,7 +901,12 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
                         # needs this refreshed reservation. The final scan
                         # below records it once after the operation.
                         if not (selected or (selected_keys is not None and len(selected_keys) == 1)):
-                            inventory = scan_inventory(root, persist=True)
+                            try:
+                                inventory = scan_inventory(root, persist=True)
+                            except Exception as exc:
+                                report.pending_recovery = ('The certificate list could not be updated after saving. '
+                                                           f'Refresh before retrying the rest of the batch. {operation_error_message(exc)}')
+                                break
                         if not row_cod:
                             next_sequence += 1
                         else:

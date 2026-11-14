@@ -726,7 +726,7 @@ class ReminderAndExcelTests(AutomationTestBase):
                              ["Generated", "Completed", "Ready", "Ready", "Generated Externally", "Ready", "N/A"])
             status_letter = get_column_letter(status_column)
             validation = next(item for item in sheet.data_validations.dataValidation if f"{status_letter}2:{status_letter}10000" in str(item.sqref))
-            self.assertIn("Generated Externally", validation.formula1)
+            self.assertNotIn("Generated Externally", validation.formula1)
             self.assertNotIn("Generated Manual", validation.formula1)
             self.assertNotIn("Working Draft", validation.formula1)
             self.assertNotIn("Created", validation.formula1)
@@ -800,7 +800,7 @@ class ReminderAndExcelTests(AutomationTestBase):
             validations = [item for item in sheet.data_validations.dataValidation
                            if f"{status_letter}2:{status_letter}10000" in str(item.sqref)]
             self.assertEqual(len(validations), 1)
-            self.assertIn("Ready,Alert,N/A,Generated,Generated Externally,Completed", validations[0].formula1)
+            self.assertIn("Ready,Alert,N/A,Generated,Completed", validations[0].formula1)
             self.assertTrue(validations[0].formula1.startswith('",Ready,Alert'))
             self.assertNotIn("Blank", validations[0].formula1)
             self.assertTrue(validations[0].allowBlank)

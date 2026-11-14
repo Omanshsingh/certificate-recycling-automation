@@ -29,13 +29,13 @@ class CertificateLookupTests(unittest.TestCase):
         expected = self.pdf('0193_Client_Mumbai.pdf')
         for number in range(200, 225):
             self.pdf(f'{number:04d}_Other_Mumbai.pdf')
-        with patch.object(runner, 'valid_pdf', wraps=valid_pdf) as validate:
+        with patch('issuance_safety.valid_pdf', wraps=valid_pdf) as validate:
             self.assertEqual(runner.find_certificate(self.root / 'Certificates', self.batch), expected)
         self.assertEqual([call.args[0] for call in validate.call_args_list], [expected])
 
     def test_no_match_opens_no_pdf(self):
         self.pdf('0200_Other_Mumbai.pdf')
-        with patch.object(runner, 'valid_pdf', wraps=valid_pdf) as validate:
+        with patch('issuance_safety.valid_pdf', wraps=valid_pdf) as validate:
             self.assertIsNone(runner.find_certificate(self.root / 'Certificates', self.batch))
         validate.assert_not_called()
 

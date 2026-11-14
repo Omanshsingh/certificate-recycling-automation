@@ -2,6 +2,7 @@
 from datetime import date
 from io import BytesIO
 import json
+import os
 from pathlib import Path
 import shutil
 import tempfile
@@ -242,10 +243,7 @@ class ProductionEdgeTests(unittest.TestCase):
                 web_app.generate(selected=("plant1", "CLIENT"), expected_revision=workspace_revision(self.root))
         self.assertFalse(safety.audit_records(self.root))
 
-    def test_manual_endpoint_retains_success_if_postcommit_state_read_fails(self):
-        body = dict(plant="plant1", details=self.details(
-            case_id="MANUAL-ENDPOINT", form6="FORM-MANUAL-ENDPOINT"),
-            expected_revision=workspace_revision(self.root))
+    def post_manual(self, body):
         handler = object.__new__(web_app.Handler)
         handler.path = "/api/manual/generate"
         payload = json.dumps(body).encode("utf-8")
@@ -254,11 +252,54 @@ class ProductionEdgeTests(unittest.TestCase):
         responses = []
         handler._same_origin = lambda: True
         handler.send_json = lambda value, status=200: responses.append((status, value))
+        handler._do_post()
+        return responses[0]
+
+    def test_manual_endpoint_retains_success_if_postcommit_state_read_fails(self):
+        body = dict(plant="plant1", details=self.details(
+            case_id="MANUAL-ENDPOINT", form6="FORM-MANUAL-ENDPOINT"),
+            expected_revision=workspace_revision(self.root))
         with patch.object(web_app, "workspace_state", side_effect=OSError("postcommit dashboard read failed")):
-            handler._do_post()
+            status, response = self.post_manual(body)
         self.assertEqual(safety.audit_records(self.root)[0]["state"], "complete")
-        self.assertEqual(responses[0][0], 200, responses)
-        self.assertEqual(responses[0][1]["created"], 1)
+        self.assertEqual(status, 200, response)
+        self.assertEqual(response["created"], 1)
+
+    def test_manual_endpoint_reports_saved_pdf_when_cached_row_cannot_be_reloaded(self):
+        checked = web_app.refresh()
+        revision = workspace_revision(self.root)
+        body = dict(plant=None, details=self.details(case_id="MANUAL-ENDPOINT", form6="FORM-MANUAL-ENDPOINT"),
+                    expected_revision=revision)
+        with patch.object(web_app, "WORKSPACE_STATE_CACHE", (revision, checked)), \
+                patch.object(web_app, "read_register", side_effect=PermissionError("Post-save register read unavailable")):
+            status, response = self.post_manual(body)
+        self.assertEqual(status, 200, response)
+        self.assertEqual(response["created"], 1)
+        self.assertEqual(len(response["certificates"]), 1)
+        self.assertIn("Do not repeat the save", response["state"]["setup_warning"])
+        self.assertEqual(safety.audit_records(self.root)[0]["state"], "complete")
+
+    @unittest.skipUnless(os.name == "nt", "Windows file sharing behavior")
+    def test_manual_correction_shows_how_to_finish_archiving_locked_old_pdf(self):
+        from tests.test_excel_edit_resilience import saved_workbook_open_for_reading
+        details = self.details(case_id="MANUAL-ENDPOINT", form6="FORM-MANUAL-ENDPOINT", supplier="Original name")
+        first = drafts.generate_draft(self.root, details=details, confirmed=True)
+        old = self.root / "Certificates" / first["relative_path"]
+        checked = web_app.refresh()
+        revision = workspace_revision(self.root)
+        body = dict(plant=None, details=dict(details, supplier="Corrected name"), record_id=first["record_id"],
+                    expected_revision=revision)
+        with saved_workbook_open_for_reading(old), patch.object(web_app, "WORKSPACE_STATE_CACHE", (revision, checked)):
+            status, result = self.post_manual(body)
+            self.assertEqual(status, 200, result)
+            self.assertEqual(result["created"], 1)
+            self.assertTrue(result["state"]["refresh_pending"])
+            self.assertIn("Close the PDF", result["state"]["recovery_note"])
+            self.assertTrue(old.exists())
+        web_app.refresh()
+        self.assertFalse(old.exists())
+        current, = (self.root / "Certificates").rglob("*.pdf")
+        self.assertIn("Corrected name", current.name)
 
     def test_finalsuccess_metadata_uses_pending_current_receipt_when_completion_fails(self):
         body = dict(plant="plant1", details=web_app.editor_details(read_batches(self.paths[0])[0]), edit_scope="update_excel")
@@ -294,6 +335,94 @@ class ProductionEdgeTests(unittest.TestCase):
             self.fail(f"The app's own later bulk commit stranded its earlier recovery: {exc}; "
                       f"created={result[0]}, states={[row['state'] for row in records]}")
         self.assertTrue(all(row["state"] == "complete" for row in safety.audit_records(self.root)))
+
+    def test_batch_reports_failed_company_and_refresh_allows_retry_of_only_that_company(self):
+        write_register(self.paths[1], case_id="OTHER", status="Ready")
+        choices = [{"plant": "plant1", "sn": "CLIENT"}, {"plant": "plant2", "sn": "OTHER"}]
+        checked = web_app.refresh()
+        revision = workspace_revision(self.root)
+
+        def fail_second(batch, *args, **kwargs):
+            if batch["case_id"] == "OTHER":
+                raise PermissionError("The certificate output folder became read-only.")
+            return self.render_workbook(batch, *args, **kwargs)
+
+        with patch.object(web_app, "WORKSPACE_STATE_CACHE", (revision, checked)), \
+                patch.object(runner, "make_certificate", side_effect=fail_second):
+            result = web_app.generate(selections=choices, starting_cod="0041", expected_revision=revision)
+        self.assertEqual(result["created"], 1)
+        self.assertEqual(len(result["certificates"]), 1)
+        self.assertEqual(len(result["unissued"]), 1)
+        unfinished = result["unissued"][0]
+        self.assertEqual((unfinished["plant"], unfinished["sn"]), ("plant2", "OTHER"))
+        self.assertIn("read-only", unfinished["detail"])
+        first, = (self.root / "Certificates").rglob("*.pdf")
+        saved_pdf = first.read_bytes()
+
+        refreshed = web_app.refresh()
+        self.assertEqual(web_app.target_row(refreshed, ("plant2", "OTHER"))["outcome"], "ready")
+        retry = web_app.generate(selections=choices[1:], expected_revision=workspace_revision(self.root))
+        self.assertEqual(retry["created"], 1)
+        self.assertFalse(retry["unissued"])
+        self.assertNotEqual(result["certificates"][0]["certificate_no"], retry["certificates"][0]["certificate_no"])
+        self.assertEqual(first.read_bytes(), saved_pdf)
+
+    def test_batch_reports_company_it_did_not_reach_after_history_write_failed(self):
+        write_register(self.paths[1], case_id="OTHER", status="Ready")
+        choices = [{"plant": "plant1", "sn": "CLIENT"}, {"plant": "plant2", "sn": "OTHER"}]
+        state = web_app.refresh()
+        revision = workspace_revision(self.root)
+        with patch.object(web_app, "WORKSPACE_STATE_CACHE", (revision, state)), \
+                patch.object(safety.IssuanceTransaction, "_finish_committed", side_effect=OSError("History disk unavailable")):
+            result = web_app.generate(selections=choices, starting_cod="0041", expected_revision=revision)
+        self.assertEqual(result["created"], 1)
+        self.assertEqual(result["state"]["recovery_note"], "History disk unavailable")
+        unfinished, = result["unissued"]
+        self.assertEqual(unfinished["sn"], "OTHER")
+        self.assertIn("batch stopped", unfinished["detail"])
+        self.assertEqual(read_batches(self.paths[1])[0]["issued"], "Ready")
+
+    def test_batch_preserves_first_success_and_stops_when_inventory_update_fails(self):
+        write_register(self.paths[1], case_id="OTHER", status="Ready")
+        choices = [{"plant": "plant1", "sn": "CLIENT"}, {"plant": "plant2", "sn": "OTHER"}]
+        state = web_app.refresh()
+        revision = workspace_revision(self.root)
+        scan_inventory = runner.scan_inventory
+        interrupted = False
+
+        def fail_after_first(*args, **kwargs):
+            nonlocal interrupted
+            if not interrupted and any(entry["state"] == "complete" for entry in safety.audit_records(self.root)):
+                interrupted = True
+                raise OSError("Inventory temporarily unavailable")
+            return scan_inventory(*args, **kwargs)
+
+        with patch.object(web_app, "WORKSPACE_STATE_CACHE", (revision, state)), \
+                patch.object(runner, "scan_inventory", side_effect=fail_after_first):
+            result = web_app.generate(selections=choices, starting_cod="0041", expected_revision=revision)
+        self.assertEqual(result["created"], 1)
+        self.assertEqual(len(result["certificates"]), 1)
+        self.assertIn("Inventory temporarily unavailable", result["state"]["recovery_note"])
+        self.assertEqual([row["outcome"] for row in result["state"]["rows"] if row["sn"] == "CLIENT"], ["generated_now"])
+        unfinished, = result["unissued"]
+        self.assertEqual(unfinished["sn"], "OTHER")
+        self.assertIn("batch stopped", unfinished["detail"])
+
+    def test_date_change_preserves_failed_hdd_request_warning_after_reloading_workbooks(self):
+        source = read_batches(self.paths[0])[0]
+        body = dict(plant="plant1", source_plant="plant1", source_kind="workbook", source_sn="CLIENT",
+                    details=dict(web_app.editor_details(source), inward_date="2026-09-04"),
+                    confirmed_excel=True, review_edits=True, edit_scope="update_excel", data_destruction_needed=True)
+        with patch("destruction_certificate.request_for_inward", side_effect=PermissionError("Local register unavailable")):
+            result = web_app.create_certificate(body)
+        self.assertEqual(result["created"], 1)
+        self.assertEqual(read_batches(self.paths[0])[0]["inward_date"], date(2026, 9, 4))
+        self.assertIn("Save request", result["state"]["setup_warning"])
+        self.assertIn("Local register unavailable", result["warnings"][0])
+        self.assertFalse(drafts.read_register(self.root)["records"])
+        from destruction_certificate import request_for_inward
+        self.assertTrue(request_for_inward(self.root, "plant1", "CLIENT", workspace_revision(self.root)))
+        self.assertEqual(len(list((self.root / "Certificates").rglob("*.pdf"))), 1)
 
     def test_renamed_same_cod_reissue_matches_only_latest_current_pdf(self):
         self.assertEqual(self.run_selected()[0], 1)

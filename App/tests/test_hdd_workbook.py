@@ -63,6 +63,58 @@ class HddWorkbookTests(unittest.TestCase):
         self.assertEqual((after['cod_no'], after['cod_date']), (before['cod_no'], before['cod_date']))
         self.assertEqual(after['hdd_cod_date'], '2026-10-18')
 
+    def test_hdd_uses_styles_synthesized_from_merged_tracking_borders(self):
+        from openpyxl.styles import Border, Side
+
+        book = load_workbook(self.paths[0])
+        sheet, _, cols = select_register(book)
+        cod_col = cols['cod_no'] + 1
+        sheet.merge_cells(start_row=2, end_row=3, start_column=cod_col, end_column=cod_col)
+        sheet.cell(3, cod_col).border = Border(bottom=Side(style='thick'))
+        book.save(self.paths[0])
+        book.close()
+        result = self.generate()
+        batch = read_batches(self.paths[0])[0]
+        self.assertEqual(batch['hdd_cod_no'], result['certificate_no'])
+        self.assertNotEqual(batch['cod_no'], result['certificate_no'])
+
+    def test_hdd_can_issue_first_without_a_recycling_number_or_date(self):
+        book = load_workbook(self.paths[0])
+        sheet, _, cols = select_register(book)
+        for key in ('cod_no', 'cod_date'):
+            cell = sheet.cell(2, cols[key] + 1)
+            cell.value = None
+            cell.number_format = 'General'
+        sheet.cell(2, cols['issued'] + 1).value = 'N/A'
+        book.save(self.paths[0])
+        book.close()
+        result = self.generate()
+        batch = read_batches(self.paths[0])[0]
+        self.assertEqual((batch['issued'], batch['cod_no'], batch['cod_date']), ('N/A', '', None))
+        self.assertEqual(batch['hdd_cod_no'], result['certificate_no'])
+        self.assertEqual(batch['hdd_cod_date'], AS_OF.isoformat())
+        from certificate_drafts import manual_rows
+        self.assertEqual(manual_rows(self.root)[0]['certificate_status'], 'generated')
+
+    def test_app_only_recycling_can_add_one_separate_hdd_record(self):
+        from certificate_drafts import save_draft
+
+        recycling = save_draft(self.root, None, dict(self.details(), certificate_type='standard',
+                                                     certificate_fields={}, reference='LOCAL-REC'))
+        identifier = request_for_inward(self.root, None, '', record_id=recycling)
+        self.assertEqual(request_for_inward(self.root, None, '', record_id=recycling), identifier)
+        records = {record['id']: record for record in read_register(self.root)['records']}
+        self.assertEqual(records[recycling]['details']['certificate_type'], 'standard')
+        self.assertEqual(records[identifier]['details']['destruction_source']['record_id'], recycling)
+        self.assertEqual(len(records), 2)
+        details = dict(records[identifier]['details'], certificate_fields=self.details()['certificate_fields'])
+        with self.assertRaisesRegex(ValueError, 'already has a Data Destruction record'):
+            generate_draft(self.root, None, details, as_of=AS_OF)
+        result = generate_draft(self.root, None, details, identifier, as_of=AS_OF)
+        self.assertEqual(result['created'], 1)
+        self.assertFalse(result['workbook_updated'])
+        self.assertEqual(len(read_register(self.root)['records']), 2)
+
     def test_recycling_correction_keeps_the_hdd_tracking_line(self):
         result = self.generate(); batch = read_batches(self.paths[0])[0]
         with WorkbookSession(self.paths[0], self.root / 'Data' / 'Workbook Backups') as session:

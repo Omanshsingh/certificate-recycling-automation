@@ -36,5 +36,40 @@ class RegisterPresentationTests(unittest.TestCase):
         updated=normalize_register_presentation(self.source())
         self.assertEqual(normalize_register_presentation(updated),updated)
 
+    def test_wrap_all_register_fields_and_expand_fixed_and_merged_rows(self):
+        book = load_workbook(BytesIO(self.source()))
+        sheet = book.active
+        sheet.column_dimensions['C'].width = 17
+        sheet.column_dimensions['E'].width = 14
+        sheet.merge_cells('C2:C4')
+        sheet['C2'] = '\n'.join(['Company branch name'] * 8)
+        sheet['E2'] = 'EquipmentID' * 12
+        sheet['E2'].alignment = Alignment(horizontal='right', shrink_to_fit=True)
+        sheet.row_dimensions[2].height = 15
+        sheet.row_dimensions[3].height = 15
+        book.create_sheet('Unrelated')['A1'] = 'Other sheet'
+        buffer = BytesIO()
+        book.save(buffer)
+        book.close()
+
+        updated = normalize_register_presentation(buffer.getvalue(), wrap_only=True, include_validation=True)
+        self.assertEqual(normalize_register_presentation(updated, wrap_only=True, include_validation=True), updated)
+        result = load_workbook(BytesIO(updated))
+        self.addCleanup(result.close)
+        sheet = result.worksheets[0]
+        self.assertIn('C2:C4', sheet.merged_cells)
+        self.assertEqual(sheet['E2'].value, 'EquipmentID' * 12)
+        self.assertEqual(sheet['F2'].value, '=2+3')
+        self.assertEqual(sheet['B2'].value, '02.11.2026')
+        self.assertEqual(sheet['E2'].alignment.horizontal, 'right')
+        self.assertFalse(sheet['E2'].alignment.shrink_to_fit)
+        self.assertTrue(all(sheet[coordinate].alignment.wrap_text for coordinate in ('B2', 'C2', 'E2', 'F2')))
+        self.assertGreater(sheet.row_dimensions[2].height, 30)
+        self.assertGreaterEqual(sum(sheet.row_dimensions[row].height for row in range(2, 5)), 120)
+        self.assertIsNone(result['Unrelated']['A1'].alignment.wrap_text)
+        self.assertTrue(sheet.column_dimensions['C'].alignment.wrap_text)
+        self.assertTrue(all('Generated Externally' not in rule.formula1
+                            for rule in sheet.data_validations.dataValidation))
+
 
 if __name__=='__main__':unittest.main()

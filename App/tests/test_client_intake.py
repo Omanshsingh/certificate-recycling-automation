@@ -40,6 +40,7 @@ class ClientIntakeTests(unittest.TestCase):
         save_json(self.root / 'settings.local.json', {'workbook_paths':[str(path) for path in self.paths], 'reminders_enabled':False})
         self.enterContext(patch.object(web_app, 'ROOT', self.root))
         self.enterContext(patch.object(web_app, 'BACKUP_DIR', self.root / 'Data' / 'Workbook Backups'))
+        self.enterContext(patch.object(web_app, 'RESULTS_PATH', self.root / 'Data' / 'Reports' / 'Latest Results.json'))
         self.enterContext(patch.object(web_app, 'refresh', return_value={'rows':[], 'scan_complete':True}))
 
     def body(self, **details):
@@ -47,12 +48,17 @@ class ClientIntakeTests(unittest.TestCase):
                 'details':{'supplier':'New client', 'form6':'FORM-NEW', **details}}
 
     def test_inward_can_be_saved_before_form6_is_entered(self):
-        result = web_app.add_client(self.body(form6='', inward_date='2026-10-01',
-                                              items=[{'item':'Asset','weight':5}]))
+        body = self.body(form6='', reference='NEW-REFERENCE', inward_date='2026-10-01',
+                         items=[{'item':'Asset','weight':5}])
+        with patch.object(web_app, 'WORKSPACE_STATE_CACHE', (body['expected_revision'], {'rows': [], 'scan_complete': True})):
+            result = web_app.add_client(body)
         added = next(row for row in read_batches(self.paths[0])
                      if row['case_id'] == result['client']['sn'])
         self.assertEqual(added['form6'], '')
         self.assertEqual(added['issued'], 'Ready')
+        row = web_app.target_row(result['state'], ('plant1', added['case_id']))
+        self.assertEqual(row['outcome'], 'needs_review')
+        self.assertIn('Form 6 number is required to create the certificate.', row['warnings'])
 
     def test_backdated_client_can_use_chronological_sr_and_excel_edits_remain_discoverable(self):
         result = web_app.add_client(self.body(sn='1000', inward_date='2026-06-15',
@@ -85,6 +91,8 @@ class ClientIntakeTests(unittest.TestCase):
         added = web_app.target_row(result['state'], ('plant1',result['client']['sn']))
         self.assertEqual(added['supplier'], 'New client')
         self.assertEqual(added['certificate_status'], 'ready')
+        self.assertEqual(added['outcome'], 'needs_review')
+        self.assertIn('Reference number is required to create the certificate.', added['warnings'])
 
     def test_duplicate_custom_sr_is_rejected_without_modifying_workbook(self):
         before = self.paths[0].read_bytes()

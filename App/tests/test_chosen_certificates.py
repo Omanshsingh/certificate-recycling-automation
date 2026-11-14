@@ -70,5 +70,23 @@ class ChosenCertificatesTests(unittest.TestCase):
         self.assertEqual(len(web_app.latest_result()['rows']),6)
         self.assertEqual(len(state['rows']),6)
 
+    def test_single_certificate_keeps_both_plant_lists_after_reload(self):
+        with patch.object(web_app, 'WORKBOOK_CHECK_STAMPS', {}):
+            checked = web_app.refresh()
+            expected = {(row['plant'], row['sn']) for row in checked['rows']}
+            self.assertEqual(len(expected), 6)
+            source = next(row for row in read_batches(self.paths[0]) if row['supplier'] == 'Choose 1')
+            revision = workspace_revision(self.root)
+            body = {'plant': 'plant1', 'source_kind': 'workbook', 'source_plant': 'plant1',
+                    'source_sn': source['case_id'], 'details': web_app.editor_details(source),
+                    'expected_revision': revision}
+            with patch.object(web_app, 'WORKSPACE_STATE_CACHE', (revision, checked)):
+                result = web_app.create_certificate(body)
+            self.assertEqual(result['created'], 1)
+            for state in (result['state'], web_app.latest_result(), web_app.workspace_state(), web_app.refresh()):
+                rows = {(row['plant'], row['sn']): row for row in state['rows']}
+                self.assertEqual(rows.keys(), expected)
+                self.assertEqual(rows['plant1', source['case_id']]['certificate_status'], 'generated')
+
 
 if __name__=='__main__':unittest.main()

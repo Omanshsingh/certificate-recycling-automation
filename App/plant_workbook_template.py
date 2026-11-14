@@ -46,7 +46,9 @@ def plant_workbook_bytes(plant: str) -> bytes:
     black = "FF000000"
     header_edge = Side(style="thin", color=black)
     for index, width in enumerate(WIDTHS, 1):
-        sheet.column_dimensions[sheet.cell(1, index).column_letter].width = width
+        column = sheet.column_dimensions[sheet.cell(1, index).column_letter]
+        column.width = width
+        column.alignment = Alignment(wrap_text=True)
         cell = sheet.cell(1, index)
         cell.font = Font(name="Calibri", size=11, bold=True, color=black)
         cell.fill = header_fill
@@ -59,7 +61,6 @@ def plant_workbook_bytes(plant: str) -> bytes:
     # One clean, fully bordered blank row is the entry point for direct Excel
     # edits. The app expands and groups it when a client has multiple items.
     for row in range(2, 3):
-        sheet.row_dimensions[row].height = 26
         for column in range(1, len(HEADERS) + 1):
             cell = sheet.cell(row, column)
             cell.font = Font(name="Calibri", size=11, color=black)
@@ -77,7 +78,7 @@ def plant_workbook_bytes(plant: str) -> bytes:
                 cell.number_format = "0.00"
 
     status_validation = DataValidation(
-        type="list", formula1='",Ready,Alert,Generated,Generated Externally,Completed,N/A"',
+        type="list", formula1='",Ready,Alert,Generated,Completed,N/A"',
         allow_blank=True,
     )
     status_validation.errorTitle = "Choose a listed status"

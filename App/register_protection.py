@@ -8,7 +8,7 @@ from zipfile import ZipFile
 
 from openpyxl import load_workbook
 from openpyxl.cell.cell import MergedCell
-from openpyxl.utils.cell import column_index_from_string
+from openpyxl.utils.cell import column_index_from_string, get_column_letter
 
 from certificate_core import read_batches, select_register, status_value
 
@@ -29,6 +29,7 @@ def _protection_hash():
 _SALT64 = b64encode(_SALT).decode('ascii')
 _HASH = _protection_hash()
 _ISSUED = {'generated', 'generated_manual', 'completed'}
+_FOLLOWUP_COLUMNS = ('comments', 'transporter_details', 'docket_vehicle_no', 'weight_slip_scale')
 
 
 def _managed(sheet):
@@ -48,7 +49,7 @@ def protect_issued_inwards(data):
 
     book = load_workbook(BytesIO(data), data_only=False)
     try:
-        sheet, header, _ = select_register(book)
+        sheet, header, columns = select_register(book)
         if externally_protected(sheet):
             return data
         batches = read_batches(BytesIO(data))
@@ -106,7 +107,7 @@ def protect_issued_inwards(data):
                 prefix = _element(xml, 'sheetData').search(xml).group('p')
                 protection = (f'<{prefix}sheetProtection sheet="1" algorithmName="SHA-512" '
                               f'hashValue="{_HASH}" saltValue="{_SALT64}" spinCount="{_SPINS}" '
-                              'objects="1" scenarios="1" autoFilter="0"/>')
+                              'objects="1" scenarios="1" autoFilter="0" formatRows="0"/>')
                 editable = []
                 start = header + 1
                 for first, last in [*locked, (1048577, 1048577)]:
@@ -114,6 +115,27 @@ def protect_issued_inwards(data):
                         editable.append(f'<{prefix}protectedRange name="EcorecoEditable{len(editable) + 1}" '
                                         f'sqref="A{start}:XFD{first - 1}"/>')
                     start = last + 1
+                for key in _FOLLOWUP_COLUMNS:
+                    if key not in columns:
+                        continue
+                    column = columns[key] + 1
+                    letter = get_column_letter(column)
+                    merges = [area for area in sheet.merged_cells.ranges
+                              if area.min_col <= column <= area.max_col]
+                    for first, last in locked:
+                        blocked = {row for row in range(first, last + 1)
+                                   if sheet.cell(row, column).data_type == 'f'}
+                        for area in merges:
+                            if (area.min_col != area.max_col or area.min_row < first or area.max_row > last
+                                    or area.min_row in blocked):
+                                blocked.update(range(max(first, area.min_row), min(last, area.max_row) + 1))
+                        start = first
+                        for stop in sorted(blocked | {last + 1}):
+                            if stop > start:
+                                editable.append(
+                                    f'<{prefix}protectedRange name="EcorecoDetails{len(editable) + 1}" '
+                                    f'sqref="{letter}{start}:{letter}{stop - 1}"/>')
+                            start = stop + 1
                 if editable:
                     protection += f'<{prefix}protectedRanges>{"".join(editable)}</{prefix}protectedRanges>'
                 # Sheet protection and editable ranges precede filters, merges,

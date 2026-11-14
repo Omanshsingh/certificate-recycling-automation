@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 from collections import Counter
+from copy import deepcopy
 from datetime import date, datetime
+from functools import lru_cache
+from io import BytesIO
 from pathlib import Path
 import re
 import math
@@ -20,6 +23,7 @@ from reportlab.pdfgen import canvas
 
 PDF_WIDTH, PDF_HEIGHT = 960, 540
 TEMPLATE_DESIGN_WIDTH, TEMPLATE_DESIGN_HEIGHT = 1534, 867
+MAX_SNAPSHOT_CACHE_BYTES = 4 * 1024 * 1024
 # Vertical grid lines in the supplied certificate template, in source-image pixels.
 CERTIFICATE_NUMBER_CELL = (797, 878)
 CERTIFICATE_DATE_CELL = (878, 990)
@@ -251,6 +255,24 @@ def source_value_issues(batch, as_of=None, certificate_type=None):
 
 
 def read_batches(path):
+    # A save or refresh may inspect the same immutable workbook snapshot more
+    # than once. Give each caller independent rows, since they annotate them.
+    if isinstance(path, BytesIO) and path.getbuffer().nbytes <= MAX_SNAPSHOT_CACHE_BYTES:
+        return deepcopy(_snapshot_batches(path.getvalue()))
+    if isinstance(path, (str, os.PathLike)) and Path(path).suffix.casefold() in {'.xlsx', '.xlsm', '.xltx', '.xltm'}:
+        with Path(path).open('rb') as source:
+            data = source.read(MAX_SNAPSHOT_CACHE_BYTES + 1)
+        if len(data) <= MAX_SNAPSHOT_CACHE_BYTES:
+            return deepcopy(_snapshot_batches(data))
+    return _read_batches(path)
+
+
+@lru_cache(maxsize=8)
+def _snapshot_batches(data):
+    return _read_batches(BytesIO(data))
+
+
+def _read_batches(path):
     from workbook_metadata import read_details, lookup_details
     saved_details = read_details(path)
     workbook = load_workbook(path, data_only=False, read_only=False)
@@ -357,6 +379,7 @@ def read_batches(path):
                 "form6": text(raw[cols["form6"]]) if "form6" in cols else text(saved.get('form6')),
                 "reference": text(raw[cols["reference"]]) if "reference" in cols else text(saved.get('reference')),
                 "pdf_recovery_pending": bool(saved.get('_pdf_recovery_pending')),
+                "external_pdf": saved.get('_external_pdf'),
                 "hdd_cod_no": text(saved.get('_hdd_cod_no')),
                 "hdd_cod_date": saved.get('_hdd_cod_date', ''),
                 **{key: text(raw[cols[key]]) if key in cols else '' for key in

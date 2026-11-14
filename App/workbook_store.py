@@ -318,10 +318,12 @@ def _patch_cell_styles(xml, style_ids):
     return xml
 
 
-def repair_register_borders(data):
+def repair_register_borders(data, *, book=None, batches=None):
     """Repair borders without moving rows or rewriting any cell payloads."""
-    batches = read_batches(BytesIO(data))
-    book = load_workbook(BytesIO(data), data_only=False)
+    batches = read_batches(BytesIO(data)) if batches is None else batches
+    owns_book = book is None
+    if owns_book:
+        book = load_workbook(BytesIO(data), data_only=False)
     try:
         sheet, _, _ = select_register(book)
         if externally_protected(sheet):
@@ -347,7 +349,8 @@ def repair_register_borders(data):
                     target.writestr(info, changes.get(info.filename, archive.read(info.filename)))
             return output.getvalue()
     finally:
-        book.close()
+        if owns_book:
+            book.close()
 
 
 class UnsupportedReorderError(ValueError):
@@ -367,12 +370,12 @@ def order_register_for_save(data, session):
         data = compact_register_gaps(data)
     except UnsupportedReorderError as exc:
         session.order_warning = str(exc)
-    data = repair_register_borders(normalize_register_presentation(data))
+    data = normalize_register_presentation(data)
     try:
         return sort_register_by_inward_date(data)
     except UnsupportedReorderError as exc:
         session.order_warning = str(exc)
-        return data
+        return repair_register_borders(data)
 
 
 def sort_register_by_inward_date(data, *, source_rows=None):
@@ -397,6 +400,8 @@ def sort_register_by_inward_date(data, *, source_rows=None):
             by_start[block[0]]['inward_date'] is None,
             by_start[block[0]]['inward_date'] or datetime.max.date()))
         moved = ordered != blocks
+        if not moved and source_rows is None:
+            return repair_register_borders(data, book=book, batches=batches)
         row_map = {}
         destination = blocks[0][0]
         for first, last in ordered:
@@ -832,7 +837,7 @@ def _ensure_status_validation(xml, status_column, row_limit, first_row=2):
     prefix = match.group("p") if match else (root_prefix_match.group("p") if root_prefix_match else "")
     validation = (f'<{prefix}dataValidation type="list" allowBlank="1" showErrorMessage="1" '
                   f'sqref="{status_column}{first_row}:{status_column}{row_limit}">'
-                  f'<{prefix}formula1>",Ready,Alert,N/A,Generated,Generated Externally,Completed"</{prefix}formula1>'
+                  f'<{prefix}formula1>",Ready,Alert,N/A,Generated,Completed"</{prefix}formula1>'
                   f'</{prefix}dataValidation>')
     if match:
         block = match.group()
@@ -1821,9 +1826,11 @@ class WorkbookSession:
         finally:
             book.close()
 
-        updated = write_details(updated, current['source_sheet'], current['case_id'],
-                                {**{key:value for key,value in (persisted_overrides or {}).items() if key not in cols},
-                                 '_pdf_recovery_pending': False})
+        metadata = {key:value for key,value in (persisted_overrides or {}).items() if key not in cols}
+        metadata['_pdf_recovery_pending'] = False
+        if current.get('external_pdf'):
+            metadata['_external_pdf'] = None
+        updated = write_details(updated, current['source_sheet'], current['case_id'], metadata)
         updated = order_register_for_save(updated, self)
 
         verified_matches = [b for b in read_batches(BytesIO(updated))
@@ -1846,18 +1853,18 @@ class WorkbookSession:
         return self._persist(updated)
 
     def set_issued_status(self, case_id, source_sheet, source_row, expected_certificate_no,
-                          expected_status, new_status):
-        """Change only Certificate Issued for an operator action or PDF recovery."""
+                          expected_status, new_status, *, external=None):
+        """Update status, with optional tracking details for a linked external PDF."""
         if self.context is None:
             raise PermissionError("The workbook became unavailable during its update. Close it in Excel and try again.")
         if isinstance(expected_status, str):
             expected_status = (expected_status,)
         expected = {status_value(value) for value in expected_status}
         target = status_value(new_status)
-        target_labels = {"ready": "Ready", "generated": "Generated",
+        target_labels = {"ready": "Ready", "alert": "Alert", "na": "N/A", "generated": "Generated",
                          "generated_manual": "Generated Externally", "completed": "Completed"}
         if target not in target_labels:
-            raise ValueError("Only Ready, Generated, Generated Externally or Completed can be recorded by this action.")
+            raise ValueError("Choose a supported certificate status.")
         new_status = target_labels[target]
         matches = [batch for batch in read_batches(BytesIO(self.data))
                    if text(batch['case_id']).casefold() == text(case_id).casefold()
@@ -1882,21 +1889,61 @@ class WorkbookSession:
             if cell.data_type == "f" or (externally_protected(sheet) and cell.protection.locked):
                 raise ValueError(f"{cell.coordinate} is a formula or protected cell; its status was not changed.")
             coordinate = cell.coordinate
+            tracking = {}
+            external_type = external.get('certificate_type') if external else None
+            if external:
+                for key, value, kind in (
+                    ('cod_no', external['cod'], 'inlineStr'),
+                    ('cod_date', to_excel(external['date'], book.epoch), 'n'),
+                ):
+                    if key not in cols:
+                        raise ValueError('The workbook needs its COD No and COD Date columns. Refresh it and try again.')
+                    tracking_cell = sheet.cell(current['source_row'], cols[key] + 1)
+                    _check_batch_merge(sheet, tracking_cell, current['source_row'], cols)
+                    if tracking_cell.data_type == 'f' or (externally_protected(sheet) and tracking_cell.protection.locked):
+                        raise ValueError(f'{tracking_cell.coordinate} uses a formula or is protected in Excel.')
+                    tracking[tracking_cell.coordinate] = (value, kind, tracking_cell.style_id,
+                                                          key == 'cod_date' and not is_date_format(tracking_cell.number_format))
+                if external_type and external_type != current['certificate_type'] and 'certificate_type' in cols:
+                    cell = sheet.cell(current['source_row'], cols['certificate_type'] + 1)
+                    _check_batch_merge(sheet, cell, current['source_row'], cols)
+                    if cell.data_type == 'f' or (externally_protected(sheet) and cell.protection.locked):
+                        raise ValueError(f'{cell.coordinate} uses a formula or is protected in Excel.')
+                    tracking[cell.coordinate] = (external_type, 'inlineStr', cell.style_id, False)
+            generated_styles = None
+            if tracking:
+                with ZipFile(BytesIO(self.data)) as archive:
+                    generated_styles = sync_generated_styles(book, archive.read('xl/styles.xml').decode('utf-8'))
         finally:
             book.close()
         with ZipFile(BytesIO(self.data)) as source:
             member = _sheet_member(source, current["source_sheet"])
             xml = source.read(member).decode("utf-8")
             xml = _set_cell(xml, coordinate, new_status, "inlineStr")
+            styles = generated_styles
+            for address, (value, kind, style, need_date_style) in tracking.items():
+                if need_date_style:
+                    styles, style = _date_style(styles, style, 'dd/mm/yy')
+                xml = _set_cell(xml, address, value, kind, style=style)
             xml = _update_issued_status_formatting(xml, coordinate, current.get('source_header_row', 1) + 1)
             ET.fromstring(xml)
             buffer = BytesIO()
             with ZipFile(buffer, "w") as target_archive:
                 target_archive.comment = source.comment
                 for info in source.infolist():
-                    target_archive.writestr(info, xml.encode("utf-8") if info.filename == member
-                                             else source.read(info.filename))
+                    content = (xml.encode('utf-8') if info.filename == member else styles.encode('utf-8')
+                               if info.filename == 'xl/styles.xml' and tracking else source.read(info.filename))
+                    target_archive.writestr(info, content)
         updated = buffer.getvalue()
+        expected_cod = current['cod_no']
+        expected_date = parse_date(current['cod_date'])
+        if external:
+            expected_cod, expected_date = external['cod'], external['date']
+            metadata = {'_external_pdf': external['link'], '_pdf_recovery_pending': False}
+            if external_type and 'certificate_type' not in cols:
+                metadata['certificate_type'] = external_type
+            updated = write_details(updated, current['source_sheet'], current['case_id'],
+                                    metadata)
         if target == 'ready' and status_value(current['issued']) in {'generated', 'generated_manual', 'completed'}:
             updated = write_details(updated, current['source_sheet'], current['case_id'],
                                     {'_pdf_recovery_pending': True})
@@ -1905,13 +1952,17 @@ class WorkbookSession:
                         and batch["source_sheet"] == source_sheet
                         and batch["source_row"] == current['source_row'])
         if (status_value(verified["issued"]) != target
-                or verified["cod_no"] != current["cod_no"]
-                or parse_date(verified["cod_date"]) != parse_date(current["cod_date"])):
+                or verified["cod_no"] != expected_cod
+                or parse_date(verified["cod_date"]) != expected_date
+                or (external and verified['external_pdf'] != external['link'])
+                or (external_type and verified['certificate_type'] != external_type)):
             raise ValueError("The workbook status update could not be verified; the original file was kept.")
         return self._persist(updated)
 
     def _persist(self, updated, *, exact=False):
         if not exact:
+            from register_presentation import normalize_register_presentation
+            updated = normalize_register_presentation(updated, wrap_only=True)
             updated = protect_issued_inwards(updated)
         if self.before_persist:
             self.before_persist(updated)
@@ -1976,7 +2027,7 @@ def update_issued_status(path, backup_dir, case_id, source_sheet, source_row,
         )
 
 
-def stage_certificate_details(session, details, validate_cells=True):
+def stage_certificate_details(session, details, validate_cells=True, *, inward_status="Ready"):
     """Build a Ready form view without writing or changing session.data.
 
     Skip source-cell checks only for a certificate-only render. Commit still
@@ -2034,7 +2085,7 @@ def stage_certificate_details(session, details, validate_cells=True):
                     if current and required > len(current['items']) else session.data)
         if expanded != session.data:
             shadow = SimpleNamespace(data=expanded, path=session.path, order_warning=None)
-            result = stage_certificate_details(shadow, details, validate_cells=True)
+            result = stage_certificate_details(shadow, details, validate_cells=True, inward_status=inward_status)
             if shadow.order_warning:
                 session.order_warning = shadow.order_warning
             return result
@@ -2182,7 +2233,7 @@ def stage_certificate_details(session, details, validate_cells=True):
             "reference": text(details.get("reference")),
             "cod_no": text(details.get("cod_no")),
             "cod_date": parse_date(details.get("cod_date")),
-            "issued": "Ready",
+            "issued": inward_status,
             "certificate_type": text(details.get("certificate_type")) or "standard",
             "certificate_fields": _certificate_fields_json(details.get("certificate_fields")),
         }
@@ -2314,8 +2365,8 @@ def stage_certificate_details(session, details, validate_cells=True):
     matches = [batch for batch in parsed if batch["case_id"] == case_id]
     if len(matches) != 1:
         raise ValueError("The entered certificate details could not be verified in the workbook.")
-    if status_value(matches[0]["issued"]) != "ready":
-        raise ValueError("The entered certificate details were not marked Ready in the workbook.")
+    if status_value(matches[0]["issued"]) != status_value(inward_status):
+        raise ValueError(f"The entered inward details were not marked {inward_status} in the workbook.")
     if material_override is not None:
         if validate_cells:
             persisted = matches[0]['items']

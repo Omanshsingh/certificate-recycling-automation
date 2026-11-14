@@ -15,15 +15,40 @@ each SN unique within its plant and each Form 6 number unique across both plants
 Leave workbook headings, weight formulas and certificate tracking to the app.
 Save and close Excel, then refresh to pick up your edits.
 
-Issued inwards are locked in Excel, including their material and linked HDD rows.
-Use **Review & edit** for corrections and **Mark Completed** after sending. The
-app applies the lock when it issues a certificate and on writable refreshes for
-existing certificates and those marked **Generated Externally** in Excel.
+Issued certificate details stay protected in Excel, including their material and
+linked HDD rows. The four follow-up fields remain editable. Use **Review & edit**
+for certificate corrections and **Mark Completed** after sending. To update an
+inward marked **N/A**, use **Review & edit → Save to Excel**. The inward keeps its
+**N/A** status. In **Companies**, **Mark N/A** skips an unissued Excel inward.
+**Undo N/A** checks the inward details and restores **Ready** or **Alert**. For an
+unissued app-only certificate, **Undo N/A** restores its previous status.
 
 The [stability plan](App/docs/STABILITY_PLAN.md) describes the longer-term local
 record store and reconciliation design that supports continued manual Excel edits.
 
 ## Everyday use
+
+**Settings → Next COD number** sets the starting point for the next new certificate.
+The app still checks used numbers across the workbooks and certificate history.
+Leave the field blank to continue automatic numbering.
+
+Use **Upload PDF** beside **Refresh** for a certificate created outside the app.
+Choose an Excel inward or save the certificate in the app only. The form fills in
+the printed COD when it can read it. Otherwise it uses the inward's existing COD
+or suggests the next available number. If the PDF already has a number, enter
+the printed COD. Confirm the type and issue date. For app-only records, also
+enter the company details.
+The app keeps the original PDF in **Certificates → Manually Added** and records
+its status as **Generated Externally**. An uploaded Data Destruction certificate
+uses its own record and COD. PDFs already in **Manually Added** can still be
+linked from **Saved certificates → Details**. Mark the record **Completed** after
+sending it. **Generated Externally** is recorded by the app when you attach a PDF.
+
+In **Review & edit**, uncheck **Recycling certificate needed** to mark only the
+Recycling certificate N/A. The equivalent checkbox uses the selected certificate
+type for Medical or International inwards. Use **Open Data Destruction (HDD)** to
+create the linked HDD certificate first or on its own. Its COD and date are
+recorded separately in Excel.
 
 Use the trash icon beside an inward in **Companies** to delete an entry entered by mistake, up to the point when a certificate is generated. An assigned number alone does not hide the action. Generated or Completed entries, including entries with an issued HDD certificate or missing issued PDF, cannot be deleted. **Settings → Advanced → Search entries to delete** follows the same rule. Pending, ungenerated HDD requests can be included in the reviewed deletion or retained as standalone records.
 
@@ -31,7 +56,7 @@ Review the company, plant and materials, tick the confirmation, then remove the 
 
 Refresh also removes wholly empty row boxes left by older deletions, with a workbook backup. Blank rows within populated merged client blocks remain intact. Workbooks with unsupported formulas or objects retain their rows and show a maintenance warning for review in Excel.
 
-Dates throughout the app and the Excel register display as **DD/MM/YY**. Excel stores real dates, and register details including SN use top-left alignment. Refresh applies the presentation to existing rows. New-client entry stays open when clicking outside the dialog. Add client and Review & edit use the same materials calculation controls: per-piece weight × quantity = line weight, with direct weight entry supported for quantities such as **1 Lot**.
+Dates throughout the app and the Excel register display as **DD/MM/YY**. Use the calendar icon next to editable dates, including Data Destruction and each device receipt. Excel stores real dates, and register details including SN use top-left alignment. App saves and writable refreshes wrap register text and make rows taller where needed, including merged client cells. You can also resize rows directly in Excel. New-client entry stays open when clicking outside the dialog. Add client and Review & edit use the same materials calculation controls: per-piece weight × quantity = line weight, with direct weight entry supported for quantities such as **1 Lot**.
 
 When an inward's HDD certificate is generated, its number and date are written on the next line beneath the recycling COD and COD Date in the same inward. The tracking lines use the light internal asset borders. Existing recycling numbers, dates and statuses stay unchanged. The workbook, HDD PDF and local tracking are saved with recovery snapshots; close Excel before this save. Refresh also fills this tracking line for older linked HDD certificates.
 
@@ -79,7 +104,7 @@ To start a plant register from scratch, choose **Create template** for that plan
 4. Find PDFs in the top-level **Certificates** folder. Names use `{COD}_Company name_City, Country.pdf`. Underscores separate sections; spaces inside company and location names are preserved. The COD matches the number written to Excel; the plant is tracked in the source record.
 5. Choose **Open PDF** to check the saved certificate and send it through the normal company process. Then choose **Mark Completed** beside that company; Excel records **Completed** and reminders stop.
 
-The app writes a newly assigned COD number and date back to Excel. A COD or date already entered by the user is respected. Reference No. is optional; Form 6 No. is the required manifest identifier for Recycling certificates. If a row is deliberately changed back to **Ready**, the current row values control the next PDF generation. If COD is blank, the next number is chosen from both plant workbooks and the existing certificate PDFs so the sequence is shared.
+The app writes a newly assigned COD number and date back to Excel. A COD or date already entered by the user is respected. Reference No. may be blank on a draft but is required before issuing a Recycling, Sita or Siemens certificate. Form 6 No. is the required manifest identifier for Standard Recycling certificates. If a row is deliberately changed back to **Ready**, the current row values control the next PDF generation. If COD is blank, the next number is chosen from both plant workbooks and the existing certificate PDFs so the sequence is shared.
 
 An inward can be reviewed and edited before or after its first certificate. The plant and SN stay fixed. The editor asks before saving changed details to Excel, and the save endpoint checks that consent and the reviewed file version. Saving inward details alone creates no PDF and reserves no COD. PDF creation records the number, date and Generated status; the chosen template and printed details are retained in the app's issuance history.
 
@@ -108,7 +133,7 @@ While the dashboard is open, it checks for saved Excel changes every 15 seconds 
 
 If Excel changes during a review, the rejected action refreshes the company list automatically. An outdated deletion review closes so it can be reopened against the current rows. Entered certificate details remain in the editor; close and reopen the entry to review the latest Excel facts before saving. The app never automatically repeats the rejected save or deletion.
 
-The everyday screen keeps search, plant selection and quick **All / Ready / Alert** choices visible. **More filters** reveals other statuses and certificate types; active selections remain visible in its heading. Clearing company search/filters keeps the selected plant. **Summary & analytics** reveals the status totals. The Alert view includes day-25 follow-ups without approving unfinished inwards or N/A rows. **Create several** includes all Excel rows marked Ready in the selected plant, regardless of search, status or type filters; Empty statuses and N/A are skipped. Close the batch dialog to cancel without generating anything.
+The everyday screen keeps search, plant selection and quick **All / Ready / Alert** choices visible. **More filters** reveals other statuses and certificate types; active selections remain visible in its heading. Clearing company search/filters keeps the selected plant. **Summary & analytics** reveals the status totals. The Alert view includes day-25 follow-ups without approving unfinished inwards or N/A rows. **Create several** lists eligible Excel rows in the selected plant, regardless of search, status or type filters. Use **Review & edit** to fill missing details for any company that is absent from the checklist. Close the batch dialog to cancel. If a batch only partly succeeds, the result shows what saved and which companies still need a certificate. Resolve the listed issues, refresh and select the unfinished companies for retry.
 
 Use **New certificate** when the details were not entered in Excel first. **Where details are saved** contains **Save details in**, the plant/workbook selection and SN. A new numeric ID is suggested from the selected plant when all its IDs are numeric; you can change it. A new Excel record is saved only when PDF creation succeeds, and an existing ID is rejected rather than replaced. Under the materials section, enter a material and its weight, then use **+ Add another material** for additional lines. The app calculates the total and previews it automatically; optional quantity-based calculations remain available. Adding materials in Review & edit inserts the required rows before the next client, moves that client's complete block, and extends the selected inward's merges and supported total formulas.
 

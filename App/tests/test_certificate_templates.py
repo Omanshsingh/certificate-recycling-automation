@@ -501,7 +501,7 @@ class DraftWorkflowTests(TemporaryCertificateTest):
         self.assertIn("INDEPENDENT CLIENT LTD, PUNE", pdf_text(output))
         rows = drafts.manual_rows(self.root)
         self.assertEqual((len(rows), rows[0]["source_kind"], rows[0]["certificate_type"]), (1, "manual", "sita"))
-        self.assertEqual(rows[0]["certificate_status"], "generated_manual")
+        self.assertEqual(rows[0]["certificate_status"], "generated")
         self.assertEqual([path.read_bytes() for path in self.paths], original_workbooks)
 
     def test_siemens_alternate_company_and_serials_do_not_require_inward(self):
@@ -790,7 +790,8 @@ class DraftWorkflowTests(TemporaryCertificateTest):
                 drafts.reconcile_manual(self.root)
                 record = drafts.read_register(self.root)["records"][0]
                 self.assertEqual(record["status"], expected)
-                self.assertEqual(drafts.manual_rows(self.root)[0]["certificate_status"], expected)
+                displayed = 'generated' if expected == 'generated_manual' else expected
+                self.assertEqual(drafts.manual_rows(self.root)[0]["certificate_status"], displayed)
                 self.assertTrue(drafts.current_record_pdf(self.root, record).is_file())
 
     def test_completion_refuses_ready_draft_or_missing_generated_pdf(self):

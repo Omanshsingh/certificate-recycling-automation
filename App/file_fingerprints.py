@@ -54,7 +54,7 @@ def _windows_change_time(path):
 def file_signature(path):
     path = Path(path)
     stat = path.stat()
-    change = _windows_change_time(path.resolve()) if os.name == 'nt' else stat.st_ctime_ns
+    change = _windows_change_time(path.absolute()) if os.name == 'nt' else stat.st_ctime_ns
     return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, change)
 
 

@@ -4,23 +4,28 @@ import re
 from zipfile import ZipFile
 
 from openpyxl import load_workbook
+from openpyxl.styles.numbers import is_date_format
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.datetime import to_excel
 
 from register_protection import externally_protected
-from certificate_core import read_batches, select_register, text
+from certificate_core import parse_date, read_batches, select_register, text
 from workbook_metadata import write_details
-from workbook_store import _attributes, _element, _sheet_member, _set_cell, _patch_cell_styles, order_register_for_save
+from workbook_store import (_attributes, _date_style, _element, _sheet_member, _set_cell,
+                            _patch_cell_styles, order_register_for_save, sync_generated_styles)
 
 
 def stage_hdd_tracking(session, sn, cod, issued_date):
     data = session.data
-    matches = [b for b in read_batches(BytesIO(data)) if text(b['case_id']).casefold() == text(sn).casefold()]
+    from workbook_store import add_tracking_column
+    data = add_tracking_column(data)
+    batches = read_batches(BytesIO(data))
+    matches = [b for b in batches if text(b['case_id']).casefold() == text(sn).casefold()]
     if len(matches) != 1:
         raise ValueError('The linked inward is missing or its SN is repeated. Refresh Excel before creating the HDD certificate.')
     batch = matches[0]
     row = batch['source_row'] + 1
-    following = min([b['source_row'] for b in read_batches(BytesIO(data)) if b['source_row'] > batch['source_row']] or [1048576])
+    following = min([b['source_row'] for b in batches if b['source_row'] > batch['source_row']] or [1048576])
     if following == row or row in batch.get('summary_rows', []):
         from register_rows import shift_register_rows
         data = shift_register_rows(data, row, 1)
@@ -32,14 +37,22 @@ def stage_hdd_tracking(session, sn, cod, issued_date):
         with ZipFile(BytesIO(data)) as archive:
             member = _sheet_member(archive, sheet.title)
             xml = archive.read(member).decode('utf-8')
+            date_style_id = None
             style_ids = {}
             for key, value in (('cod_no', cod), ('cod_date', to_excel(issued_date, book.epoch))):
                 column = cols[key] + 1
                 current = sheet.cell(row, column)
                 if current.data_type == 'f':
                     raise ValueError('The HDD tracking line contains a formula. Check Excel before creating the certificate.')
+                matches_existing = (text(current.value) == text(cod) if key == 'cod_no'
+                                    else parse_date(current.value) == issued_date)
+                if (current.value not in (None, '') and not batch.get('hdd_cod_no')
+                        and not matches_existing):
+                    raise ValueError(f'{current.coordinate} already contains tracking data. Check the existing HDD number and date in Excel.')
                 coordinate = f'{get_column_letter(column)}{row}'
                 style_ids[coordinate] = sheet.cell(batch['source_row'], column).style_id
+                if key == 'cod_date' and not is_date_format(sheet.cell(batch['source_row'], column).number_format):
+                    date_style_id = coordinate
                 xml = _patch_cell_styles(xml, {coordinate: style_ids[coordinate]})
                 xml = _set_cell(xml, coordinate, value, 'inlineStr' if key == 'cod_no' else 'n')
             xml = _patch_cell_styles(xml, style_ids)
@@ -54,10 +67,15 @@ def stage_hdd_tracking(session, sn, cod, issued_date):
                 block = re.sub(r'\bcount=(["\x27]).*?\1', f'count="{count}"', block, count=1) if count else ''
                 xml = xml[:section.start()] + block + xml[section.end():]
             output = BytesIO()
+            styles = sync_generated_styles(book, archive.read('xl/styles.xml').decode('utf-8'))
+            if date_style_id:
+                styles, date_style = _date_style(styles, style_ids[date_style_id], 'dd/mm/yy')
+                xml = _patch_cell_styles(xml, {date_style_id: date_style})
+            updates = {member: xml.encode('utf-8'), 'xl/styles.xml': styles.encode('utf-8')}
             with ZipFile(output, 'w') as target:
                 target.comment = archive.comment
                 for info in archive.infolist():
-                    target.writestr(info, xml.encode('utf-8') if info.filename == member else archive.read(info.filename))
+                    target.writestr(info, updates.get(info.filename, archive.read(info.filename)))
         updated = write_details(output.getvalue(), sheet.title, batch['case_id'],
                                 {'_hdd_cod_no': str(cod), '_hdd_cod_date': issued_date.isoformat()})
         updated = order_register_for_save(updated, session)

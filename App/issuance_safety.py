@@ -17,7 +17,11 @@ import shutil
 import uuid
 
 from pypdf import PdfReader
+from file_fingerprints import file_signature, fingerprint
 from workflow_support import save_json
+
+
+LOOKUP_RECEIPT = object()
 
 
 def digest_bytes(data):
@@ -52,6 +56,26 @@ def valid_pdf(path):
                     contents.get_data()
         return True
     except Exception:
+        return False
+
+
+@lru_cache(maxsize=256)
+def _cached_pdf_health(path, signature):
+    if not valid_pdf(path) or file_signature(path) != signature:
+        raise OSError('PDF is unreadable or changed during validation')
+    return True
+
+
+def current_pdf_is_healthy(path, expected_sha=None):
+    """Check an existing PDF for the dashboard, reusing work for unchanged files."""
+    try:
+        path = Path(path)
+        signature = file_signature(path)
+        if expected_sha is not None and fingerprint(path)[0] != expected_sha:
+            return False
+        healthy = valid_pdf(path) if signature[-1] is None else _cached_pdf_health(path, signature)
+        return healthy and file_signature(path) == signature
+    except OSError:
         return False
 
 
@@ -123,7 +147,6 @@ def _projected_records(root, stamp, links_json, deletion_stamp=()):
 
 
 def _receipt_snapshot(root):
-    from file_fingerprints import file_signature
     from inward_serials import workspace_links
     root = Path(root).resolve()
     stamp = tuple((str(path), file_signature(path)) for path in sorted((root / 'Data' / 'Issuance History').glob('*.json')))
@@ -137,7 +160,7 @@ def audit_records(root):
     from certificate_drafts import read_register
     from manual_ownership import record_plant
     try:
-        local = {row['id']:row for row in read_register(root)['records']}
+        local = {row['id']: row for row in read_register(root)['records']}
     except (OSError, ValueError):
         # Recovery/audit must still inspect immutable history when the current
         # register is damaged. Normal edit/creation paths validate it separately.
@@ -146,6 +169,21 @@ def audit_records(root):
         if row.get('source_kind') == 'manual':
             row['plant'] = record_plant(local.get(str(row.get('key')), {'details':row.get('after') or {}}))
     return records
+
+
+def manual_receipts(root, records, *, history=None):
+    """Latest committed issuance for each selected local record and its owner."""
+    owners = {row['id']: row['plant'] for row in records}
+    latest = {}
+    if not owners:
+        return latest
+    history = audit_records(root) if history is None else history
+    for entry in history:
+        key = str(entry.get('key'))
+        if (entry.get('source_kind') == 'manual' and entry.get('state') == 'complete'
+                and key in owners and entry.get('plant') in (None, owners[key])):
+            latest[key] = entry
+    return latest
 
 
 def latest_issuance(root, source_kind, plant, key):
@@ -197,7 +235,7 @@ class IssuanceTransaction:
     def __init__(self, root, destination, temporary, source_path, source_before,
                  *, source_kind, plant, key, cod, issued_date, before, after,
                  warnings=(), override_reason='', old_paths=(), template_path=None,
-                 companion_source=None, converted_from=None):
+                 companion_source=None, converted_from=None, external_upload=False, retain_existing=False):
         self.root = Path(root).resolve()
         self.id = uuid.uuid4().hex
         self.folder = self.root / 'Data' / 'Issuance Recovery' / self.id
@@ -210,7 +248,7 @@ class IssuanceTransaction:
             raise ValueError('The new PDF could not be validated. Nothing was saved.')
         _write_bytes(self.folder / 'new.pdf', temporary.read_bytes())
         old = []
-        for item in dict.fromkeys([str(destination)] + [str(path) for path in old_paths]):
+        for item in dict.fromkeys(([] if retain_existing else [str(destination)]) + [str(path) for path in old_paths]):
             path = Path(item)
             if path.is_file():
                 relative = path.resolve().relative_to(self.root).as_posix()
@@ -235,6 +273,9 @@ class IssuanceTransaction:
         }
         if converted_from:
             self.data['converted_from'] = deepcopy(converted_from)
+        if external_upload:
+            self.data['external_upload'] = True
+            self.data['retain_existing'] = retain_existing
         if companion_source:
             path, before_payload, after_payload = companion_source
             path = Path(path).resolve()
@@ -258,8 +299,34 @@ class IssuanceTransaction:
     def publish(self):
         destination = _certificate_path(self.root, self.data['pdf_path'])
         stage = destination.with_name(f'.{self.id}.publish.pdf')
-        _write_bytes(stage, (self.folder / 'new.pdf').read_bytes())
-        os.replace(stage, destination)
+        try:
+            if self.data.get('retain_existing'):
+                if file_digest(destination) != self.data['pdf_sha256']:
+                    raise ValueError('The existing PDF changed. Refresh and select the file again.')
+            else:
+                _write_bytes(stage, (self.folder / 'new.pdf').read_bytes())
+                if self.data.get('external_upload'):
+                    if os.name == 'nt':
+                        # Windows rename fails if a file appeared at the destination.
+                        os.rename(stage, destination)
+                    else:
+                        os.link(stage, destination)
+                        stage.unlink()
+                else:
+                    os.replace(stage, destination)
+        except OSError as exc:
+            try:
+                stage.unlink(missing_ok=True)
+            except OSError:
+                pass
+            if not isinstance(exc, PermissionError):
+                raise
+            if destination.is_file():
+                raise PermissionError(
+                    f'Could not replace {destination.name}. Close the PDF in your viewer or File Explorer preview, '
+                    'then try again. If it still fails, check write access to the PDF and its folder.') from exc
+            raise PermissionError(
+                f'Could not save {destination.name}. Check write access to the Certificates folder, then try again.') from exc
         self.data['state'] = 'published'
         self._save()
 
@@ -344,7 +411,12 @@ class IssuanceTransaction:
                 if file_digest(path) != old['sha256']:
                     raise ValueError('An older PDF changed outside this app. Both versions were preserved; ask IT to review them.')
                 # Recoverable retirement: move the old file only after source commit.
-                path.unlink()
+                try:
+                    path.unlink()
+                except PermissionError as exc:
+                    raise PermissionError(
+                        f'Could not archive {path.name}. Close the PDF in your viewer or File Explorer preview, '
+                        'then refresh to finish. If it still fails, check write access to the PDF and its folder.') from exc
         from certificate_inventory import record_issuance
         record_issuance(self.root, destination, self.data['cod'], self.data['source_kind'],
                         self.data['plant'], self.data['key'])
@@ -363,7 +435,7 @@ class IssuanceTransaction:
             if current != previous['sha256']:
                 stage = destination.with_name(f'.{self.id}.restore.pdf')
                 _replace_snapshot(self.folder / previous['snapshot'], destination, stage, previous['sha256'])
-        elif current == self.data['pdf_sha256']:
+        elif current == self.data['pdf_sha256'] and not self.data.get('retain_existing'):
             # Quarantine, not permanent deletion: retains the uncommitted output.
             quarantine = self.root / 'Data' / 'Archive' / 'Uncommitted Certificates' / self.id
             quarantine.mkdir(parents=True, exist_ok=True)

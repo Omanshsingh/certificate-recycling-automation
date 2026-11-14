@@ -21,9 +21,10 @@ def workspace_revision(root, file_overrides=None, *, force=False):
         paths.extend(path for path in sorted(folder.rglob('*')) if path.is_file() and not path.name.startswith('.'))
     result = hashlib.sha256()
     for path in dict.fromkeys(paths):
-        result.update(str(path).encode('utf-8'))
-        if file_overrides and str(path.resolve()) in file_overrides:
-            result.update(hashlib.sha256(file_overrides[str(path.resolve())]).digest())
+        name = str(path)
+        result.update(name.encode('utf-8'))
+        if file_overrides and name in file_overrides:
+            result.update(hashlib.sha256(file_overrides[name]).digest())
             continue
         try:
             from file_fingerprints import fingerprint
@@ -36,8 +37,8 @@ def workspace_revision(root, file_overrides=None, *, force=False):
     return result.hexdigest()
 
 
-def require_revision(root, expected, file_overrides=None):
-    if not isinstance(expected, str) or not expected or not hmac.compare_digest(workspace_revision(root, file_overrides, force=True), expected):
+def require_revision(root, expected, file_overrides=None, *, force=True):
+    if not isinstance(expected, str) or not expected or not hmac.compare_digest(workspace_revision(root, file_overrides, force=force), expected):
         raise ValueError('The files changed since you opened these details. Refresh Excel and review the current details before saving. Your entered details have not been saved.')
 
 

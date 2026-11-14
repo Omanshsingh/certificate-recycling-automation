@@ -38,6 +38,8 @@ def stage_followup(data, sn, values):
     if len(matches) != 1 or matches[0].get('duplicate_serial_number'):
         raise ValueError('This SN is missing or repeated. Check Excel, then refresh.')
     source = matches[0]
+    if all(key in source['column_mapping'] and source[key] == value for key, value in values.items()):
+        return data, source
     if any(key not in source['column_mapping'] for key in FIELDS):
         from register_column_order import normalize_register_columns
         data = normalize_register_columns(data)

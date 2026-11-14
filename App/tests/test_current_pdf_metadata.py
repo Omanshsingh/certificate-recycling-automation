@@ -97,7 +97,8 @@ class CurrentPdfMetadataTests(unittest.TestCase):
                     state = web_app.workspace_state()
                     rows = state['rows']
                     self.assertEqual([row['pdf_filename'] for row in rows], [workbook.name, manual.name])
-                    self.assertEqual([row['certificate_status'] for row in rows], [workbook_status, manual_status])
+                    expected_manual = 'generated' if manual_status == 'generated_manual' else manual_status
+                    self.assertEqual([row['certificate_status'] for row in rows], [workbook_status, expected_manual])
                     self.assertEqual(self.snapshot(), before)
                     # Validated row metadata also works with the unchanged success formatter.
                     outputs = web_app.certificate_outputs(rows)

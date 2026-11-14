@@ -35,8 +35,10 @@ from pypdf import PdfReader
 from openpyxl.utils.exceptions import InvalidFileException
 from certificate_inventory import scan_inventory, safe_certificate_path, ensure_certificate_folders, identity as cod_identity
 from workflow_support import run_lock
+from file_fingerprints import file_signature
 from issuance_safety import (recover_issuances, valid_pdf, file_digest, latest_issuance,
-                             audit_records, workbook_receipt_conflict)
+                             audit_records, workbook_receipt_conflict, current_pdf_is_healthy,
+                             manual_receipts)
 from workspace_review import workspace_revision, require_revision, reviewed_operation
 from backup_service import create_backup, list_backups, restore_backup
 from dashboard_review import DashboardReview
@@ -90,8 +92,11 @@ def merge_workbook_report(expected_revision, report, *, preserve_unmentioned=Fal
                       and (row.get('plant'), str(row.get('sn')).strip().casefold()) not in incoming_keys)
     merged.extend(copy.deepcopy(row) for row in previous_rows if row.get('source_kind') == 'manual')
     state['rows'] = merged
+    for key in ('refresh_pending', 'recovery_note'):
+        state.pop(key, None)
     for key in ('scan_complete', 'certificate_inventory', 'numbering', 'created', 'review',
-                'completed_at', 'as_of', 'run_id', 'maintenance_notes', 'setup_warning'):
+                'completed_at', 'as_of', 'run_id', 'maintenance_notes', 'setup_warning', 'refresh_pending',
+                'recovery_note'):
         if key in report:
             state[key] = copy.deepcopy(report[key])
     return state
@@ -265,11 +270,10 @@ def save_certificate_type_choice(body):
 def workbook_check_stamp(paths):
     """Cheap saved-file change detection for workbooks and certificate PDFs."""
     stamp = [('as_of', date.today().isoformat())]
-    for name in ('Custom Certificates.json', 'History Reset.json'):
-        tracked = ROOT / 'Data' / name
+    for tracked in (ROOT / 'Data' / 'Custom Certificates.json', ROOT / 'Data' / 'History Reset.json',
+                    ROOT / 'settings.local.json'):
         if tracked.exists():
-            stat = tracked.stat()
-            stamp.append(('tracking', name, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size))
+            stamp.append(('tracking', tracked.name, file_signature(tracked)))
     for path in paths:
         stat = path.stat()
         stamp.append(('workbook', str(path), stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size))
@@ -279,11 +283,10 @@ def workbook_check_stamp(paths):
             if not path.is_file() or path.suffix.casefold() != '.pdf' or path.name.startswith('.'):
                 continue
             try:
-                stat = path.stat()
+                signature = file_signature(path)
             except FileNotFoundError:
                 continue
-            stamp.append(('pdf', path.relative_to(ROOT).as_posix().casefold(),
-                          stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size))
+            stamp.append(('pdf', path.relative_to(ROOT).as_posix().casefold(), signature))
     return tuple(stamp)
 
 
@@ -296,11 +299,11 @@ def check_workbook_changes():
     try:
         paths = configured_paths()
         stamp = workbook_check_stamp(paths)
+        if WORKBOOK_CHECK_STAMPS.get(str(ROOT)) == stamp and reusable_workbook_report(latest_result()):
+            return {'changed': False}
     except (OSError, ValueError):
         WORKBOOK_CHECK_STAMPS.pop(str(ROOT), None)
         return {'changed': True, 'state': refresh()}
-    if WORKBOOK_CHECK_STAMPS.get(str(ROOT)) == stamp:
-        return {"changed": False}
     return {"changed": True, "state": refresh(paths)}
 
 
@@ -379,8 +382,8 @@ def add_client(body):
         row_batch = dict(batch, source_id=plant, source_path=str(path),
                          _effective_certificate_status=batch.get('issued', ''))
         report = Report(ROOT, date.today(), 'Add client', publish_latest=False)
-        report.add(row_batch, 'ready' if status_value(batch.get('issued')) == 'ready' else 'needs_review',
-                   'Client added to Excel.')
+        report.add_saved_inward(row_batch, 'ready' if status_value(batch.get('issued')) == 'ready' else 'needs_review',
+                               'Client added to Excel.')
         state = merge_added_workbook_row(expected, report.rows[0], state)
         try:
             latest = latest_result()
@@ -420,6 +423,14 @@ def latest_result():
     return value
 
 
+def reusable_workbook_report(report):
+    # A failed save or reminder can replace the report without changing the
+    # workbooks. A file can also become writable again without a timestamp change.
+    return (report.get('scan_complete') is True
+            and not report.get('refresh_pending')
+            and not any(row.get('workbook_read_only') for row in report['rows']))
+
+
 def refresh(paths=None, *, force=False):
     settings = load_settings(ROOT)
     if not any(value.strip() for value in settings['workbook_paths']):
@@ -442,7 +453,7 @@ def refresh(paths=None, *, force=False):
         stamp = workbook_check_stamp(paths)
         if (not force and WORKBOOK_CHECK_STAMPS.get(str(ROOT)) == stamp and RESULTS_PATH.is_file()):
             previous = latest_result()
-            if isinstance(previous.get('certificate_inventory'), dict):
+            if reusable_workbook_report(previous) and isinstance(previous.get('certificate_inventory'), dict):
                 state = workspace_state(recheck_obsolete=False, inventory=previous['certificate_inventory'])
                 state['already_up_to_date'] = True
                 return state
@@ -452,25 +463,24 @@ def refresh(paths=None, *, force=False):
     checked = {}
     run(paths, ROOT, check_only=True, progress=None, report_sink=checked)
     state = workspace_state(recheck_obsolete=False, inventory=checked.get('certificate_inventory'))
-    if state.get("scan_complete"):
+    if reusable_workbook_report(state):
         try:
-            if any(row.get('workbook_read_only') for row in state.get('rows', [])):
-                # Closing Excel need not change the file timestamp. Keep
-                # polling pending status/order writes until it releases access.
-                WORKBOOK_CHECK_STAMPS.pop(str(ROOT), None)
-            else:
-                WORKBOOK_CHECK_STAMPS[str(ROOT)] = workbook_check_stamp(paths)
+            WORKBOOK_CHECK_STAMPS[str(ROOT)] = workbook_check_stamp(paths)
         except OSError:
             WORKBOOK_CHECK_STAMPS.pop(str(ROOT), None)
             state['scan_complete'] = False
             state['setup_warning'] = 'An Excel file became unavailable while refreshing. Save and close it in Excel, check its path in Settings, then refresh again. No certificate was created.'
+    else:
+        WORKBOOK_CHECK_STAMPS.pop(str(ROOT), None)
     return state
 
 
 def disconnected_workbook_state(inventory=None):
+    from run_certificates import numbering_plan
     reset_path = ROOT / 'Data' / 'History Reset.json'
     inventory = inventory if inventory is not None else scan_inventory(ROOT)
     return {'rows': current_pdf_rows(manual_rows(ROOT)), 'scan_complete': False,
+            'numbering': numbering_plan([], load_settings(ROOT), ROOT / 'Certificates', inventory=inventory),
             'workbooks_disconnected': True, 'created': 0, 'review': 0,
             'certificate_inventory': add_certificate_type_choices(inventory),
             'certificate_folder': str(ROOT / 'Certificates'),
@@ -499,16 +509,18 @@ def workspace_state(recheck_obsolete=True, inventory=None):
             canonicalized = True
     if canonicalized and not refresh_pending:
         save_json(RESULTS_PATH, report)
+    inventory = inventory if isinstance(inventory, dict) else scan_inventory(ROOT)
+    history = audit_records(ROOT)
+    workbook_rows = [row for row in report['rows'] if row.get('source_kind') != 'manual']
+    rows = current_pdf_rows(workbook_rows + manual_rows(ROOT, history=history), inventory=inventory, history=history)
     if recheck_obsolete and not refresh_pending:
-        missing_pdf = any(
-            row.get('certificate_status') in {'generated', 'generated_manual', 'completed'}
-            and not find_certificate(ROOT / 'Certificates', {
-                'cod_no': row.get('certificate_no'), 'source_id': row.get('plant'), 'case_id': row.get('sn')})
-            for row in report.get('rows', []) if row.get('source_kind') != 'manual')
+        missing_pdf = any(row.get('certificate_status') in {'generated', 'generated_manual', 'completed'}
+                          and row.get('outcome') != 'needs_review' and not row.get('pdf_filename')
+                          for row in rows[:len(workbook_rows)])
         obsolete_template = any(
             obsolete_template_warning(row.get('detail', ''))
             or any(obsolete_template_warning(warning) for warning in (row.get('warnings') or []))
-            for row in report.get('rows', []) if row.get('source_kind') != 'manual')
+            for row in workbook_rows)
         if missing_pdf or obsolete_template:
             # Re-evaluate real data instead of just hiding the warning and leaving
             # stale attention flags (or incorrectly declaring the row valid).
@@ -517,10 +529,8 @@ def workspace_state(recheck_obsolete=True, inventory=None):
             return refresh(force=True)
     # Refresh already scanned and checked every saved PDF. Reuse that snapshot
     # when it is available instead of hashing the same files again.
-    report['certificate_inventory'] = add_certificate_type_choices(
-        inventory if isinstance(inventory, dict) else scan_inventory(ROOT))
-    report["rows"] = current_pdf_rows(
-        [row for row in report.get("rows", []) if row.get("source_kind") != "manual"] + manual_rows(ROOT))
+    report['certificate_inventory'] = add_certificate_type_choices(inventory)
+    report['rows'] = rows
     if refresh_pending:
         report['refresh_pending'] = True
     return report
@@ -538,16 +548,18 @@ def rebuild_history_state():
     return workspace_state(recheck_obsolete=False)
 
 
-def current_pdf_rows(rows):
+def current_pdf_rows(rows, *, inventory=None, history=None):
     """Add validated current filenames to response rows without saving tracking."""
     issued = {'generated', 'generated_manual', 'completed'}
     records = {record['id']: record for record in read_register(ROOT)['records']} if any(
         row.get('source_kind') == 'manual' and status_value(row.get('certificate_status')) in issued
         for row in rows) else {}
     folder = (ROOT / 'Certificates').resolve()
+    history = audit_records(ROOT) if history is None else history
     receipts = {(entry.get('source_kind'), entry.get('plant'),
                  str(entry.get('key')).strip().casefold() if entry.get('source_kind') == 'workbook' else str(entry.get('key'))): entry
-                for entry in audit_records(ROOT) if entry.get('state') == 'complete'}
+                for entry in history if entry.get('state') == 'complete'}
+    local_receipts = manual_receipts(ROOT, records.values(), history=history)
     result = []
     for original in rows:
         row = dict(original)
@@ -583,23 +595,23 @@ def current_pdf_rows(rows):
         result.append(row)
         if status_value(row.get('certificate_status')) not in issued:
             continue
-        source_kind = row.get('source_kind', 'workbook')
-        key = row.get('record_id') if source_kind == 'manual' else row.get('sn')
         try:
             if source_kind == 'manual':
                 record = records.get(key)
                 if not record or record.get('plant') != row.get('plant'):
                     continue
-                path = current_record_pdf(ROOT, record)
+                path = current_record_pdf(ROOT, record, receipt=local_receipts.get(key))
             else:
                 path = find_certificate(ROOT / 'Certificates', {
-                    'cod_no': row.get('certificate_no'), 'source_id': row.get('plant'), 'case_id': key})
+                    'cod_no': row.get('certificate_no'), 'source_id': row.get('plant'), 'case_id': key,
+                    'issued': row.get('certificate_status'), 'external_pdf': row.get('external_pdf')},
+                    inventory=inventory, receipt=receipt)
             if not isinstance(path, (str, os.PathLike)):
                 continue
             path = Path(path)
             current = path.resolve(strict=True)
             if (path.suffix.casefold() != '.pdf' or not current.is_relative_to(folder)
-                    or current.name != path.name or not valid_pdf(current)):
+                    or current.name != path.name):
                 continue
             relative = current.relative_to(folder).as_posix()
             if safe_certificate_path(ROOT, relative) != current:
@@ -609,8 +621,10 @@ def current_pdf_rows(rows):
                 if recorded.parts[:1] != ('Certificates',) or len(recorded.parts) < 2:
                     continue
                 receipt_path = safe_certificate_path(ROOT, Path(*recorded.parts[1:]).as_posix(), expected_sha=receipt.get('pdf_sha256'))
-                if current != receipt_path or file_digest(current) != receipt.get('pdf_sha256'):
+                if current != receipt_path:
                     continue
+            if not current_pdf_is_healthy(current, receipt.get('pdf_sha256') if receipt else None):
+                continue
             row['pdf_filename'] = path.name
             row['pdf_relative_path'] = current.relative_to(folder).as_posix()
         except (OSError, ValueError):
@@ -676,8 +690,6 @@ def workbook_form(body, details, paths, *, saving=False):
         raise ValueError(f'Serial Number {selected[1]} is repeated in Excel rows {rows}. '
                          'Open the workbook and give each record a different Serial Number before creating a certificate.')
     source = next(iter(matches), None)
-    if source and supplier_is_always_not_applicable(source.get('supplier')):
-        raise ValueError('This inward is marked N/A and cannot be issued a certificate.')
     if body.get('expected_revision') is not None:
         require_revision(ROOT, body['expected_revision'])
     if source is None:
@@ -694,6 +706,8 @@ def workbook_form(body, details, paths, *, saving=False):
         return details, body.get('edit_scope', 'update_excel')
     if body.get('create_new'):
         raise ValueError('This Serial Number is already used in this plant. Choose the company from the list to edit it, or enter a different Serial Number.')
+    if status_value(source.get('issued')) == 'na':
+        raise ValueError('This inward is marked N/A and cannot be issued a certificate.')
     details['case_id'] = source['case_id']
     receipt = latest_issuance(ROOT, 'workbook', *selected)
     conflict = workbook_receipt_conflict(source, receipt)
@@ -961,6 +975,17 @@ def target_row(report, selected):
                  and str(row.get("sn", "")) == selected[1]), None)
 
 
+def workbook_check_error(report):
+    problems = [row for row in report.get('rows', []) if row.get('source_kind') == 'system' and row.get('detail')]
+    source_problem = next((row for row in problems if row.get('issue_code') == 'source_unavailable'
+                           and row.get('plant') in {'plant1', 'plant2'}), None)
+    if source_problem:
+        return source_problem['detail']
+    if problems:
+        return problems[0]['detail']
+    return 'Both plant files must be checked before creating a certificate. Refresh and review the workbook message.'
+
+
 def open_selected_workbook_record(plant, case_id, source_sheet=None, source_row=None):
     """Select a unique live record, or open its workbook for manual repair."""
     selected = selected_key(plant, case_id)
@@ -1089,8 +1114,7 @@ def generate(*, selected=None, plants=None, confirmed=False, expected_revision=N
     run(paths, ROOT, **preflight_args)
     preflight = preflight or latest_result()
     if not preflight.get('scan_complete'):
-        error = next((row.get('detail') for row in preflight.get('rows', []) if row.get('source_kind') == 'system'), None)
-        raise ValueError(error or 'Both plant files must be checked before creating a certificate. Refresh and review the workbook message.')
+        raise ValueError(workbook_check_error(preflight))
     eligible = [row for row in preflight.get('rows', [])
                 if row.get('certificate_status') == 'ready' and row.get('outcome') == 'ready'
                 and not row.get('issuance_blocked')]
@@ -1098,7 +1122,8 @@ def generate(*, selected=None, plants=None, confirmed=False, expected_revision=N
         for key in selected_keys:
             target = target_row(preflight, key)
             if target is None or target not in eligible:
-                raise ValueError(f'SN {key[1]} in {key[0].replace("plant", "Plant ")} is no longer ready. Refresh the list and choose the certificates again.')
+                detail = (target or {}).get('detail') or 'Refresh the list and choose the certificates again.'
+                raise ValueError(f'SN {key[1]} in {key[0].replace("plant", "Plant ")} is not ready. {detail}')
         eligible = [row for row in eligible if (row.get('plant'), str(row.get('sn'))) in selected_keys]
     if selected:
         target = target_row(preflight, selected)
@@ -1132,17 +1157,32 @@ def generate(*, selected=None, plants=None, confirmed=False, expected_revision=N
         arguments["plants"] = plants
     result = run(paths, ROOT, **arguments)
     generated_report = generated_report or latest_result()
-    generated_rows = {
-        (row.get("plant"), str(row.get("sn"))): row
-        for row in generated_report.get("rows", [])
-        if row.get("outcome") == "generated_now"
-    }
+    if not result[0] and not generated_report.get('scan_complete'):
+        WORKBOOK_CHECK_STAMPS.pop(str(ROOT), None)
+        raise ValueError(workbook_check_error(generated_report))
+    rows = generated_report.get('rows', [])
+    reported_rows = {(row.get('plant'), str(row.get('sn'))): row for row in rows}
+    generated_rows = {(row.get('plant'), str(row.get('sn'))): row for row in rows
+                      if row.get('outcome') == 'generated_now'}
+    unissued = []
+    for row in eligible:
+        key = (row.get('plant'), str(row.get('sn')))
+        if key not in generated_rows:
+            detail = reported_rows.get(key, {}).get('detail')
+            if not detail and generated_report.get('refresh_pending'):
+                detail = 'The batch stopped while finishing an earlier certificate. Refresh before retrying.'
+            unissued.append({'plant': key[0], 'sn': key[1], 'supplier': row.get('supplier'),
+                             'detail': detail or 'This certificate was not created. Refresh the list and review this company.'})
     partial_selection = selected is not None or selected_keys is not None or plants is not None
     state = merge_workbook_report(expected_revision, generated_report, preserve_unmentioned=partial_selection)
     if state is None:
+        WORKBOOK_CHECK_STAMPS.pop(str(ROOT), None)
         state = post_commit_state(lambda: refresh(paths))
-    else:
+    elif not unissued:
         remember_workbook_stamp()
+    else:
+        # The last issuance report is an outcome, not a fresh check of what can be retried.
+        WORKBOOK_CHECK_STAMPS.pop(str(ROOT), None)
     for row in state.get("rows", []):
         generated_row = generated_rows.get((row.get("plant"), str(row.get("sn"))))
         if generated_row:
@@ -1155,9 +1195,10 @@ def generate(*, selected=None, plants=None, confirmed=False, expected_revision=N
         try:
             save_json(RESULTS_PATH, state)
         except OSError:
-            state['setup_warning'] = 'The PDFs were created. Refresh to reload the full company list.'
+            WORKBOOK_CHECK_STAMPS.pop(str(ROOT), None)
+            state['setup_warning'] = 'Refresh to reload the full company list.'
     return {"requires_confirmation": False, "state": state,
-            "created": result[0], "review": result[1],
+            "created": result[0], "review": result[1], "unissued": unissued,
             'warnings': [state['setup_warning']] if state.get('setup_warning') else [],
             'certificates': certificate_outputs(list(generated_rows.values()))}
 
@@ -1205,8 +1246,7 @@ def create_certificate(body):
     run(paths, ROOT, check_only=True, read_only_preflight=True, **arguments)
     preflight = dict(snapshot) if snapshot else latest_result()
     if not preflight.get('scan_complete'):
-        error = next((row.get('detail') for row in preflight.get('rows', []) if row.get('source_kind') == 'system'), None)
-        raise ValueError(error or 'Both plant files must be checked before creating a certificate.')
+        raise ValueError(workbook_check_error(preflight))
     row = target_row(preflight, selected)
     if row is None:
         error = next((item.get('detail') for item in preflight.get('rows', []) if item.get('system_alert')), None)
@@ -1225,6 +1265,10 @@ def create_certificate(body):
     final_report = snapshot or latest_result()
     final_row = target_row(final_report, selected)
     if not result[0]:
+        # A scoped run may have replaced the checked list with just its error.
+        WORKBOOK_CHECK_STAMPS.pop(str(ROOT), None)
+        if not final_report.get('scan_complete'):
+            raise ValueError(workbook_check_error(final_report))
         raise ValueError((final_row or {}).get('detail') or 'The certificate could not be created. Excel details were not saved.')
     if scope == 'remove_excel':
         state = post_commit_state(rebuild_history_state)
@@ -1233,14 +1277,20 @@ def create_certificate(body):
         return {'requires_confirmation': False, 'state': state, 'created': result[0], 'review': result[1],
                 'record_id': identifier, 'certificates': certificate_outputs([local_row] if local_row else []),
                 'warnings': [state['setup_warning']] if state.get('setup_warning') else []}
-    state = merge_workbook_report(body.get('expected_revision'), final_report)
+    state = merge_workbook_report(body.get('expected_revision'), final_report, preserve_unmentioned=True)
     if state is None:
         # Save any companion HDD request against the current SN before a
         # date-order refresh can reassign that SN to another inward.
         state = (post_commit_state(lambda: workspace_state(recheck_obsolete=False), fallback_state=final_report)
                  if date_changed else post_commit_state(lambda: refresh(paths)))
     else:
-        remember_workbook_stamp()
+        try:
+            save_json(RESULTS_PATH, state)
+        except OSError:
+            WORKBOOK_CHECK_STAMPS.pop(str(ROOT), None)
+            state['setup_warning'] = 'The PDF was created. Refresh to reload the full company list.'
+        else:
+            remember_workbook_stamp()
     state_row = target_row(state, selected)
     if state_row and final_row:
         state_row['detail'] = final_row['detail'] + (' Certificate-only changes: original inward details were kept.'
@@ -1248,7 +1298,10 @@ def create_certificate(body):
         state_row['warnings'] = final_row.get('warnings', [])
     state = save_requested_destruction(body, state)
     if date_changed:
+        warning = state.get('setup_warning')
         state = post_commit_state(lambda: refresh(paths, force=True), fallback_state=state)
+        if warning and warning != state.get('setup_warning'):
+            state['setup_warning'] = ' '.join(filter(None, [warning, state.get('setup_warning')]))
         if final_row:
             current = next((row for row in state.get('rows', [])
                             if row.get('source_kind') == 'workbook' and row.get('plant') == plant
@@ -1264,17 +1317,20 @@ def save_requested_destruction(body, state):
     """Mark a separate HDD task after a successful save, without issuing a PDF."""
     if not isinstance(body.get('data_destruction_needed'), bool):
         return state
-    local = None
-    if body.get('source_kind') == 'manual':
-        local = next((record for record in read_register(ROOT)['records']
-                      if record['id'] == body.get('record_id') and record.get('removed_inward')), None)
-        if local is None:
-            return state
-    source_sn = body.get('source_sn') or (body.get('details') or {}).get('case_id')
     try:
+        local = None
+        if body.get('source_kind') == 'manual':
+            local = next((record for record in read_register(ROOT)['records']
+                          if record['id'] == body.get('record_id')
+                          and record['details'].get('certificate_type') != 'destruction'), None)
+            if local is None:
+                return state
+        source_sn = body.get('source_sn') or (body.get('details') or {}).get('case_id')
         if body['data_destruction_needed'] is False:
             link = {'plant': body.get('plant'), 'case_id': str(source_sn or '')} if local is None else {
-                'plant': local['plant'], 'case_id': str(local['removed_inward']['case_id']), 'record_id': local['id']}
+                'plant': None, 'case_id': str((local.get('removed_inward') or {}).get('case_id')
+                                              or local['details'].get('case_id') or local['id']),
+                'record_id': local['id']}
             if not any(record.get('destruction_requested', True)
                        and record['details'].get('destruction_source') == link
                        for record in read_register(ROOT)['records']):
@@ -1286,7 +1342,8 @@ def save_requested_destruction(body, state):
             record_id=local['id'] if local else None)
         return (merge_manual_record_state(None, identifier, state) or state) if identifier else state
     except (OSError, ValueError) as exc:
-        state['setup_warning'] = f'Your changes were saved, but the Data Destruction request could not be updated: {exc}. Open Review & edit to try again.'
+        state['setup_warning'] = ('Your changes were saved, but the Data Destruction request could not be updated. '
+                                  f'Open Review & edit, set Data Destruction also needed, then choose Save request. Details: {exc}')
         return state
 
 
@@ -1304,17 +1361,17 @@ def save_inward_changes(body):
     path = paths[int(plant[-1]) - 1]
     with run_lock(ROOT):
         recover_issuances(ROOT)
-        require_revision(ROOT, body.get('expected_revision'))
         with WorkbookSession(path, BACKUP_DIR) as session:
             overrides = {str(path.resolve()): session.data}
-            require_revision(ROOT, body.get('expected_revision'), overrides)
+            require_revision(ROOT, body.get('expected_revision'), overrides, force=False)
             matches = [row for row in read_batches(BytesIO(session.data)) if row['case_id'] == sn]
             if len(matches) != 1 or matches[0].get('duplicate_serial_number'):
                 raise ValueError('The inward’s SN is missing or repeated. Check Excel, then refresh.')
             source = matches[0]
-            if latest_issuance(ROOT, 'workbook', plant, sn) or status_value(source.get('issued')) in {'generated', 'generated_manual', 'completed'}:
+            current_status = status_value(source.get('issued'))
+            if latest_issuance(ROOT, 'workbook', plant, sn) or current_status in {'generated', 'generated_manual', 'completed'}:
                 raise ValueError('This certificate already has a PDF. Save a corrected PDF to update its Excel details too.')
-            if status_value(source.get('issued')) not in {'blank', 'alert', 'ready'}:
+            if current_status not in {'blank', 'alert', 'ready', 'na'}:
                 raise ValueError('Check this inward’s status in Excel before saving changes.')
             if (details['certificate_type'] in {'sita', 'siemens'}
                     and details['certificate_type'] != source.get('certificate_type', 'standard')):
@@ -1322,9 +1379,10 @@ def save_inward_changes(body):
             details['cod_no'], details['cod_date'] = source.get('cod_no', ''), source.get('cod_date', '')
             if not body.get('use_certificate_weight'):
                 details.pop('certificate_weight', None)
-            updated, saved = stage_certificate_details(session, details)
-            ready = inward_details_complete(saved)
-            if not ready:
+            no_certificate = current_status == 'na' or supplier_is_always_not_applicable(details.get('supplier'))
+            updated, saved = stage_certificate_details(session, details, inward_status='N/A' if no_certificate else 'Ready')
+            ready = not no_certificate and inward_details_complete(saved)
+            if not no_certificate and not ready:
                 from workbook_store import _set_cell, _sheet_member
                 from zipfile import ZipFile
                 with ZipFile(BytesIO(updated)) as archive:
@@ -1351,7 +1409,9 @@ def save_inward_changes(body):
             session._persist(updated)
     row_batch = dict(saved, source_id=plant, source_path=str(path), _effective_certificate_status=saved['issued'])
     report = Report(ROOT, date.today(), 'Edit inward', publish_latest=False)
-    report.add(row_batch, 'ready' if ready else 'needs_review', 'Changes saved to Excel. No PDF has been created.')
+    outcome = 'not_applicable' if no_certificate else 'ready' if ready else 'needs_review'
+    report.add_saved_inward(row_batch, outcome,
+                           'Changes saved to Excel. No PDF has been created.')
     state = cached_workspace_state(body.get('expected_revision'))
     if state is not None:
         apply_inward_number_changes(state, plant, serial_changes, saved_batches)
@@ -1370,6 +1430,174 @@ def save_inward_changes(body):
     return {'saved': True, 'created': 0, 'state': state, 'sn': saved['case_id']}
 
 
+def update_inward_status(body):
+    action = body.get('action')
+    if action not in {'mark_na', 'undo_na'}:
+        raise ValueError('Choose Mark N/A or Undo N/A.')
+    revision = body.get('expected_revision')
+    if body.get('record_id'):
+        from certificate_drafts import _manual_record_issued, _manual_status, write_register
+        record_id = body['record_id']
+        with run_lock(ROOT):
+            recover_issuances(ROOT)
+            require_revision(ROOT, revision)
+            register = read_register(ROOT)
+            record = next((item for item in register['records'] if item['id'] == record_id), None)
+            if not record or _manual_record_issued(ROOT, record) or record.get('pdf_recovery_pending'):
+                raise ValueError('Choose an unissued local certificate record.')
+            current = _manual_status(record.get('status'))
+            if action == 'mark_na' and current in {'blank', 'draft', 'ready', 'alert'}:
+                record.update(status='na', status_before_na=current)
+                target = 'N/A'
+            elif action == 'undo_na' and current == 'na':
+                previous = record.pop('status_before_na', None)
+                record['status'] = previous if previous in {'blank', 'draft', 'ready', 'alert'} else 'ready'
+                target = {'blank':'No status selected', 'draft':'Draft', 'ready':'Ready', 'alert':'Alert'}[record['status']]
+            else:
+                raise ValueError('The local certificate status has changed. Refresh and try again.')
+            record['updated_at'] = datetime.now().isoformat()
+            write_register(ROOT, register)
+        state = merge_manual_record_state(revision, record_id)
+        return {'saved': True, 'status': target, 'state': state if state is not None else post_commit_state(workspace_state)}
+    plant, sn = selected_key(body.get('plant'), body.get('sn'))
+    path = configured_paths(allow_unavailable=True)[int(plant[-1]) - 1]
+    with run_lock(ROOT):
+        recover_issuances(ROOT)
+        with WorkbookSession(path, BACKUP_DIR) as session:
+            overrides = {str(path): session.data}
+            require_revision(ROOT, revision, overrides, force=False)
+            source = _selected_inward(session, sn)
+            status = status_value(source['issued'])
+            if (source.get('pdf_recovery_pending') or
+                    source.get('external_pdf') or latest_issuance(ROOT, 'workbook', plant, sn)):
+                raise ValueError('An existing certificate is linked to this inward. Review its certificate before changing this status.')
+            if action == 'mark_na':
+                if status not in {'blank', 'alert', 'ready'}:
+                    raise ValueError('Only an unissued inward can be marked N/A.')
+                target = 'N/A'
+            else:
+                if status != 'na':
+                    raise ValueError('This inward is no longer marked N/A. Refresh and try again.')
+                if supplier_is_always_not_applicable(source.get('supplier')):
+                    raise ValueError('This company is always marked N/A. Correct the company name first if it was entered by mistake.')
+                target = 'Ready' if inward_details_complete(source) else 'Alert'
+            session.before_persist = lambda _: require_revision(ROOT, revision, overrides)
+            session.set_issued_status(source['case_id'], source['source_sheet'], source['source_row'],
+                                      source['cod_no'], source['issued'], target)
+    fresh = Report(ROOT, date.today(), 'Update inward status', publish_latest=False)
+    fresh.add_saved_inward(dict(source, source_id=plant, source_path=str(path), issued=target),
+                          {'N/A':'not_applicable', 'Ready':'ready', 'Alert':'needs_review'}[target],
+                          f'Excel status saved as {target}.')
+    state = cached_workspace_state(revision)
+    if state is not None and not source.get('blocking_issues') and reusable_workbook_report(state):
+        try:
+            report = latest_result()
+            if (reusable_workbook_report(report) and target_row(report, (plant, sn))
+                    and target_row(state, (plant, sn))):
+                for snapshot in (state, report):
+                    row = target_row(snapshot, (plant, sn))
+                    row.update(copy.deepcopy(fresh.rows[0]))
+                    if not fresh.rows[0].get('system_alert'):
+                        row.pop('system_alert', None)
+                # Recheck issuance eligibility in the next background refresh.
+                if target == 'Ready':
+                    WORKBOOK_CHECK_STAMPS.pop(str(ROOT), None)
+                save_json(RESULTS_PATH, report)
+                if target != 'Ready':
+                    remember_workbook_stamp()
+                return {'saved': True, 'status': target, 'state': state}
+        except (OSError, ValueError):
+            pass
+    return {'saved': True, 'status': target, 'state': post_commit_state(
+        refresh, saved_message=f'Excel status saved as {target}',
+        fallback_state=state or {'rows':fresh.rows, 'scan_complete':False})}
+
+
+def _selected_inward(session, sn):
+    matches = [batch for batch in read_batches(BytesIO(session.data))
+               if text(batch['case_id']).casefold() == sn.casefold()]
+    if len(matches) != 1 or matches[0].get('duplicate_serial_number'):
+        raise ValueError('The inward’s SN is missing or repeated. Check Excel, then refresh.')
+    return matches[0]
+
+
+def link_external_certificate(body):
+    from certificate_inventory import is_external_path
+
+    plant, sn = selected_key(body.get('plant'), body.get('sn'))
+    revision = body.get('expected_revision')
+    digest = body.get('sha256')
+    path = safe_certificate_path(ROOT, body.get('relative_path'))
+    relative = path.relative_to((ROOT / 'Certificates').resolve()).as_posix()
+    issued_date = parse_date(body.get('certificate_date'))
+    if not issued_date or issued_date > date.today():
+        raise ValueError('Enter the certificate’s issue date. It cannot be in the future.')
+    paths = configured_paths()
+    workbook = paths[int(plant[-1]) - 1]
+    with run_lock(ROOT):
+        recover_issuances(ROOT)
+        require_revision(ROOT, revision)
+        inventory = scan_inventory(ROOT)
+        entry = next((item for item in inventory['entries']
+                      if item.get('present') and item['path'] == f'Certificates/{relative}'), None)
+        if (not is_external_path(relative) or not entry or entry.get('managed_owner')
+                or not valid_pdf(path) or not digest or entry.get('sha256') != digest):
+            raise ValueError('Choose a current external PDF from Saved certificates.')
+        saved_type = certificate_type_choices().get(digest)
+        if saved_type == 'destruction' or (not saved_type and re.search(r'_hdd\.pdf$', path.name, re.I)):
+            raise ValueError('This is a Data Destruction PDF. Keep it under Saved certificates with its own certificate number.')
+        cods = {cod_identity(value) for value in entry.get('current_cods', [])}
+        if len(cods) != 1:
+            raise ValueError('The PDF needs one identifiable certificate number. Check the printed number and filename.')
+        cod = entry['current_cods'][0]
+        if any(item.get('present') and item.get('sha256') != digest and
+               cod_identity(cod) in {cod_identity(value) for value in item.get('current_cods', [])}
+               for item in inventory['entries']):
+            raise ValueError(f'COD {cod} appears on another PDF. Resolve the duplicate before linking.')
+        with WorkbookSession(workbook, BACKUP_DIR) as session:
+            overrides = {str(workbook): session.data}
+            require_revision(ROOT, revision, overrides)
+            source = _selected_inward(session, sn)
+            status = status_value(source['issued'])
+            if (status not in {'blank', 'alert', 'ready', 'generated_manual'} or source.get('pdf_recovery_pending')
+                    or latest_issuance(ROOT, 'workbook', plant, sn)):
+                raise ValueError('Choose an unissued inward or one marked Generated Externally.')
+            if source['cod_no'] and cod_identity(source['cod_no']) != cod_identity(cod):
+                raise ValueError(f'This inward already has COD {source["cod_no"]}. Check the PDF and Excel before linking.')
+            from identifier_rules import workspace_batches
+            batches = workspace_batches(ROOT, overrides)
+            if any(cod_identity(row.get('hdd_cod_no')) == cod_identity(cod) for row in batches):
+                raise ValueError(f'COD {cod} is already assigned to a Data Destruction certificate.')
+            conflict = workbook_cod_ownership_issue(dict(source, source_id=plant, cod_no=cod),
+                                                     batches, read_register(ROOT)['records'])
+            if conflict:
+                raise ValueError(conflict)
+            external = {'cod': source['cod_no'] or cod, 'date': issued_date,
+                        'link': {'path': relative, 'sha256': digest}}
+            session.before_persist = lambda _: require_revision(ROOT, revision, overrides)
+            session.set_issued_status(source['case_id'], source['source_sheet'], source['source_row'],
+                                      source['cod_no'], source['issued'], 'Generated Externally', external=external)
+    fresh = Report(ROOT, date.today(), 'Link external certificate', publish_latest=False)
+    fresh.add(dict(source, source_id=plant, source_path=str(workbook), issued='Generated Externally',
+                   cod_no=external['cod'], cod_date=issued_date, external_pdf=external['link']),
+              'generated_manual', f'COD {external["cod"]} was linked to the external PDF.')
+    row = fresh.rows[0]
+    row.update(pdf_filename=path.name, pdf_relative_path=relative, has_issued_certificate=True)
+    fallback = merge_added_workbook_row(revision, row) or {'rows':fresh.rows, 'scan_complete':False}
+    return {'saved': True, 'state': post_commit_state(
+        refresh, saved_message='External certificate linked', fallback_state=fallback)}
+
+
+def save_uploaded_certificate(body):
+    from external_certificate_upload import save_upload
+    result = save_upload(ROOT, BACKUP_DIR, body)
+    WORKBOOK_CHECK_STAMPS.pop(str(ROOT), None)
+    result['state'] = post_commit_state(refresh, saved_message='External certificate saved')
+    if result['recovery_note']:
+        result['state'].update(refresh_pending=True, recovery_note=result['recovery_note'])
+    return result
+
+
 def save_inward_followup(body):
     """Save transport/office details even after completion, without issuing a PDF."""
     from inward_followup import clean_followup, stage_followup
@@ -1380,19 +1608,23 @@ def save_inward_followup(body):
     path = configured_paths(allow_unavailable=True)[int(plant[-1]) - 1]
     with run_lock(ROOT):
         recover_issuances(ROOT)
-        require_revision(ROOT, body.get('expected_revision'))
         with WorkbookSession(path, BACKUP_DIR) as session:
             overrides = {str(path.resolve()): session.data}
-            require_revision(ROOT, body.get('expected_revision'), overrides)
+            require_revision(ROOT, body.get('expected_revision'), overrides, force=False)
             updated, saved = stage_followup(session.data, sn, values)
             session.before_persist = lambda _: require_revision(ROOT, body.get('expected_revision'), overrides)
             if updated != session.data:
                 session._persist(updated)
+            else:
+                require_revision(ROOT, body.get('expected_revision'), overrides)
+                state = cached_workspace_state(body.get('expected_revision'))
+                if state is not None and not isinstance(body.get('data_destruction_needed'), bool):
+                    return {'saved': True, 'created': 0, 'state': state}
     status = status_value(saved.get('issued'))
     report = Report(ROOT, date.today(), 'Inward details', publish_latest=False)
-    report.add(dict(saved, source_id=plant, source_path=str(path)),
-               'already_issued' if status in {'generated', 'generated_manual', 'completed'} else 'ready',
-               'Inward details saved to Excel.')
+    report.add_saved_inward(dict(saved, source_id=plant, source_path=str(path)),
+                           'already_issued' if status in {'generated', 'generated_manual', 'completed'} else 'ready',
+                           'Inward details saved to Excel.')
     fresh = report.rows[0]
 
     def merge_followup(state):
@@ -1572,6 +1804,11 @@ def open_certificate_locally(relative_path, *, reveal=True, open_document=True):
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "EcorecoLocal/1.0"
+    ASSETS = {"/": ("index.html", "text/html; charset=utf-8"),
+              "/analytics.css": ("analytics.css", "text/css; charset=utf-8"),
+              "/analytics.js": ("analytics.js", "text/javascript; charset=utf-8"),
+              "/styles.css": ("styles.css", "text/css; charset=utf-8"),
+              "/app.js": ("app.js", "text/javascript; charset=utf-8")}
 
     def log_message(self, _format, *_args):
         return
@@ -1608,11 +1845,28 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json({"error": operation_error_message(exc)}, status)
 
     def do_GET(self):
-        if urlsplit(self.path).path == '/api/dashboard-review':
+        path = urlsplit(self.path).path
+        if path == '/api/dashboard-review':
             self.send_json({'application':'ecoreco-certificates', 'changed':False})
+            return
+        if path in self.ASSETS:
+            self.send_asset(*self.ASSETS[path])
             return
         with OPERATION_LOCK:
             self._do_get()
+
+    def send_asset(self, name, mime):
+        try:
+            payload = (WEB_ROOT / name).read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", mime)
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(payload)
+        except OSError as exc:
+            self.send_error_json(exc, 500)
 
     def _do_get(self):
         path = urlsplit(self.path).path
@@ -1632,6 +1886,7 @@ class Handler(BaseHTTPRequestHandler):
                         "reminders_enabled": settings["reminders_enabled"],
                         "reminder_time": settings["reminder_time"],
                         'backup_destination': settings.get('backup_destination', ''),
+                        **({'next_cod': settings['next_cod']} if settings.get('next_cod') is not None else {}),
                     },
                     "certificate_folder": str(ROOT / "Certificates"),
                     "server_time": datetime.now().isoformat(timespec="minutes"),
@@ -1643,7 +1898,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/templates":
             try:
                 from pdf_attachments import attachment_catalog
-                self.send_json({"templates": template_specs(), 'annexures': attachment_catalog(ROOT)})
+                self.send_json({"templates": template_specs(), 'annexures': attachment_catalog(ROOT), 'changed': False})
             except Exception as exc:
                 self.send_error_json(exc, 500)
             return
@@ -1730,27 +1985,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(payload)
             return
 
-        assets = {"/": ("index.html", "text/html; charset=utf-8"),
-                  "/analytics.css": ("analytics.css", "text/css; charset=utf-8"),
-                  "/analytics.js": ("analytics.js", "text/javascript; charset=utf-8"),
-                  "/styles.css": ("styles.css", "text/css; charset=utf-8"),
-                  "/app.js": ("app.js", "text/javascript; charset=utf-8")}
-        asset = assets.get(path)
-        if not asset:
-            self.send_error(404)
-            return
-        name, mime = asset
-        try:
-            payload = (WEB_ROOT / name).read_bytes()
-            self.send_response(200)
-            self.send_header("Content-Type", mime)
-            self.send_header("Content-Length", str(len(payload)))
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("X-Content-Type-Options", "nosniff")
-            self.end_headers()
-            self.wfile.write(payload)
-        except OSError as exc:
-            self.send_error_json(exc, 500)
+        self.send_error(404)
 
     def do_POST(self):
         if urlsplit(self.path).path in {'/api/dashboard-presence', '/api/dashboard-review'}:
@@ -1774,6 +2009,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             length = int(self.headers.get("Content-Length", "0"))
+            if parsed.path == '/api/certificates/upload-file':
+                from external_certificate_upload import UPLOAD_LIMIT, stage_upload
+                if not 0 < length <= UPLOAD_LIMIT or self.headers.get('Content-Type') != 'application/pdf':
+                    raise ValueError('Choose a PDF smaller than 50 MB.')
+                payload = self.rfile.read(length)
+                if len(payload) != length:
+                    raise ValueError('The upload was interrupted. Choose the PDF again.')
+                self.send_json(stage_upload(ROOT, payload))
+                return
             if length < 0 or length > 1_000_000:
                 raise ValueError("The request is too large.")
             body = json.loads(self.rfile.read(length) or b"{}")
@@ -1796,9 +2040,10 @@ class Handler(BaseHTTPRequestHandler):
                     "reminders_enabled": settings["reminders_enabled"],
                     "reminder_time": settings["reminder_time"],
                     'backup_destination': settings.get('backup_destination', ''),
+                    **({'next_cod': settings['next_cod']} if settings.get('next_cod') is not None else {}),
                 }})
             elif parsed.path == "/api/preview":
-                self.send_json(preview_certificate(body))
+                self.send_json(dict(preview_certificate(body), changed=False))
             elif parsed.path == '/api/certificate-type':
                 kind = save_certificate_type_choice(body)
                 self.send_json({'saved': True, 'certificate_type': kind, 'changed': False})
@@ -1806,6 +2051,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(add_client(body))
             elif parsed.path == '/api/clients/update':
                 self.send_json(save_inward_changes(body))
+            elif parsed.path == '/api/clients/status':
+                self.send_json(update_inward_status(body))
+            elif parsed.path == '/api/certificates/link-external':
+                self.send_json(link_external_certificate(body))
+            elif parsed.path == '/api/certificates/save-upload':
+                self.send_json(save_uploaded_certificate(body))
             elif parsed.path == '/api/clients/followup':
                 self.send_json(save_inward_followup(body))
             elif parsed.path in {'/api/entries/delete-preview', '/api/entries/delete'}:
@@ -1823,12 +2074,14 @@ class Handler(BaseHTTPRequestHandler):
                     result['state'] = post_commit_state(rebuild_history_state, saved_message='Inward removed from Excel')
                 self.send_json(result)
             elif parsed.path == '/api/destruction/request':
-                require_revision(ROOT, body.get('expected_revision'))
+                expected = body.get('expected_revision')
+                if not isinstance(expected, str) or not expected:
+                    require_revision(ROOT, expected)
                 from destruction_certificate import request_for_inward
-                identifier = request_for_inward(ROOT, body.get('plant'), body.get('sn'), body.get('expected_revision'),
+                identifier = request_for_inward(ROOT, body.get('plant'), body.get('sn'), expected,
                     needed=body.get('needed', True), confirmed=body.get('confirmed') is True,
                     record_id=body.get('record_id'))
-                state = merge_manual_record_state(body.get('expected_revision'), identifier)
+                state = merge_manual_record_state(expected, identifier)
                 self.send_json({'record_id': identifier, 'state': state if state is not None else post_commit_state(
                     workspace_state, saved_message='Data destruction request saved')})
             elif parsed.path == "/api/manual/save":
@@ -1845,8 +2098,12 @@ class Handler(BaseHTTPRequestHandler):
                     confirmed=bool(values.get('confirmed')), override_reason=values.get('override_reason', ''),
                     expected_revision=values.get('expected_revision'), starting_cod=values.get('starting_cod')))
                 if response.get('created'):
-                    state = None if response.get('workbook_updated') else merge_manual_record_state(body.get('expected_revision'), response.get('record_id'))
-                    response['state'] = state if state is not None else post_commit_state(workspace_state)
+                    response['state'] = post_commit_state(lambda: (
+                        None if response.get('workbook_updated') else
+                        merge_manual_record_state(body.get('expected_revision'), response.get('record_id'))
+                    ) or workspace_state())
+                    if response.get('recovery_note'):
+                        response['state'].update(refresh_pending=True, recovery_note=response['recovery_note'])
                     response['state'] = save_requested_destruction(dict(body, record_id=response.get('record_id')), response['state'])
                 else:
                     response['state'] = cached_workspace_state(body.get('expected_revision')) or workspace_state()
@@ -2016,6 +2273,22 @@ class Handler(BaseHTTPRequestHandler):
                         raise ValueError("Reminder enabled must be on or off.")
                     settings.update(workbook_paths=[str(path) if path is not None else '' for path in resolved],
                                     reminder_time=reminder_time, reminders_enabled=enabled)
+                    if 'next_cod' in body:
+                        from certificate_core import certificate_number
+                        from certificate_drafts import numbering_sources
+                        from run_certificates import numbering_plan, starting_cod_sequence
+                        raw_cod = body['next_cod']
+                        if raw_cod is None or raw_cod == '':
+                            settings.pop('next_cod', None)
+                        else:
+                            next_cod = starting_cod_sequence(raw_cod)
+                            if next_cod != settings.get('next_cod'):
+                                batches, _ = numbering_sources(ROOT, settings)
+                                plan = numbering_plan(batches, settings, ROOT / 'Certificates')
+                                if next_cod < plan['minimum_sequence']:
+                                    earliest = certificate_number(plan['minimum_sequence'], settings)
+                                    raise ValueError(f'Choose COD {earliest} or higher. Earlier numbers are reserved.')
+                                settings['next_cod'] = next_cod
                     save_json(ROOT / "settings.local.json", settings)
                     WORKBOOK_CHECK_STAMPS.pop(str(ROOT), None)
                 message = "Settings saved."
@@ -2046,6 +2319,7 @@ class Handler(BaseHTTPRequestHandler):
                     "workbook_paths": settings["workbook_paths"],
                     "reminders_enabled": enabled, "reminder_time": reminder_time,
                     'backup_destination': settings.get('backup_destination', ''),
+                    **({'next_cod': settings['next_cod']} if settings.get('next_cod') is not None else {}),
                 }, "message": message, **reminder_feedback})
             elif parsed.path == '/api/backup/pick-destination':
                 import tkinter as tk
