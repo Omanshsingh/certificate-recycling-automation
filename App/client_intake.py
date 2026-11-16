@@ -87,6 +87,17 @@ def intake_details(raw):
         if item['item'] or any(item[key] is not None for key in ('quantity','per_piece_weight','weight')):
             items.append(item)
     details['items'] = items or [{'item':'', 'quantity':None, 'per_piece_weight':None, 'weight':None}]
+    weights = []
+    for index, item in enumerate(details['items'], 1):
+        weight = item['weight']
+        quantity = number(item['quantity'])
+        if weight is None and quantity is not None and item['per_piece_weight'] is not None:
+            weight = quantity * item['per_piece_weight']
+        if weight is not None and not math.isfinite(weight):
+            raise ValueError(f'The calculated weight for material {index} is too large. Check the quantity and weight per piece.')
+        weights.append(weight or 0)
+    if not math.isfinite(sum(weights)):
+        raise ValueError('The total weight is too large. Check the material weights.')
     return details
 
 
@@ -323,7 +334,8 @@ def stage_new_client(session, raw):
                     cell_kind = ('inlineStr' if isinstance(value, str) else 'n') if value is not None else 'blank'
                     xml = _set_cell(xml, f'{get_column_letter(cols[key] + 1)}{row}', value, cell_kind)
                 if (material['weight'] is None and {'quantity','per_piece_weight','weight'}.issubset(cols)
-                        and number(material['quantity']) is not None):
+                        and number(material['quantity']) is not None
+                        and material['per_piece_weight'] is not None):
                     # These are the same bounded inputs the certificate reader recalculates.
                     coordinate = f'{get_column_letter(cols["weight"] + 1)}{row}'
                     formula = f'{get_column_letter(cols["quantity"] + 1)}{row}*{get_column_letter(cols["per_piece_weight"] + 1)}{row}'
@@ -343,16 +355,16 @@ def stage_new_client(session, raw):
             if len(destinations) > 1:
                 material_columns = {cols[key] + 1 for key in
                                     ('item', 'quantity', 'per_piece_weight', 'weight') if key in cols}
-                if empty_template:
+                template_merges = [area.min_col for area in sheet.merged_cells.ranges
+                                   if area.min_row == template and area.min_col == area.max_col
+                                   and area.max_row > template and area.min_col not in material_columns]
+                if empty_template and template_end == template:
                     # A clean template has one fully ruled entry row, so add
                     # the batch-level merges when it expands into material rows.
                     client_columns = [column for column in range(1, width + 1)
                                       if column not in material_columns]
                 else:
-                    client_columns = [area.min_col for area in sheet.merged_cells.ranges
-                                      if area.min_row == template and area.min_col == area.max_col
-                                      and area.max_row > template
-                                      and area.min_col not in material_columns]
+                    client_columns = template_merges
                 for column in client_columns:
                     letter = get_column_letter(column)
                     merges.append(f'<{prefix}mergeCell ref="{letter}{first}:{letter}{last}"/>')

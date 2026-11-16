@@ -1,8 +1,11 @@
 """Linked HDD tracking, failure recovery, and recycling identity in disposable files."""
+from contextlib import closing
 from datetime import date
 from io import BytesIO
 import unittest
 from unittest.mock import patch
+from xml.etree import ElementTree as ET
+from zipfile import ZipFile
 
 from openpyxl import load_workbook
 
@@ -62,6 +65,41 @@ class HddWorkbookTests(unittest.TestCase):
         self.assertEqual(corrected['certificate_no'], result['certificate_no'])
         self.assertEqual((after['cod_no'], after['cod_date']), (before['cod_no'], before['cod_date']))
         self.assertEqual(after['hdd_cod_date'], '2026-10-18')
+
+    def test_hdd_row_insertion_preserves_excel_shared_weight_formulas(self):
+        path = self.paths[0]
+        with closing(load_workbook(path)) as book:
+            sheet = book.active
+            sheet.append([cell.value for cell in sheet[2]])
+            sheet['A3'] = 'NEXT'
+            sheet['I3'] = 'F6-NEXT'
+            sheet['K3'] = '0304'
+            sheet['H2'] = '=F2*G2'
+            sheet['H3'] = '=F3*G3'
+            book.save(path)
+
+        shared = BytesIO()
+        with ZipFile(path) as source, ZipFile(shared, 'w') as target:
+            for member in source.infolist():
+                payload = source.read(member)
+                if member.filename == 'xl/worksheets/sheet1.xml':
+                    xml = ET.fromstring(payload)
+                    first = xml.find('.//{*}c[@r="H2"]/{*}f')
+                    first.attrib.update(t='shared', si='0', ref='H2:H3')
+                    second = xml.find('.//{*}c[@r="H3"]/{*}f')
+                    second.attrib.update(t='shared', si='0')
+                    second.text = None
+                    payload = ET.tostring(xml)
+                target.writestr(member, payload)
+        path.write_bytes(shared.getvalue())
+        before = read_batches(path)
+        result = self.generate()
+        after = read_batches(path)
+        self.assertEqual(after[0]['hdd_cod_no'], result['certificate_no'])
+        self.assertEqual(batch_content(after[1]), batch_content(before[1]))
+        with closing(load_workbook(path)) as book:
+            self.assertEqual(book.active['H2'].value, '=F2*G2')
+            self.assertEqual(book.active['H4'].value, '=F4*G4')
 
     def test_hdd_uses_styles_synthesized_from_merged_tracking_borders(self):
         from openpyxl.styles import Border, Side

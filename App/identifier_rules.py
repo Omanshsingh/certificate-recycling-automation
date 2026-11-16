@@ -77,3 +77,36 @@ def workspace_batches(root, overrides=None):
         source = BytesIO(overrides[str(path)]) if str(path) in overrides else path
         batches.extend(dict(batch, source_id=f'plant{index}') for batch in read_batches(source))
     return batches
+
+
+def require_restored_identifiers(root, entries, overrides, records):
+    """Check restored manifests against changes in other sources."""
+    from certificate_inventory import identity as cod_identity, scan_inventory
+
+    batches = workspace_batches(root, overrides)
+    active_pdfs = None
+    for entry in entries:
+        source_kind, plant = entry['source_kind'], entry['plant']
+        if source_kind == 'manual':
+            key = entry['record_id']
+            record = next((record for record in records if record['id'] == key), None)
+            details = record['details'] if record else None
+            others = batches + [record['details'] for record in records if record['id'] != key]
+        else:
+            key = entry['sn']
+            details = next((batch for batch in batches if batch['source_id'] == plant
+                            and identifier(batch['case_id']) == identifier(key)), None)
+            others = [batch for batch in batches if batch is not details] + [record['details'] for record in records]
+        if details is None:
+            raise ValueError('The deleted entry could not be found in its recovery copy.')
+        require_unique(details, plant, source_kind, key, batches, records)
+        cod = cod_identity(details.get('cod_no'))
+        if not cod:
+            continue
+        if active_pdfs is None:
+            active_pdfs = {cod_identity(number) for pdf in scan_inventory(root, persist=False)['entries']
+                           if pdf.get('present') for number in pdf.get('current_cods', pdf.get('cods', []))}
+        if cod in active_pdfs or any(cod in {cod_identity(other.get('cod_no')), cod_identity(other.get('hdd_cod_no'))}
+                                    for other in others):
+            raise ValueError(f'COD {details["cod_no"]} now belongs to another entry or PDF. '
+                             'Use the recovery copy to restore this entry with a different COD.')

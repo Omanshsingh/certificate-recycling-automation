@@ -483,7 +483,7 @@ def reconcile_manual(root):
 
 
 def generate_draft(root, plant=None, details=None, record_id=None, confirmed=False, as_of=None,
-                   override_reason='', expected_revision=None, starting_cod=None):
+                   override_reason='', expected_revision=None, starting_cod=None, *, review_only=False):
     with run_lock(root), ExitStack() as resources:
         recover_issuances(root)
         if expected_revision is not None:
@@ -526,6 +526,8 @@ def generate_draft(root, plant=None, details=None, record_id=None, confirmed=Fal
                    "certificate_status": "ready", "outcome": "needs_review", "warnings": warnings,
                    "detail": "; ".join(warnings)}
             return {"requires_confirmation": True, "warnings": [row], "created": 0, "record_id": record_id}
+        if review_only:
+            return {"requires_confirmation": True, "warnings": [], "created": 0, "record_id": record_id}
         details = clean_details(details)
         details.update(cod_no=cod, cod_date=issued_date.isoformat())
         linked_session = None
@@ -617,7 +619,7 @@ def generate_draft(root, plant=None, details=None, record_id=None, confirmed=Fal
                 "warnings": warnings, "recovery_note": recovery_note, "workbook_updated": linked_session is not None}
 
 
-def complete_draft(root, record_id, expected_revision=None):
+def complete_draft(root, record_id, expected_revision=None, *, undo=False):
     with run_lock(root):
         recover_issuances(root)
         if expected_revision is not None:
@@ -625,9 +627,18 @@ def complete_draft(root, record_id, expected_revision=None):
             require_revision(root, expected_revision)
         data = read_register(root)
         existing = _record(data, record_id)
+        if undo:
+            if not existing or _manual_status(existing.get('status')) != 'completed':
+                raise ValueError('Refresh and select a certificate marked Completed.')
+            prior_status = existing.pop('status_before_completed', 'generated_manual')
+            existing.update(status=prior_status if prior_status in {'generated', 'generated_manual'} else 'generated_manual',
+                            updated_at=datetime.now().isoformat())
+            write_register(root, data)
+            return
         if not existing or _manual_status(existing.get("status")) not in {"generated_manual", "generated"}:
             raise ValueError("Create this certificate PDF before marking it Completed.")
         if not current_record_pdf(root, existing):
             raise ValueError("The certificate PDF is missing. Recreate it before marking it Completed.")
-        existing.update(status="completed", updated_at=datetime.now().isoformat())
+        existing.update(status="completed", status_before_completed=_manual_status(existing.get('status')),
+                        updated_at=datetime.now().isoformat())
         write_register(root, data)

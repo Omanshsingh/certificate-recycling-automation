@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import json
 from pathlib import Path
+import re
 import secrets
 
 from workflow_support import load_settings
@@ -38,7 +39,8 @@ def workspace_revision(root, file_overrides=None, *, force=False):
 
 
 def require_revision(root, expected, file_overrides=None, *, force=True):
-    if not isinstance(expected, str) or not expected or not hmac.compare_digest(workspace_revision(root, file_overrides, force=force), expected):
+    if (not isinstance(expected, str) or not re.fullmatch(r'[a-f0-9]{64}', expected)
+            or not hmac.compare_digest(workspace_revision(root, file_overrides, force=force), expected)):
         raise ValueError('The files changed since you opened these details. Refresh Excel and review the current details before saving. Your entered details have not been saved.')
 
 
@@ -53,21 +55,25 @@ def reviewed_operation(root, endpoint, payload, action):
     """HTTP boundary: never accept a bare confirmed=True as prior review."""
     expected = payload.get('expected_revision')
     require_revision(root, expected)
-    check = dict(payload, confirmed=False)
+    check = dict(payload, confirmed=False, review_only=True)
     result = action(check)
-    # A no-warning operation has already completed. Actions are deliberately
-    # called once in that case, not duplicated after a successful issuance.
     if not result.get('requires_confirmation'):
         return result
-    revision = workspace_revision(root)
+    # A file can change while the warnings are being computed. Keep the
+    # review tied to the original revision rather than blessing newer data.
+    require_revision(root, expected, force=False)
+    revision = expected
     token = review_token(endpoint, payload, revision, result.get('warnings', []))
-    if payload.get('confirmed') and isinstance(payload.get('review_token'), str) and hmac.compare_digest(payload['review_token'], token):
+    submitted_token = payload.get('review_token')
+    if (payload.get('confirmed') is True and isinstance(submitted_token, str)
+            and submitted_token.isascii() and hmac.compare_digest(submitted_token, token)):
         reason = str(payload.get('override_reason') or '').strip()
         if len(reason) > 2000:
             raise ValueError('The warning confirmation note must be 2,000 characters or fewer.')
         # The reviewed token proves which details and warnings were accepted.
         # Retain notes from older clients, without requiring the user to type one.
-        return action(dict(payload, expected_revision=revision,
-                           override_reason=reason or 'Warnings reviewed; user chose Continue anyway.'))
+        default_reason = 'Warnings reviewed; user chose Continue anyway.' if result.get('warnings') else 'Creation confirmed.'
+        return action(dict(payload, expected_revision=revision, review_only=False,
+                           override_reason=reason or default_reason))
     result.update(review_token=token, workspace_revision=revision)
     return result

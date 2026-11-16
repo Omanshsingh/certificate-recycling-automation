@@ -229,7 +229,7 @@ def recover_entry_deletions(root):
     recovered = []
     for path in sorted((root/'Data'/'Entry Deletions').glob('*.json')):
         data = json.loads(path.read_text(encoding='utf-8'))
-        if data.get('state') in {'complete','rolled_back'}:
+        if data.get('state') in {'complete','rolled_back','undone'}:
             continue
         if not re.fullmatch(r'[a-f0-9]{32}', str(data.get('id',''))) or data.get('version') != 1:
             raise ValueError('The entry deletion recovery record needs checking.')
@@ -238,8 +238,11 @@ def recover_entry_deletions(root):
             sessions = {item['path']:stack.enter_context(WorkbookSession(Path(item['path']), root/'Data'/'Workbook Backups'))
                         for item in data['sources'] if Path(item['path']).resolve() != register_path(root).resolve()}
             _sync(root, data, False, sessions)
-        data['state'] = 'rolled_back'; save_json(path, data)
-        recovered.append('Restored an interrupted mistaken-entry deletion. Review and delete again if needed.')
+        undo = data['state'] == 'undoing'
+        data['state'] = 'undone' if undo else 'rolled_back'
+        save_json(path, data)
+        recovered.append('Finished restoring the deleted entries.' if undo
+                         else 'Restored an interrupted mistaken-entry deletion. Review and delete again if needed.')
     return recovered
 
 
@@ -307,3 +310,60 @@ def delete_entries(root, body, *, commit=False):
                 data['state'] = 'rolled_back'; save_json(journal, data)
                 raise
         return {'deleted':True, 'review':review}
+
+
+def undo_entry_deletion(root, identifier, revision):
+    """Restore the reviewed deletion only while all affected files still match."""
+    from issuance_safety import recover_issuances
+
+    root = Path(root).resolve()
+    if not isinstance(identifier, str) or not re.fullmatch(r'[a-f0-9]{32}', identifier):
+        raise ValueError('Choose a saved deletion to undo.')
+    journal = root/'Data'/'Entry Deletions'/f'{identifier}.json'
+    with run_lock(root), ExitStack() as stack:
+        recover_issuances(root)
+        if not journal.is_file():
+            raise ValueError('The deletion record was not found.')
+        data = json.loads(journal.read_text(encoding='utf-8'))
+        if data.get('state') == 'undone':
+            return {'undone':True}
+        if data.get('state') != 'complete' or data.get('id') != identifier or data.get('version') != 1:
+            raise ValueError('This deletion has no completed change to undo.')
+        _paths(root, data)
+        sessions = {item['path']:stack.enter_context(WorkbookSession(Path(item['path']), root/'Data'/'Workbook Backups'))
+                    for item in data['sources'] if Path(item['path']).resolve() != register_path(root).resolve()}
+        require_revision(root, revision, {path:session.data for path,session in sessions.items()})
+        folder = root/'Data'/'Entry Deletion Recovery'/identifier
+        restored_workbooks = {}
+        restored_records = None
+        for item in data['sources']:
+            session = sessions.get(item['path'])
+            actual = digest_bytes(session.data) if session else file_digest(Path(item['path']))
+            if actual != item['after']:
+                raise ValueError(f'{Path(item["path"]).name} changed after the deletion. '
+                                 f'The recovery copies in {folder} contain the previous entries.')
+            before = (folder/item['before_snapshot']).read_bytes()
+            if digest_bytes(before) != item['before']:
+                raise ValueError('A pre-deletion recovery copy failed verification.')
+            if session:
+                restored_workbooks[item['path']] = before
+            else:
+                restored_records = json.loads(before)['records']
+        from identifier_rules import require_restored_identifiers
+        require_restored_identifiers(root, data['review']['entries'], restored_workbooks,
+                                     read_register(root)['records'] if restored_records is None else restored_records)
+        for pdf in data['pdfs']:
+            if file_digest(root/pdf['path']) is not None:
+                raise ValueError('Another PDF now uses a deleted certificate’s filename. The recovery copies were kept.')
+            if (file_digest(folder/pdf['snapshot']) != pdf['sha256']
+                    or file_digest(root/pdf['archive']) not in {None, pdf['sha256']}):
+                raise ValueError('A PDF deletion recovery copy failed verification.')
+        data['state'] = 'undoing'
+        save_json(journal, data)
+        _sync(root, data, False, sessions)
+        data['state'] = 'undone'
+        try:
+            save_json(journal, data)
+        except OSError:
+            pass  # Recovery can complete the journal using the restored hashes.
+    return {'undone':True}

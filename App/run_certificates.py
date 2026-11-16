@@ -382,7 +382,7 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
         plants=None, allow_warnings=False, overrides=None, details=None, update_excel=True,
         override_reason='', expected_revision=None, report_sink=None, read_only_preflight=False,
         starting_cod=None, selected_keys=None,
-        remove_inward=False, hdd_needed=None, hdd_removal_confirmed=False):
+        remove_inward=False, hdd_needed=None):
     """Check both workbooks or generate PDFs for rows explicitly marked Ready."""
     root = Path(root)
     if remove_inward and (not selected or details is None or update_excel):
@@ -644,7 +644,7 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
                             detail = ('The external PDF could not be matched. Open Saved certificates and link the correct PDF.'
                                       if state == 'generated_manual' else
                                       'The externally created PDF linked to this completed inward is missing or has changed.')
-                            report.add(batch, 'needs_review', detail, system_alert=True)
+                            report.add(batch, 'needs_review', detail, issue_code='pdf_unavailable', system_alert=True)
                             continue
                         try:
                             if not (batch.get('_workbook_read_only') or read_only_preflight):
@@ -656,7 +656,8 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
                             batch["_effective_certificate_status"] = state = "ready"
                             batch["_missing_pdf"] = True
                         except Exception as exc:
-                            report.add(batch, "needs_review", f"The PDF is missing, but Excel could not be changed to Ready: {exc}", system_alert=True)
+                            report.add(batch, "needs_review", f"The PDF is missing, but Excel could not be changed to Ready: {exc}",
+                                       issue_code='pdf_unavailable', system_alert=True)
                             continue
                     if state == "blank":
                         detail = "Fill the required inward details in Excel. The empty status will change to Ready when they are complete."
@@ -810,7 +811,7 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
                                 from certificate_conversion import prepare_local_certificate
                                 local_record, companion, converted_from = prepare_local_certificate(
                                     root, batch['source_id'], original_form_batch, batch, cod, issued_date, destination,
-                                    hdd_needed=hdd_needed, hdd_removal_confirmed=hdd_removal_confirmed,
+                                    hdd_needed=hdd_needed,
                                     warnings=list(dict.fromkeys(issues)))
                             transaction = IssuanceTransaction(
                                 root, destination, temporary, session.path, session.data,

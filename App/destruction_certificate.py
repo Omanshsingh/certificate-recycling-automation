@@ -167,7 +167,7 @@ def request_for_inward(root, plant, case_id, expected_revision=None, *, needed=T
     from workspace_review import require_revision
     if not isinstance(needed, bool):
         raise ValueError('Choose whether Data Destruction is needed.')
-    if (plant not in {'plant1', 'plant2'} and not record_id) or (not record_id and not str(case_id or '').strip()):
+    if (plant not in ('plant1', 'plant2') and not record_id) or (not record_id and not str(case_id or '').strip()):
         raise ValueError('Choose an inward client first.')
     case_id = str(case_id).strip()
     with run_lock(root):
@@ -203,8 +203,8 @@ def request_for_inward(root, plant, case_id, expected_revision=None, *, needed=T
                         if record['details'].get('destruction_source') == link), None)
         if current:
             if current.get('destruction_requested', True) != needed:
-                if not needed and _manual_record_issued(root, current) and confirmed is not True:
-                    raise ValueError('An HDD certificate already exists. Confirm removing its request; its PDF and number will be kept.')
+                if not needed and _manual_record_issued(root, current):
+                    raise ValueError('This Data Destruction certificate has been issued. Open its row to review it or mark it Completed.')
                 current['destruction_requested'] = needed
                 write_register(root, data)
             return current['id']

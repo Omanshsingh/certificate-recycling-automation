@@ -1,7 +1,9 @@
 """Destruction is supplemental to an inward; all issuance tests use disposable data."""
 from datetime import date
+from io import BytesIO
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from zipfile import ZipFile
 import xml.etree.ElementTree as ET
 import tempfile
@@ -82,7 +84,7 @@ class DestructionTests(unittest.TestCase):
         self.assertEqual(restored['certificate_fields'], details['certificate_fields'])
         self.assertEqual(before, [path.read_bytes() for path in self.paths])
 
-    def test_removing_an_issued_request_requires_confirmation_and_keeps_pdf_number_and_history(self):
+    def test_issued_request_cannot_be_removed_and_keeps_pdf_number_and_history(self):
         record_id = request_for_inward(self.root, 'plant1', 'CLIENT1')
         details = read_register(self.root)['records'][0]['details']
         details['certificate_fields'] = self.details()['certificate_fields']
@@ -90,20 +92,20 @@ class DestructionTests(unittest.TestCase):
         pdf_path = self.root / 'Certificates' / result['relative_path']
         before = pdf_path.read_bytes()
         excel = [path.read_bytes() for path in self.paths]
-        with self.assertRaisesRegex(ValueError, 'Confirm removing'):
-            request_for_inward(self.root, 'plant1', 'CLIENT1', workspace_revision(self.root), needed=False)
-        self.assertTrue(manual_rows(self.root)[0]['destruction_pending'])
-        request_for_inward(self.root, 'plant1', 'CLIENT1', workspace_revision(self.root), needed=False, confirmed=True)
+        for confirmed in (False, True):
+            with self.assertRaisesRegex(ValueError, 'has been issued'):
+                request_for_inward(self.root, 'plant1', 'CLIENT1', workspace_revision(self.root),
+                                   needed=False, confirmed=confirmed)
         row = manual_rows(self.root)[0]
-        self.assertFalse(row['destruction_requested'])
-        self.assertFalse(row['destruction_pending'])
+        self.assertTrue(row['destruction_requested'])
+        self.assertTrue(row['destruction_pending'])
         self.assertEqual(row['certificate_no'], result['certificate_no'])
         self.assertEqual(pdf_path.read_bytes(), before)
         self.assertEqual(excel, [path.read_bytes() for path in self.paths])
         self.assertEqual(row['record_id'], record_id)
         pdf_path.unlink()
         reconcile_manual(self.root)
-        self.assertEqual(manual_rows(self.root), [])
+        self.assertTrue(manual_rows(self.root)[0]['pdf_missing'])
 
     def test_request_removal_rejects_a_stale_review(self):
         request_for_inward(self.root, 'plant1', 'CLIENT1')
@@ -198,6 +200,35 @@ class DestructionTests(unittest.TestCase):
             response = web_app.preview_certificate({'source_kind':'manual', 'plant':'plant1', 'details':self.details()})
         self.assertEqual(len(response['preview_detail_images']), 1)
         self.assertFalse(read_register(self.root)['records'])
+
+    def test_hdd_handles_a_broken_excel_style_reference(self):
+        book = self.paths[1]
+        original = book.read_bytes()
+        damaged = BytesIO()
+        with ZipFile(BytesIO(original)) as source, ZipFile(damaged, 'w') as target:
+            for member in source.infolist():
+                payload = source.read(member)
+                if member.filename == 'xl/worksheets/sheet1.xml':
+                    sheet = ET.fromstring(payload)
+                    cell = sheet.find('.//{*}c[@r="A2"]')
+                    cell.set('s', '65535')
+                    payload = ET.tostring(sheet)
+                target.writestr(member, payload)
+        book.write_bytes(damaged.getvalue())
+
+        with patch.object(web_app, 'ROOT', self.root):
+            response = web_app.preview_certificate({
+                'source_kind': 'manual', 'plant': 'plant1', 'details': self.details(),
+            })
+        self.assertEqual(len(response['preview_detail_images']), 1)
+        self.assertTrue(any('Plant 2 workbook' in warning and 'invalid formatting' in warning
+                            for warning in response['warnings']))
+        with self.assertRaisesRegex(ValueError, 'invalid formatting or text reference'):
+            request_for_inward(self.root, 'plant2', 'CLIENT2')
+        from hdd_workbook import stage_hdd_tracking
+        with self.assertRaisesRegex(ValueError, 'invalid formatting or text reference'):
+            stage_hdd_tracking(SimpleNamespace(data=book.read_bytes()), 'CLIENT2', '0303', AS_OF)
+        self.assertEqual(book.read_bytes(), damaged.getvalue())
 
     def test_filled_reference_uses_bold_values_slash_dates_and_padded_cod(self):
         details = self.details(272)

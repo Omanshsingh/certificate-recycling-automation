@@ -67,9 +67,19 @@ class CreateNewIntentTests(unittest.TestCase):
         body.update(changes)
         return body
 
-    def post_create(self, body):
+    def post_create(self, body, *, confirm=False):
+        status, response = self.post_generation('/api/create', body)
+        if confirm:
+            self.assertEqual(status, 200, response)
+            self.assertTrue(response['requires_confirmation'])
+            status, response = self.post_generation('/api/create', dict(
+                body, confirmed=True, review_token=response['review_token'],
+                expected_revision=response['workspace_revision']))
+        return status, response
+
+    def post_generation(self, endpoint, body):
         handler = object.__new__(web_app.Handler)
-        handler.path = "/api/create"
+        handler.path = endpoint
         payload = json.dumps(body).encode("utf-8")
         handler.headers = {"Host": "127.0.0.1", "Content-Length": str(len(payload))}
         handler.rfile = BytesIO(payload)
@@ -148,8 +158,19 @@ class CreateNewIntentTests(unittest.TestCase):
         self.assertEqual(self.snapshot(), before)
 
     def test_new_unique_id_can_match_an_id_in_the_other_plant(self):
+        first_before = self.paths[0].read_bytes()
         other_before = self.paths[1].read_bytes()
-        status, response = self.post_create(self.body(case_id="OTHER"))
+        body = self.body(case_id="OTHER")
+        status, review = self.post_create(dict(body, confirmed=True))
+        self.assertEqual(status, 200, review)
+        self.assertTrue(review["requires_confirmation"])
+        self.assertEqual(review["warnings"], [])
+        self.assertEqual(review["created"], 0)
+        self.assertEqual(self.paths[0].read_bytes(), first_before)
+        self.assertEqual(self.paths[1].read_bytes(), other_before)
+        self.assert_no_issuance()
+        confirmed = dict(body, confirmed=True, review_token=review['review_token'])
+        status, response = self.post_create(confirmed)
         self.assertEqual(status, 200, response)
         self.assertEqual(response["created"], 1)
         batches = read_batches(self.paths[0])
@@ -163,7 +184,7 @@ class CreateNewIntentTests(unittest.TestCase):
     def test_existing_source_edit_remains_allowed(self):
         self.assertEqual(runner.run(self.paths, self.root, selected=('plant1', 'CLIENT'), progress=None)[0], 1)
         status, response = self.post_create(self.body(
-            create_new=False, source_sn="CLIENT", source_plant="plant1"))
+            create_new=False, source_sn="CLIENT", source_plant="plant1"), confirm=True)
         self.assertEqual(status, 200, response)
         self.assertEqual(response["created"], 1)
         batches = read_batches(self.paths[0])
@@ -176,7 +197,7 @@ class CreateNewIntentTests(unittest.TestCase):
         self.assertEqual(runner.run(self.paths, self.root, selected=('plant1', 'CLIENT'), progress=None)[0], 1)
         body = self.body()
         del body["create_new"]
-        status, response = self.post_create(body)
+        status, response = self.post_create(body, confirm=True)
         self.assertEqual(status, 200, response)
         self.assertEqual(response["created"], 1)
         batches = read_batches(self.paths[0])
@@ -233,7 +254,7 @@ class CreateNewIntentTests(unittest.TestCase):
             status, response = self.post_create(body)
         self.assertEqual(status, 400, response)
         self.assertIn("files changed", response["error"])
-        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_count, 1)
         self.assertTrue(all(call.kwargs["expected_revision"] == body["expected_revision"]
                             for call in run.call_args_list))
         self.assertEqual(self.paths[0].read_bytes(), external_bytes[0])

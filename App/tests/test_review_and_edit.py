@@ -431,6 +431,24 @@ class ReviewAndEditTests(unittest.TestCase):
         self.assertEqual(self.paths[0].read_bytes(), before)
         self.assertFalse(list((self.root/'Certificates').rglob('*.pdf')))
 
+    def test_invalid_upload_fields_allow_retrying_the_same_pdf(self):
+        from external_certificate_upload import save_upload, stage_upload
+        from tests.test_certificate_inventory import external_pdf
+
+        payload = external_pdf(self.root/'operator.pdf', cod='0424').read_bytes()
+        staged = stage_upload(self.root, payload)
+        body = {'token':staged['token'], 'expected_revision':workspace_revision(self.root),
+                'details':{'supplier':'Independent client', 'certificate_type':'standard',
+                           'cod_date':'2026-10-14', 'reference':'EXT-REF'}}
+        with self.assertRaisesRegex(ValueError, 'Choose the certificate type'):
+            save_upload(self.root, web_app.BACKUP_DIR,
+                        dict(body, details=dict(body['details'], certificate_type=[])))
+        with self.assertRaisesRegex(ValueError, 'Choose an Excel inward'):
+            save_upload(self.root, web_app.BACKUP_DIR, dict(body, inward={'plant':{}, 'sn':'1001'}))
+        result = save_upload(self.root, web_app.BACKUP_DIR, body)
+        self.assertTrue(result['saved'])
+        self.assertEqual((self.root/'Certificates'/result['relative_path']).read_bytes(), payload)
+
     def test_upload_without_readable_cod_uses_numbering_and_preserves_original_pdf(self):
         from external_certificate_upload import save_upload, stage_upload
         from tests.test_certificate_inventory import external_pdf

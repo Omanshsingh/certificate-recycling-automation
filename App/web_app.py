@@ -1,6 +1,7 @@
 """Loopback-only browser interface for the Ecoreco certificate workflow."""
 from __future__ import annotations
 
+from collections import OrderedDict
 from datetime import date, datetime
 from http.client import HTTPConnection, HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -13,6 +14,7 @@ from pathlib import Path
 import subprocess
 import threading
 import time
+import traceback
 from urllib.parse import urlsplit, unquote, quote, parse_qs
 import webbrowser
 import re
@@ -36,7 +38,7 @@ from openpyxl.utils.exceptions import InvalidFileException
 from certificate_inventory import scan_inventory, safe_certificate_path, ensure_certificate_folders, identity as cod_identity
 from workflow_support import run_lock
 from file_fingerprints import file_signature
-from issuance_safety import (recover_issuances, valid_pdf, file_digest, latest_issuance,
+from issuance_safety import (recover_issuances, valid_pdf, file_digest, digest_bytes, latest_issuance,
                              audit_records, workbook_receipt_conflict, current_pdf_is_healthy,
                              manual_receipts)
 from workspace_review import workspace_revision, require_revision, reviewed_operation
@@ -56,6 +58,7 @@ OPERATION_LOCK = threading.RLock()
 STOPPING = False
 WORKBOOK_CHECK_STAMPS = {}
 WORKSPACE_STATE_CACHE = None
+PREVIEW_CACHE = OrderedDict()
 DASHBOARD_REVIEW = DashboardReview()
 
 
@@ -319,9 +322,13 @@ def configured_paths(settings=None, allow_unavailable=False):
     return paths
 
 
+class ClientAddRequestEnded(ValueError):
+    """The current request ID cannot be used for another add."""
+
+
 def add_client(body):
     plant = body.get('plant')
-    if plant not in {'plant1', 'plant2'}:
+    if plant not in ('plant1', 'plant2'):
         raise ValueError('Choose Plant 1 or Plant 2.')
     expected = body.get('expected_revision')
     request_id = body.get('request_id')
@@ -337,7 +344,9 @@ def add_client(body):
         recover_issuances(ROOT)
         journal = json.loads(journal_path.read_text(encoding='utf-8')) if journal_path.is_file() else None
         if journal and (journal.get('plant') != plant or journal.get('path') != str(path) or journal.get('input') != signature):
-            raise ValueError('This add request already belongs to different details. Check the client in Excel before starting a new entry.')
+            raise ClientAddRequestEnded(
+                'This add request belongs to different details. Check Companies for the previous client. '
+                'Use Review & edit to correct it, or choose Add to Excel again to add this as a new entry.')
         if not journal:
             require_revision(ROOT, expected)
         with WorkbookSession(path, BACKUP_DIR) as session:
@@ -345,17 +354,28 @@ def add_client(body):
             if journal:
                 from inward_serials import links_from
                 current_sn = links_from(session.data).get('additions', {}).get(request_id, journal['sn'])
+                if current_sn is None:
+                    raise ClientAddRequestEnded(
+                        'This client was already added and later removed. '
+                        'Review the fields and choose Add to Excel to create a new entry.')
                 journal['sn'] = current_sn
                 if isinstance(journal.get('snapshot'), dict):
                     journal['snapshot']['case_id'] = current_sn
                 batch = next((row for row in read_batches(BytesIO(session.data)) if row['case_id'] == journal['sn']), None)
                 recovered = batch and (journal.get('saved') or json.loads(json.dumps(batch_content(batch), default=str)) == journal['snapshot'])
                 if not recovered and (batch or journal.get('saved')):
-                    raise ValueError('This client was already added and later changed or removed. Check Excel; it has not been added again.')
+                    raise ClientAddRequestEnded(
+                        'This client was already added and later changed or removed. '
+                        'Check Companies before choosing Add to Excel to create a new entry.')
             else:
                 recovered = False
             if not recovered:
-                require_revision(ROOT, journal.get('expected_revision', expected) if journal else expected, overrides)
+                if (journal and journal.get('expected_revision', expected) != expected
+                        and journal.get('before_sha256') != digest_bytes(session.data)):
+                    raise ClientAddRequestEnded(
+                        'The workbook changed after this interrupted add. Check Companies for the client, '
+                        'then choose Add to Excel again if a new entry is needed.')
+                require_revision(ROOT, expected, overrides)
                 updated, batch = stage_new_client(session, details)
                 if not details.get('sn'):
                     from inward_serials import resequence_added_inward
@@ -366,7 +386,7 @@ def add_client(body):
                 require_unique(batch, plant, 'workbook', batch['case_id'], workspace_batches(ROOT, staged_overrides), read_register(ROOT)['records'])
                 journal = {'plant':plant, 'path':str(path), 'input':signature, 'sn':batch['case_id'],
                            'snapshot':json.loads(json.dumps(batch_content(batch), default=str)),
-                           'expected_revision':expected, 'saved':False}
+                           'expected_revision':expected, 'before_sha256':digest_bytes(session.data), 'saved':False}
                 session.before_persist = lambda _: require_revision(ROOT, expected, overrides)
                 save_json(journal_path, journal)
                 session._persist(updated)
@@ -540,12 +560,17 @@ def rebuild_history_state():
     """Rebuild the dashboard after cleanup without rewriting the Excel files."""
     if not all(value.strip() for value in load_settings(ROOT)['workbook_paths']):
         return refresh()
+    paths = configured_paths(load_settings(ROOT))
+    before = workbook_check_stamp(paths)
     snapshot = {}
-    run(configured_paths(load_settings(ROOT)), ROOT, check_only=True, read_only_preflight=True,
+    run(paths, ROOT, check_only=True, read_only_preflight=True,
         progress=None, report_sink=snapshot)
     save_json(RESULTS_PATH, snapshot)
     WORKBOOK_CHECK_STAMPS.pop(str(ROOT), None)
-    return workspace_state(recheck_obsolete=False)
+    state = workspace_state(recheck_obsolete=False)
+    if reusable_workbook_report(state) and workbook_check_stamp(paths) == before:
+        WORKBOOK_CHECK_STAMPS[str(ROOT)] = before
+    return state
 
 
 def current_pdf_rows(rows, *, inventory=None, history=None):
@@ -567,6 +592,7 @@ def current_pdf_rows(rows, *, inventory=None, history=None):
         row.pop('pdf_relative_path', None)
         row.pop('has_issued_certificate', None)
         row.pop('last_certificate_details', None)
+        row.pop('uploaded_pdf_sha256', None)
         source_kind = row.get('source_kind', 'workbook')
         if source_kind == 'workbook' and row.get('duplicate_serial_number'):
             # A shared Serial Number cannot safely identify either inward's
@@ -574,8 +600,8 @@ def current_pdf_rows(rows, *, inventory=None, history=None):
             result.append(row)
             continue
         key = row.get('record_id') if source_kind == 'manual' else row.get('sn')
-        receipt = receipts.get((source_kind, row.get('plant'),
-                                str(key).strip().casefold() if source_kind == 'workbook' else str(key)))
+        receipt = (local_receipts.get(key) if source_kind == 'manual'
+                   else receipts.get((source_kind, row.get('plant'), str(key).strip().casefold())))
         conflict = workbook_receipt_conflict(row, receipt) if source_kind == 'workbook' else ''
         if conflict:
             row['record_identity_conflict'] = conflict
@@ -627,6 +653,10 @@ def current_pdf_rows(rows, *, inventory=None, history=None):
                 continue
             row['pdf_filename'] = path.name
             row['pdf_relative_path'] = current.relative_to(folder).as_posix()
+            uploaded_digest = ((receipt or {}).get('pdf_sha256') if (receipt or {}).get('external_upload')
+                               else (row.get('external_pdf') or {}).get('sha256'))
+            if uploaded_digest:
+                row['uploaded_pdf_sha256'] = uploaded_digest
         except (OSError, ValueError):
             # Unavailable metadata must not turn a stale filename into an Open PDF link.
             continue
@@ -852,21 +882,39 @@ def workbook_form(body, details, paths, *, saving=False):
     return canonical, requested_scope if saving and type_changed else 'certificate_only'
 
 
-def _render_preview_image(document, index, destination):
+def _write_preview_image(document, index, output):
     page = document[index]
     bitmap = None
-    temporary = destination.with_name(f'.{uuid.uuid4().hex}.png')
     try:
         # Large imported pages must not require an unbounded bitmap allocation.
         scale = min(1.5, 2400 / max(page.get_size()))
         bitmap = page.render(scale=scale)
-        bitmap.to_pil().save(temporary, format='PNG')
-        os.replace(temporary, destination)
+        bitmap.to_pil().save(output, format='PNG')
     finally:
         if bitmap is not None:
             bitmap.close()
         page.close()
+
+
+def _render_preview_image(document, index, destination):
+    temporary = destination.with_name(f'.{uuid.uuid4().hex}.png')
+    try:
+        _write_preview_image(document, index, temporary)
+        os.replace(temporary, destination)
+    finally:
         temporary.unlink(missing_ok=True)
+
+
+def uploaded_pdf_bytes(relative, digest):
+    if not isinstance(digest, str) or not re.fullmatch(r'[a-f0-9]{64}', digest):
+        raise ValueError('Refresh Companies and open the saved certificate again.')
+    path = safe_certificate_path(ROOT, relative, expected_sha=digest)
+    if not 0 < path.stat().st_size <= 50_000_000:
+        raise ValueError('This PDF is missing or too large. Check the current file in Saved certificates.')
+    payload = path.read_bytes()
+    if digest_bytes(payload) != digest:
+        raise ValueError('This PDF changed. Refresh and check the current file in Saved certificates.')
+    return payload
 
 
 def preview_page_image(identifier, page_number):
@@ -878,19 +926,58 @@ def preview_page_image(identifier, page_number):
     source = folder / f'{identifier}.pdf'
     if not source.is_file():
         raise ValueError('This preview is no longer available. Preview the certificate again.')
+    destination = folder / f'{identifier}_page_{page_number}.png'
+    if destination.is_file():
+        return destination
     import pypdfium2 as pdfium
     with pdfium.PdfDocument(str(source)) as document:
         if page_number > len(document):
             raise ValueError('This preview page was not found.')
-        destination = folder / f'{identifier}_page_{page_number}.png'
-        if not destination.is_file():
-            _render_preview_image(document, page_number - 1, destination)
+        _render_preview_image(document, page_number - 1, destination)
     return destination
+
+
+def editor_preview(body):
+    """Reuse a preview only for identical inputs and an unchanged workspace."""
+    session = body.get('preview_session')
+    if not isinstance(session, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,80}', session):
+        return preview_certificate(body)
+    try:
+        revision = workspace_revision(ROOT)
+    except (OSError, ValueError):
+        return preview_certificate(body)
+    key = (ROOT, session)
+    inputs = {name: value for name, value in body.items() if name not in {'preview_client', 'preview_session'}}
+    signature = (date.today(), revision, inputs)
+    cached = PREVIEW_CACHE.get(key)
+    if cached and cached[0] == signature:
+        _, identifier, response = cached
+        folder = ROOT / 'Data' / 'Previews'
+        required = [folder / f'{identifier}.{suffix}' for suffix in ('pdf', 'png')]
+        required.extend(folder / f'{identifier}_page_{index}.png'
+                        for index in range(2, len(response['preview_detail_images']) + 2))
+        if all(path.is_file() for path in required):
+            from preview_store import retain_preview
+            retain_preview(ROOT, identifier, session, body.get('preview_client'))
+            PREVIEW_CACHE.move_to_end(key)
+            return response
+    response = preview_certificate(body)
+    identifier = Path(response['preview_url']).stem
+    try:
+        unchanged = revision == workspace_revision(ROOT)
+    except (OSError, ValueError):
+        unchanged = False
+    if unchanged:
+        PREVIEW_CACHE[key] = (signature, identifier, response)
+        PREVIEW_CACHE.move_to_end(key)
+        while len(PREVIEW_CACHE) > 32:
+            PREVIEW_CACHE.popitem(last=False)
+    return response
 
 
 def preview_certificate(body):
     source_kind = body.get("source_kind", "workbook")
-    if source_kind not in {"workbook", "manual"}:
+    if source_kind not in ("workbook", "manual"):
         raise ValueError("Choose the plant workbook or local certificate register.")
     if source_kind == 'manual':
         validate_manual_identifiers(body)
@@ -955,7 +1042,7 @@ def preview_certificate(body):
 
 
 def selected_key(plant, case_id):
-    if plant not in {"plant1", "plant2"} or not str(case_id or "").strip():
+    if plant not in ("plant1", "plant2") or not str(case_id or "").strip():
         raise ValueError("Choose a plant and enter a Serial Number.")
     return plant, str(case_id).strip()
 
@@ -1036,6 +1123,7 @@ def open_selected_workbook_record(plant, case_id, source_sheet=None, source_row=
 
 def complete_workbook_record(body):
     """Verify live record ownership while holding the workbook's write lock."""
+    undo = body.get('undo_completed') is True
     with run_lock(ROOT):
         recover_issuances(ROOT)
         require_revision(ROOT, body.get('expected_revision'))
@@ -1065,30 +1153,36 @@ def complete_workbook_record(body):
             conflict = issued_workbook_cod_issue(source, selected[0], paths, source_batches, receipt)
             if conflict:
                 raise ValueError(conflict)
-            if not find_certificate(ROOT / 'Certificates', dict(source, source_id=selected[0])):
+            if not undo and not find_certificate(ROOT / 'Certificates', dict(source, source_id=selected[0])):
                 raise ValueError('The current PDF is missing, changed or unreadable. Refresh and recreate it before marking it Completed.')
+            restored = 'Generated Externally' if source.get('external_pdf') or (receipt or {}).get('external_upload') else 'Generated'
             session.set_issued_status(source['case_id'], source['source_sheet'], source['source_row'],
-                                      row.get('certificate_no', ''), row.get('certificate_status', 'Generated'), 'Completed')
+                                      row.get('certificate_no', ''),
+                                      'Completed' if undo else row.get('certificate_status', 'Generated'),
+                                      restored if undo else 'Completed')
         # The status has committed. Keep its acknowledgement even if rereading
         # another workbook or rebuilding the report fails afterwards.
-        row.update(certificate_status='completed', outcome='completed', reminder_due=False, overdue=False,
-                   detail=f'COD {source.get("cod_no", "")} is marked Completed.')
+        status = status_value(restored) if undo else 'completed'
+        row.update(certificate_status=status, outcome=status, reminder_due=False, overdue=False,
+                   detail='Completion undone. This certificate can be sent and marked Completed again.' if undo
+                   else f'COD {source.get("cod_no", "")} is marked Completed.')
         try:
             save_json(RESULTS_PATH, completed_state)
         except OSError:
             pass  # Return the committed state below even when the cache is unavailable.
-        state = merge_workbook_report(body.get('expected_revision'), completed_state)
+        state = None if undo else merge_workbook_report(body.get('expected_revision'), completed_state)
         if state is None:
             WORKBOOK_CHECK_STAMPS.pop(str(ROOT), None)
         else:
             remember_workbook_stamp()
     if state is None:
-        return post_commit_state(refresh, saved_message='Completed status saved successfully', fallback_state=completed_state)
+        return post_commit_state(refresh, saved_message='Completion undone' if undo else 'Completed status saved successfully',
+                                 fallback_state=completed_state)
     return state
 
 
 def generate(*, selected=None, plants=None, confirmed=False, expected_revision=None, override_reason='',
-             starting_cod=None, selections=None):
+             starting_cod=None, selections=None, review_only=False):
     selected_keys = None
     if selections is not None:
         if selected or plants is not None or not isinstance(selections, list) or not 1 <= len(selections) <= 500 or any(not isinstance(item, dict) for item in selections):
@@ -1139,8 +1233,8 @@ def generate(*, selected=None, plants=None, confirmed=False, expected_revision=N
             and any(not row.get('certificate_no') for row in eligible)):
         raise ValueError('Enter the starting COD number before creating certificates.')
     candidates = [row for row in eligible if row.get('warnings')]
-    if candidates and not confirmed:
-        return {"requires_confirmation": True, "warnings": candidates}
+    if review_only or (candidates and not confirmed):
+        return {"requires_confirmation": True, "warnings": candidates, "created": 0}
 
     generated_report = {}
     arguments = {"progress": None, "allow_warnings": confirmed, 'override_reason': override_reason,
@@ -1237,8 +1331,7 @@ def create_certificate(body):
     arguments = {'selected': selected,
                  'details': details, 'update_excel': scope == 'update_excel', 'progress': None, 'report_sink': snapshot}
     if scope == 'remove_excel':
-        arguments.update(remove_inward=True, hdd_needed=body.get('data_destruction_needed'),
-                         hdd_removal_confirmed=body.get('destruction_removal_confirmed') is True)
+        arguments.update(remove_inward=True, hdd_needed=body.get('data_destruction_needed'))
     if body.get('starting_cod') is not None:
         arguments['starting_cod'] = body['starting_cod']
     if body.get('expected_revision') is not None:
@@ -1256,8 +1349,9 @@ def create_certificate(body):
     if (preflight.get('numbering', {}).get('needs_start') and body.get('starting_cod') is None
             and not details.get('cod_no')):
         raise ValueError('Enter the starting COD number before creating this certificate.')
-    if row.get('outcome') == 'needs_review' and not body.get('confirmed'):
-        return {'requires_confirmation': True, 'warnings': [row], 'created': 0}
+    warnings = [row] if row.get('outcome') == 'needs_review' else []
+    if body.get('review_only') is True or (warnings and not body.get('confirmed')):
+        return {'requires_confirmation': True, 'warnings': warnings, 'created': 0}
     if body.get('expected_revision') is not None:
         arguments['expected_revision'] = body['expected_revision']
     result = run(paths, ROOT, allow_warnings=bool(body.get('confirmed')),
@@ -1338,7 +1432,7 @@ def save_requested_destruction(body, state):
         from destruction_certificate import request_for_inward
         identifier = request_for_inward(ROOT, body.get('plant'),
             source_sn, workspace_revision(ROOT),
-            needed=body['data_destruction_needed'], confirmed=body.get('destruction_removal_confirmed') is True,
+            needed=body['data_destruction_needed'],
             record_id=local['id'] if local else None)
         return (merge_manual_record_state(None, identifier, state) or state) if identifier else state
     except (OSError, ValueError) as exc:
@@ -1657,7 +1751,11 @@ def validate_manual_identifiers(body):
     """Keep COD fixed while allowing a valid date correction after issuance."""
     if body.get('void_reissue'):
         raise ValueError('Certificate replacement with a new COD is no longer available. Corrections keep the current COD.')
-    supplied = (body.get('details') or {})
+    supplied = body.get('details')
+    if supplied is None:
+        supplied = {}
+    if not isinstance(supplied, dict):
+        raise ValueError('Enter the certificate details first.')
     cod = str(supplied.get('cod_no') or '').strip()
     cod_date = str(supplied.get('cod_date') or '').strip()
     record_id = body.get('record_id')
@@ -1820,7 +1918,7 @@ class Handler(BaseHTTPRequestHandler):
             # committed certificate as a failure just to obtain a UI snapshot.
             if value.get('changed') is not False:
                 try:
-                    revision = workspace_revision(ROOT)
+                    revision = value.get('workspace_revision') if value.get('requires_confirmation') else workspace_revision(ROOT)
                     value['workspace_revision'] = revision
                     state = value.get('state')
                     if isinstance(state, dict) and isinstance(state.get('rows'), list):
@@ -1927,17 +2025,40 @@ class Handler(BaseHTTPRequestHandler):
             except (OSError, ValueError) as exc:
                 self.send_error_json(exc)
             return
-        if path.startswith('/api/certificates/'):
-            relative_path = unquote(path[len('/api/certificates/'):])
+        if path == '/api/certificate-preview-image':
+            query = parse_qs(urlsplit(self.path).query)
             try:
-                destination = safe_certificate_path(ROOT, relative_path)
-            except ValueError:
+                payload = uploaded_pdf_bytes(query.get('path', [''])[0], query.get('sha256', [''])[0])
+                import pypdfium2 as pdfium
+                rendered = BytesIO()
+                with OPERATION_LOCK, pdfium.PdfDocument(payload) as document:
+                    _write_preview_image(document, 0, rendered)
+                image = rendered.getvalue()
+            except (ValueError, OSError, RuntimeError, IndexError):
                 self.send_error(404)
                 return
-            if not valid_pdf(destination):
+            self.send_response(200)
+            self.send_header('Content-Type', 'image/png')
+            self.send_header('Content-Length', str(len(image)))
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('X-Content-Type-Options', 'nosniff')
+            self.end_headers()
+            self.wfile.write(image)
+            return
+        if path.startswith('/api/certificates/'):
+            relative_path = unquote(path[len('/api/certificates/'):])
+            digest = parse_qs(urlsplit(self.path).query).get('sha256', [None])[0]
+            try:
+                if digest:
+                    payload = uploaded_pdf_bytes(relative_path, digest)
+                else:
+                    destination = safe_certificate_path(ROOT, relative_path)
+                    if not valid_pdf(destination):
+                        raise ValueError('Invalid PDF')
+                    payload = destination.read_bytes()
+            except (ValueError, OSError):
                 self.send_error_json('This PDF is missing or unreadable. Refresh and recreate it.', 404)
                 return
-            payload = destination.read_bytes()
             self.send_response(200)
             self.send_header('Content-Type', 'application/pdf')
             self.send_header('Content-Length', str(len(payload)))
@@ -2010,12 +2131,13 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
             if parsed.path == '/api/certificates/upload-file':
                 from external_certificate_upload import UPLOAD_LIMIT, stage_upload
-                if not 0 < length <= UPLOAD_LIMIT or self.headers.get('Content-Type') != 'application/pdf':
-                    raise ValueError('Choose a PDF smaller than 50 MB.')
+                content_type = self.headers.get('Content-Type')
+                if not 0 < length <= UPLOAD_LIMIT or content_type not in {'application/pdf', 'image/png', 'image/jpeg'}:
+                    raise ValueError('Choose a PDF, PNG, or JPEG file under 50 MB.')
                 payload = self.rfile.read(length)
                 if len(payload) != length:
-                    raise ValueError('The upload was interrupted. Choose the PDF again.')
-                self.send_json(stage_upload(ROOT, payload))
+                    raise ValueError('The upload was interrupted. Choose the file again.')
+                self.send_json(stage_upload(ROOT, payload, content_type=content_type))
                 return
             if length < 0 or length > 1_000_000:
                 raise ValueError("The request is too large.")
@@ -2042,7 +2164,7 @@ class Handler(BaseHTTPRequestHandler):
                     **({'next_cod': settings['next_cod']} if settings.get('next_cod') is not None else {}),
                 }})
             elif parsed.path == "/api/preview":
-                self.send_json(dict(preview_certificate(body), changed=False))
+                self.send_json(dict(editor_preview(body), changed=False))
             elif parsed.path == '/api/certificate-type':
                 kind = save_certificate_type_choice(body)
                 self.send_json({'saved': True, 'certificate_type': kind, 'changed': False})
@@ -2054,6 +2176,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(update_inward_status(body))
             elif parsed.path == '/api/certificates/link-external':
                 self.send_json(link_external_certificate(body))
+            elif parsed.path == '/api/certificates/upload-saved-file':
+                from external_certificate_upload import stage_saved_upload
+                self.send_json(stage_saved_upload(ROOT, body))
             elif parsed.path == '/api/certificates/save-upload':
                 self.send_json(save_uploaded_certificate(body))
             elif parsed.path == '/api/clients/followup':
@@ -2071,6 +2196,17 @@ class Handler(BaseHTTPRequestHandler):
                 if result.get('removed'):
                     WORKBOOK_CHECK_STAMPS.pop(str(ROOT), None)
                     result['state'] = post_commit_state(rebuild_history_state, saved_message='Inward removed from Excel')
+                self.send_json(result)
+            elif parsed.path == '/api/entries/undo-delete':
+                if body.get('kind') == 'inward':
+                    from inward_removal import undo_inward_removal
+                    result = undo_inward_removal(ROOT, body.get('request_id'), body.get('expected_revision'))
+                elif body.get('kind') == 'entries':
+                    from entry_deletion import undo_entry_deletion
+                    result = undo_entry_deletion(ROOT, body.get('request_id'), body.get('expected_revision'))
+                else:
+                    raise ValueError('Choose a saved deletion to undo.')
+                result['state'] = post_commit_state(rebuild_history_state, saved_message='Deletion undone')
                 self.send_json(result)
             elif parsed.path == '/api/destruction/request':
                 expected = body.get('expected_revision')
@@ -2095,7 +2231,8 @@ class Handler(BaseHTTPRequestHandler):
                 response = reviewed_operation(ROOT, parsed.path, body, lambda values: generate_draft(
                     ROOT, values.get('plant'), values.get('details'), values.get('record_id'),
                     confirmed=bool(values.get('confirmed')), override_reason=values.get('override_reason', ''),
-                    expected_revision=values.get('expected_revision'), starting_cod=values.get('starting_cod')))
+                    expected_revision=values.get('expected_revision'), starting_cod=values.get('starting_cod'),
+                    review_only=values.get('review_only') is True))
                 if response.get('created'):
                     response['state'] = post_commit_state(lambda: (
                         None if response.get('workbook_updated') else
@@ -2104,8 +2241,6 @@ class Handler(BaseHTTPRequestHandler):
                     if response.get('recovery_note'):
                         response['state'].update(refresh_pending=True, recovery_note=response['recovery_note'])
                     response['state'] = save_requested_destruction(dict(body, record_id=response.get('record_id')), response['state'])
-                else:
-                    response['state'] = cached_workspace_state(body.get('expected_revision')) or workspace_state()
                 if response.get('created'):
                     if response['state'].get('setup_warning'):
                         response.setdefault('warnings', []).append(response['state']['setup_warning'])
@@ -2118,10 +2253,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(response)
             elif parsed.path == "/api/manual/complete":
                 require_revision(ROOT, body.get('expected_revision'))
-                complete_draft(ROOT, body.get("record_id"), expected_revision=body.get('expected_revision'))
+                undo = body.get('undo_completed') is True
+                complete_draft(ROOT, body.get("record_id"), expected_revision=body.get('expected_revision'), undo=undo)
                 state = merge_manual_record_state(body.get('expected_revision'), body.get('record_id'))
                 if state is None:
-                    state = post_commit_state(workspace_state, saved_message='Completed status saved successfully')
+                    state = post_commit_state(workspace_state, saved_message='Completion undone' if undo else 'Completed status saved successfully')
                 self.send_json({"state": state})
             elif parsed.path == "/api/generate":
                 if str(body.get('custom_cod') or '').strip():
@@ -2133,7 +2269,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(reviewed_operation(ROOT, parsed.path, body, lambda values: generate(
                     selected=selected, plants=plants, selections=body.get('selections'),
                     confirmed=bool(values.get('confirmed')), expected_revision=values.get('expected_revision'),
-                    override_reason=values.get('override_reason', ''), starting_cod=values.get('starting_cod'))))
+                    override_reason=values.get('override_reason', ''), starting_cod=values.get('starting_cod'),
+                    review_only=values.get('review_only') is True)))
             elif parsed.path == "/api/create":
                 self.send_json(reviewed_operation(ROOT, parsed.path, body, create_certificate))
             elif parsed.path == "/api/pick-annexure":
@@ -2375,10 +2512,24 @@ class Handler(BaseHTTPRequestHandler):
                         threading.Thread(target=SERVER.shutdown, daemon=True).start()
             else:
                 self.send_error_json("Unknown action.", 404)
+        except ClientAddRequestEnded as exc:
+            self.send_json({'error': str(exc), 'client_request_ended': True}, 400)
         except (ValueError, OSError, RuntimeError, KeyError, json.JSONDecodeError) as exc:
             self.send_error_json(exc)
-        except Exception as exc:
-            self.send_error_json(exc, 500)
+        except Exception:
+            report = ROOT / 'Data' / 'Reports' / 'Last Dashboard Error.txt'
+            try:
+                report.parent.mkdir(parents=True, exist_ok=True)
+                report.write_text(
+                    f'{datetime.now().isoformat()} POST {parsed.path}\n{traceback.format_exc()}',
+                    encoding='utf-8',
+                )
+            except OSError:
+                self.send_error_json('An unexpected error interrupted the operation. Refresh to check what was saved.', 500)
+            else:
+                self.send_error_json(
+                    'An unexpected error interrupted the operation. Refresh to check what was saved. '
+                    'Technical details are in Data / Reports / Last Dashboard Error.txt.', 500)
 
     def _same_origin(self):
         host = self.headers.get("Host", "").split(":", 1)[0].casefold()

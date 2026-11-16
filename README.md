@@ -34,26 +34,24 @@ record store and reconciliation design that supports continued manual Excel edit
 The app still checks used numbers across the workbooks and certificate history.
 Leave the field blank to continue automatic numbering.
 
-Use **Upload PDF** beside **Refresh** for a certificate created outside the app.
-Choose an Excel inward or save the certificate in the app only. The app uses the
-COD it reads from the PDF, the inward's existing COD, or the next available
-number in that order. It assigns the number when you save. Selecting a client
-fills in the saved company, site, received date, reference, Form 6 and any
-saved certificate weight. Check the saved certificate type and issue date, and
-enter the issue date if it is blank. Edits to the prefilled fields are saved
-with the certificate. Use **Review & edit** in Companies to correct the Excel
-inward. For a new app-only record, enter its company details.
-The app keeps the original PDF in **Certificates** and records its status as
-**Generated Externally**. An uploaded Data Destruction certificate uses its own
-record and COD. External PDFs already in **Certificates** can also be
-linked from **Saved certificates → Details**. Mark the record **Completed** after
-sending it. **Generated Externally** is recorded by the app when you attach a PDF.
+Use **Upload certificate** for a PDF, PNG or JPEG created outside the app. For a
+PDF already in the Certificates folder, choose **Saved certificates → Details →
+Save this certificate** to open the same form. Pick the certificate type, attach
+it to a client or save an app-only record, then check the issue date and details.
+The app uses the COD read from the file or the inward's existing COD. If neither
+is available, enter the displayed COD from the original or leave it blank for
+the app to assign one.
 
-To revise an issued certificate with your own file, choose **Upload PDF → Save to
-→ Replace an existing certificate PDF**. Search by company, plant or COD,
-select the existing certificate, and review its saved details. **Replace PDF**
-keeps the COD, archives the previous PDF and marks the revision **Generated
-Externally**. Use **Review & edit** to make corrections with an app template.
+Recycling and Data Destruction use separate records and CODs for the same client.
+To add the second certificate, choose its type and select the same client.
+Companies shows the details saved with the certificate, and Review shows the
+uploaded original. PDFs are kept as uploaded. PNG and JPEG files are saved as
+single-page PDFs. Mark each certificate **Completed** after sending it.
+
+To revise an issued certificate with your own file, choose **Replace PDF** in
+its review or use **Upload certificate → Replace an existing certificate PDF**.
+The replacement keeps the COD, archives the previous PDF and marks the revision
+**Generated Externally**.
 
 In **Review & edit**, uncheck **Recycling certificate needed** to mark only the
 Recycling certificate N/A. The equivalent checkbox uses the selected certificate
@@ -64,6 +62,8 @@ recorded separately in Excel.
 Use the trash icon beside an inward in **Companies** to delete an entry entered by mistake, up to the point when a certificate is generated. An assigned number alone does not hide the action. Generated or Completed entries, including entries with an issued HDD certificate or missing issued PDF, cannot be deleted. **Settings → Advanced → Search entries to delete** follows the same rule. Pending, ungenerated HDD requests can be included in the reviewed deletion or retained as standalone records.
 
 Review the company, plant and materials, tick the confirmation, then remove the inward. The app keeps a workbook backup, physically removes the entire inward block, shifts later rows up, and closes numeric SN gaps. Text SNs and existing certificate numbers remain unchanged; receipt and HDD links follow renumbered inwards. Cancel does not delete anything, and repeated requests cannot remove a replacement entry.
+
+Use **Undo deletion** after removing an entry, or **Settings → Advanced → Undo last deletion**. The app checks the affected files before restoring. If a later edit prevents automatic restoration, the app identifies the recovery copies. If you mark a certificate **Completed** by mistake, choose **Undo Completed** in Companies and confirm **Yes, undo** to put it back in the send queue.
 
 Refresh also removes wholly empty row boxes left by older deletions, with a workbook backup. Blank rows within populated merged client blocks remain intact. Workbooks with unsupported formulas or objects retain their rows and show a maintenance warning for review in Excel.
 
@@ -111,7 +111,7 @@ Keep each plant's existing register layout. The app keeps **Comments**, **Transp
 To start a plant register from scratch, choose **Create template** for that plant in Settings. The app makes a blank `.xlsx` with the standard headings, readable client-block formatting, a Certificate Issued dropdown and colors. The total-weight formula is added when a client is entered through **Add client**. Choose a new filename; an existing workbook is never overwritten. The new file becomes active only after you click **Save** in Settings. **Choose file** continues to connect an existing workbook without replacing its layout.
 3. Search for the company and choose **Review & edit**. Change the company details, received date, materials or certificate weight and check the PDF preview beside them. Choose Recycling, Medical or International. **Data Destruction needed** adds a separate pending HDD task when you save; it does not create another PDF or assign an HDD number. Before the first PDF exists, **Save to Excel** lets you save corrected inward details without creating a certificate. Excel changes require **Yes, update Excel**. When creating a PDF, **No, keep Excel details** uses the edits only on the certificate. COD is assigned when the PDF is created. **Create several** shows a searchable checklist of Ready clients, with nothing checked initially. Search by company, SN, reference or city. Selections stay checked across searches; the footer shows the total and any selected clients hidden by the search. **Select shown** changes only matching clients. Only checked clients receive PDFs, and warnings still need review. Creating the chosen PDFs keeps the other clients visible in the company list.
 
-   **Details to finish** lists inwards with missing Comments, Transporter / vehicle details, Docket no. / vehicle no., or Weight slip / scale weight. All four fields are visible in Add client and directly in Review & edit. Enter them when known; any blanks appear in this separate view, including after Completed. They do not block certificate creation or join urgent certificate reminders. Saving only these four fields asks **Yes, update Excel** and keeps the PDF and certificate status unchanged. Status buttons and the additional company filters stay visible.
+   **Details to finish** lists inwards with missing Comments, Transporter / vehicle details, Docket no. / vehicle no., or Weight slip / scale weight, including Completed and N/A inwards. N/A applies to the certificate. All four fields are visible in Add client and Review & edit. These fields are optional for certificate creation. Saving only these four fields asks **Yes, update Excel** and keeps the PDF and certificate status unchanged.
 4. Find PDFs in the top-level **Certificates** folder. Names use `{COD}_Company name_City, Country.pdf`. Underscores separate sections; spaces inside company and location names are preserved. The COD matches the number written to Excel; the plant is tracked in the source record.
 5. Choose **Open PDF** to check the saved certificate and send it through the normal company process. Then choose **Mark Completed** beside that company; Excel records **Completed** and reminders stop.
 
@@ -144,7 +144,7 @@ While the dashboard is open, it checks for saved Excel changes every 15 seconds 
 
 If Excel changes during a review, the rejected action refreshes the company list automatically. An outdated deletion review closes so it can be reopened against the current rows. Entered certificate details remain in the editor; close and reopen the entry to review the latest Excel facts before saving. The app never automatically repeats the rejected save or deletion.
 
-The everyday screen keeps search, plant selection and quick **All / Ready / Alert** choices visible. **More filters** reveals other statuses and certificate types; active selections remain visible in its heading. Clearing company search/filters keeps the selected plant. **Summary & analytics** reveals the status totals. The Alert view includes day-25 follow-ups without approving unfinished inwards or N/A rows. **Create several** lists eligible Excel rows in the selected plant, regardless of search, status or type filters. Use **Review & edit** to fill missing details for any company that is absent from the checklist. Close the batch dialog to cancel. If a batch only partly succeeds, the result shows what saved and which companies still need a certificate. Resolve the listed issues, refresh and select the unfinished companies for retry.
+The **Companies** view keeps search, plant selection and status filters visible. **Filters** adds certificate type, SN, received-date range and follow-up choices such as pending HDD work, PDFs to send and missing Form 6 or reference. Enter the same date in both fields to find a single day. Each active filter appears below the search bar and can be removed individually. **Clear all filters** clears search and returns to all plants and statuses while keeping the selected sort order. **Create several** lists eligible Excel rows for the selected plant and starts with no companies checked. Use **Review & edit** to fill missing details for any company that is absent from the checklist. If a batch only partly succeeds, the result shows which companies still need a certificate. Resolve the listed issues, refresh and select those companies for retry.
 
 Use **New certificate** when the details were not entered in Excel first. **Where details are saved** contains **Save details in**, the plant/workbook selection and SN. A new numeric ID is suggested from the selected plant when all its IDs are numeric; you can change it. A new Excel record is saved only when PDF creation succeeds, and an existing ID is rejected rather than replaced. Under the materials section, enter a material and its weight, then use **+ Add another material** for additional lines. The app calculates the total and previews it automatically; optional quantity-based calculations remain available. Adding materials in Review & edit inserts the required rows before the next client, moves that client's complete block, and extends the selected inward's merges and supported total formulas.
 
@@ -172,7 +172,7 @@ Every source or layout issue is shown as a warning. Before generation, the app l
 
 ## Requested data destruction certificates
 
-To remove a linked request before creating its PDF, clear **Keep this Data Destruction request active** in the HDD editor and choose **Save request**; it leaves pending work while retaining its saved details. If an HDD PDF was already issued, confirm removal; the PDF and number are preserved.
+To remove a linked request before creating its PDF, clear **Keep this Data Destruction request active** in the HDD editor and choose **Save request**. The saved details remain available. Once the PDF is issued, the editor shows the certificate status. Use **Mark Completed** on the Data Destruction row after sending it.
 
 Open **Review & edit**, check **Data Destruction needed**, and save. This marks an additional HDD certificate as needed without generating it or allocating a number. **Review Data Destruction** appears inside the same panel to open the saved task later. The app copies the company/location and links it to the plant and SN. Enter the actual destruction date, received dates and whole device counts when preparing its PDF. Device counts are never inferred from material weights. Reopening reuses the existing task. The HDD gets its own number from the shared sequence when its PDF is created.
 

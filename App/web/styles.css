@@ -166,16 +166,11 @@ tbody tr.data-row.expanded { background: #fbfcfa; }
 .field b, .required-note b { color: #c06d50; font-weight: 700; }
 .field small { color: #9aa59e; font-size: 9px; font-weight: 400; margin-left: 4px; }
 .field input, .field select, .field textarea { background: #fff; border: 1px solid #e0e7e0; border-radius: 6px; color: #42544a; font: inherit; font-size: 11px; min-height: 36px; outline: 0; padding: 0 10px; width: 100%; }
-.date-input-control { display: flex; position: relative; width: 100%; }
+.date-input-control { align-items: stretch; display: flex; min-width: 0; position: relative; width: 100%; }
 .date-input-control > input[data-date-input] { flex: 1 1 auto; min-width: 0; }
-.date-picker-button { align-items: center; background: #fff; border: 1px solid #e0e7e0; border-left: 0; border-radius: 0 6px 6px 0; color: #53645b; display: inline-flex; flex: 0 0 40px; font-size: 19px; justify-content: center; margin-left: -1px; padding: 0; position: relative; }
+.date-picker-button { align-items: center; background: #fff; border: 1px solid #c9d0d5; border-left: 0; border-radius: 0 6px 6px 0; color: #53645b; display: inline-flex; flex: 0 0 40px; font-size: 19px; justify-content: center; padding: 0; position: relative; }
 .date-input-control > input[data-date-input] { border-radius: 6px 0 0 6px; }
 .date-input-control > input[data-date-input]:read-only { border-radius: 6px; }
-.external-link-form { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); align-items: end; gap: 12px; margin: 0 26px 18px; }
-.external-link-form > .field { grid-column: auto; }
-.external-link-form > p { margin: 0; }
-.external-link-form > .inward-picker { align-self: start; }
-.external-link-form > .field:has(> .date-input-control) { align-self: start; }
 .inward-picker > label { color: var(--ink); font-size: inherit; font-weight: 600; }
 .inward-options { background: #fff; border: 1px solid #bfcfc6; border-radius: 6px; max-height: 210px; overflow: auto; }
 .inward-option { background: #fff; border: 0; color: var(--ink); display: grid; font: inherit; gap: 3px; overflow-wrap: anywhere; padding: 8px 10px; text-align: left; width: 100%; }
@@ -189,10 +184,9 @@ tbody tr.data-row.expanded { background: #fbfcfa; }
 #upload-materials ul { margin: 4px 0 0; padding-left: 20px; }
 .upload-certificate-modal input[type="file"] { padding: 8px; }
 .upload-certificate-modal #upload-certificate-error { margin: 0; }
-@media (max-width: 560px) { .external-link-form { grid-template-columns: minmax(0, 1fr); } }
 .date-input-control:has(> input[data-date-input]:read-only) > .date-picker-button { display: none; }
 .date-picker-button:hover, .date-picker-button:focus-visible { background: #f4f8f4; border-color: #83a990; }
-.date-picker-native { cursor: pointer; height: 100%; min-height: 0; opacity: 0; pointer-events: none; position: absolute; right: 0; top: 0; width: 40px; }
+.date-input-control > .date-picker-native { cursor: pointer; height: 100%; min-height: 0; opacity: 0; pointer-events: none; position: absolute; right: 0; top: 0; width: 40px; }
 .date-input-control:focus-within { border-radius: 6px; box-shadow: 0 0 0 3px #edf5ef; }
 .date-input-control > input[data-date-input]:focus { box-shadow: none; }
 .field input:focus, .field select:focus, .field textarea:focus { border-color: #83a990; box-shadow: 0 0 0 3px #edf5ef; }
@@ -708,6 +702,7 @@ button:focus-visible, summary:focus-visible, a:focus-visible { outline-color: #4
 .destruction-choice-label strong { font-size: 16px; line-height: 1.45; }
 .destruction-choice-label small, .destruction-choice-footer p { font-size: 14px; line-height: 1.55; color: var(--muted); }
 .destruction-choice-footer { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 16px; margin-left: 33px; }
+#destruction-issued-label:not([hidden]) + .destruction-choice-footer { margin-left: 0; }
 .destruction-choice-footer p { flex: 1; min-width: 180px; margin: 10px 0 0; }
 .destruction-choice-footer .button { margin-top: 10px; }
 #excel-save-description, #excel-save-note { font-size: 15px; line-height: 1.6; }
@@ -919,6 +914,7 @@ th:last-child { width: 30%; }
 .client-material-equation > .field { grid-column:auto; }
 #dismiss-toast { color: #fff; background: transparent; border: 1px solid #ffffff55; border-radius: 3px; min-width: 30px; min-height: 30px; font-size: 20px; }
 .toast.error.visible, #dismiss-toast { pointer-events: auto; }
+#undo-deletion-toast { pointer-events: auto; color: #fff; background: transparent; border: 1px solid #ffffff88; border-radius: 4px; padding: 6px 10px; white-space: nowrap; }
 .offline-card .button { margin-top: 18px; }
 /* Use wide monitors for the content, rather than enlarging text or controls. */
 @media (min-width: 1200px) {
@@ -970,7 +966,7 @@ th:last-child { width: 30%; }
 .device-receipt-row { display:grid; grid-template-columns:minmax(130px,1fr) minmax(110px,1fr) auto; align-items:end; gap:10px; margin-bottom:12px; }
 .device-receipt-row .field { min-width:0; }
 .device-receipt-row > .field { grid-column:auto; }
-.device-receipt-row button { margin-bottom:10px; }
+.device-receipt-row > .text-button { margin-bottom:10px; }
 #preview-detail-images img { display:block; width:100%; height:auto; margin-top:18px; border:1px solid #ddd; }
 .preview-attachment { margin-top:24px; padding-top:20px; border-top:1px solid #dce3dd; }
 .preview-attachment h4 { font-size:18px; margin:0 0 8px; }
@@ -979,7 +975,7 @@ th:last-child { width: 30%; }
 .preview-attachment-controls .button { font-size:16px; min-height:40px; }
 #preview-attachment-count, #preview-attachment-status, #preview-attachment-retry { font-size:16px; }
 #preview-attachment-image img { display:block; width:100%; height:auto; border:1px solid #c9d0d5; background:#fff; }
-@media (max-width:620px) { .device-receipt-row { grid-template-columns:1fr 1fr; } .device-receipt-row button { grid-column:1 / -1; justify-self:start; } }
+@media (max-width:620px) { .device-receipt-row { grid-template-columns: minmax(0,1fr) minmax(0,1fr); } .device-receipt-row > .text-button { grid-column:1 / -1; justify-self:start; margin-bottom:0; } }
 
 /* Keep each company's status and actions together in the desktop list. */
 #records-workspace table { min-width:1120px; }
@@ -995,6 +991,12 @@ th:last-child { width: 30%; }
 .filter-toggle.has-filters, .filter-toggle[aria-expanded="true"] { color:var(--green, #216b52); background:#edf5f0; border-color:#aac9b8; }
 .filter-active-count { display:inline-grid; place-items:center; min-width:22px; height:22px; padding:0 5px; border-radius:50%; color:white; background:var(--green, #216b52); font-size:13px; font-weight:700; }
 .filter-active-count[hidden] { display:none; }
+.record-filter-chips { display:flex; flex:0 0 100%; flex-wrap:wrap; gap:6px 8px; min-width:0; }
+.record-filter-chip { display:inline-flex; align-items:center; gap:8px; min-height:32px; max-width:100%; padding:4px 9px; border:1px solid #aac9b8; border-radius:6px; background:#edf5f0; color:var(--ink); line-height:1.35; }
+#clear-file-search { min-height:48px; }
+.record-filter-chip:hover { background:#e0eee6; }
+.record-filter-chip span:first-child { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.record-filter-chip span:last-child { flex:none; font-size:17px; }
 .record-filter-popover { position:fixed; inset:auto; margin:0; width:480px; max-width:calc(100vw - 32px); padding:22px; border:1px solid var(--line); border-radius:12px; box-shadow:0 12px 40px #1f3c2829; background:white; color:var(--ink); overflow:auto; }
 .record-filter-popover:not(:popover-open) { display:none; }
 .record-filter-heading { display:flex; align-items:center; justify-content:space-between; gap:16px; margin-bottom:20px; }
@@ -1002,7 +1004,8 @@ th:last-child { width: 30%; }
 .record-filter-heading .icon-button { width:34px; height:34px; font-size:24px; }
 #more-filters .filter-fields { display:grid; grid-template-columns:1fr 1fr; gap:18px 16px; padding:0; }
 #more-filters .field { min-width:0; width:100%; grid-column:auto; }
-#more-filters .field:first-child, #more-filters .field:last-child { grid-column:1 / -1; }
+#more-filters .field:has(#record-followup-filter), #more-filters .field:last-child, .record-filter-error { grid-column:1 / -1; }
+.record-filter-error { margin:0; color:#a1332e; font-size:14px; }
 .record-filter-footer { display:flex; align-items:center; justify-content:space-between; margin-top:24px; padding-top:18px; border-top:1px solid var(--line); }
 .bulk-choices { max-height:360px; overflow:auto; border:1px solid var(--line); border-radius:8px; margin:16px 24px; }
 .bulk-choice { display:flex; align-items:center; gap:14px; padding:13px 16px; border-bottom:1px solid var(--line); cursor:pointer; }

@@ -71,6 +71,16 @@ class BackupServiceTests(unittest.TestCase):
     def restore(self, item):
         return backup.restore_backup(self.root, item["backup_id"], confirmed=True)
 
+    def test_backup_restores_after_a_completed_deletion_undo(self):
+        identifier = 'a' * 32
+        data = json.dumps({'id': identifier, 'version': 1, 'state': 'undone'}).encode()
+        journal = self.put(f'Data/Entry Deletions/{identifier}.json', data)
+        saved = self.create()
+        self.put('Data/Working Drafts/later.json', b'{"draft":true}')
+        restored = self.restore(saved)
+        self.assertEqual(restored['backup_id'], saved['backup_id'])
+        self.assertEqual(journal.read_bytes(), data)
+
     def manifest(self, item):
         with ZipFile(item["path"]) as archive:
             return json.loads(archive.read("manifest.json"))

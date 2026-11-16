@@ -6,11 +6,14 @@ const commonTemplateKeys = new Set(['supplier', 'location', 'inward_date', 'cert
 const revisionEndpoints = new Set(['/api/create', '/api/generate', '/api/manual/save', '/api/manual/generate', '/api/manual/complete', '/api/complete', '/api/backup/restore', '/api/clients/add', '/api/clients/update', '/api/clients/followup', '/api/clients/remove-preview', '/api/clients/remove', '/api/destruction/request']);
 const followupFields = {comments:'Comments', transporter_details:'Transporter / vehicle details', docket_vehicle_no:'Docket no. / vehicle no.', weight_slip_scale:'Weight slip / scale weight'};
 revisionEndpoints.add('/api/entries/delete-preview'); revisionEndpoints.add('/api/entries/delete');
+revisionEndpoints.add('/api/entries/undo-delete');
+const deletionUndoKey = 'ecoreco-last-deletion';
 revisionEndpoints.add('/api/clients/status'); revisionEndpoints.add('/api/certificates/link-external');
 revisionEndpoints.add('/api/certificates/save-upload');
 function hasInward(row) { return row && !isManual(row) && ['plant1','plant2'].includes(row.plant) && String(row.sn || '').trim(); }
 function missingFollowup(row) { return hasInward(row) ? Object.keys(followupFields).filter(key => !String(row[key] || '').trim()) : []; }
 const workingDraftKey = 'ecoreco.certificate.working-draft.v1';
+const showWorkingDraftRecovery = false;
 const fieldLabels = { plant: 'Plant', source_kind: 'Use details from', certificate_type: 'Certificate type', case_id: 'SN', supplier: 'Company name', location: 'City', inward_date: 'Received date', certificate_weight: 'Certificate Weight (kg)', item: 'Item description', items: 'Materials and weights', quantity: 'Quantity', per_piece_weight: 'Per piece weight (kg)', weight: 'Inward weight (kg)', form6: 'Form 6 number', reference: 'Reference number', cod_no: 'Certificate number', cod_date: 'Certificate date', starting_cod:'Starting COD number' };
 Object.assign(fieldLabels, followupFields);
 function isManual(row) { return row.source_kind === 'manual'; }
@@ -267,6 +270,7 @@ async function saveClient() {
   const serialValid = validateClientSerialNumber();
   if (!serialValid) { form.elements.namedItem('sn').focus(); return; }
   if (!form.reportValidity()) return;
+  app.clientRequestId ||= Array.from({length:32}, () => Math.floor(Math.random() * 16).toString(16)).join('');
   const payload = clientEntryPayload(form);
   app.clientBusy = true;
   $('#add-client-error').hidden = true;
@@ -289,7 +293,17 @@ async function saveClient() {
       : row && readyForBatch(row) ? 'Ready to create a certificate.' : 'Open Review & edit to finish the certificate details.';
     toast(`${response.client.supplier} added to ${labelPlant(response.client.plant)}. ${next}`);
   } catch (error) {
-    $('#add-client-error').textContent = noticeText(error.message);
+    if (error.clientRequestEnded) {
+      app.clientRequestId = null;
+      app.clientPendingAttempt = null;
+      app.clientRevision = null;
+    }
+    if (error.workspaceRecovered) {
+      app.clientRevision = app.workspaceRevision;
+      $('#add-client-error').textContent = 'The Excel list was refreshed. Your entries are kept. Review them, then choose Add to Excel again.';
+    } else {
+      $('#add-client-error').textContent = noticeText(error.message);
+    }
     $('#add-client-error').hidden = false;
     $('#add-client-error').focus();
     $('#add-client-error').scrollIntoView?.({block:'nearest'});
@@ -742,9 +756,8 @@ function renderWarningList(list, warnings, compact = false) {
 
 function nextStep(row) {
   if (recordIdentityIssue(row)) return recordIdentityIssue(row);
-  if (row.destruction_pending) return row.pdf_filename
-    ? 'Send the Data Destruction PDF, then click Mark Completed.'
-    : 'Add the device details in Review & edit, then create the Data Destruction PDF.';
+  const destructionAction = destructionFollowupAction(row);
+  if (destructionAction) return destructionAction;
   switch (stateOf(row)) {
     case 'generated': case 'generated_manual': return 'Your PDF is saved. Send it, then mark it Completed.';
     case 'completed': return 'This certificate is marked Completed.';
@@ -774,15 +787,16 @@ function dismissToast() {
   clearTimeout(app.toastTimer);
 }
 
-function toast(message, isError = false) {
+function toast(message, isError = false, canUndoDeletion = false) {
   const node = $('#toast');
   $('#toast-message').textContent = isError ? noticeText(message) : message;
-  $('#dismiss-toast').hidden = !isError;
+  $('#dismiss-toast').hidden = !isError && !canUndoDeletion;
+  $('#undo-deletion-toast').hidden = !canUndoDeletion;
   node.classList.toggle('error', isError);
   node.classList.add('visible');
   syncToastLayer();
   clearTimeout(app.toastTimer);
-  if (!isError) app.toastTimer = setTimeout(dismissToast, 4500);
+  if (!isError && !canUndoDeletion) app.toastTimer = setTimeout(dismissToast, 4500);
 }
 
 function setBusy(on, title = 'Checking workbooks…', description = 'This usually takes a few seconds.') {
@@ -816,6 +830,7 @@ async function api(path, payload, {background = false} = {}) {
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
     const error = new Error((data.error || `Request failed (${response.status}).`) + (response.status === 409 ? ' Refresh Excel and reopen the details to review the latest data. Your working draft is kept.' : ''));
+    error.clientRequestEnded = path === '/api/clients/add' && data.client_request_ended === true;
     error.workspaceChanged = /files changed|Excel has changed|files have changed/i.test(error.message);
     if (error.workspaceChanged && path !== '/api/check') {
       // Reload the queue, never replay the rejected write. An open review
@@ -946,7 +961,12 @@ function savedFileLabel(entry) {
   const relativePath = String(entry.path || '').replaceAll('\\', '/').replace(/^Certificates\//i, '');
   const row = savedFileUrl(entry) && app.state.rows.find(row => row.pdf_filename === filename
     && row.pdf_relative_path === relativePath);
-  return row?.supplier || certificateFileTitle(entry);
+  return (row && savedCertificateDetails(row).supplier) || certificateFileTitle(entry);
+}
+
+function savedCertificateDetails(row) {
+  return row.uploaded_pdf_sha256 && row.last_certificate_details && !recordIdentityIssue(row)
+    ? row.last_certificate_details : row;
 }
 
 function savedFileRecord(entry) {
@@ -982,7 +1002,9 @@ function savedFileMatches(entry) {
   const type = $('#saved-template-filter').value || 'all';
   if (type !== 'all' && savedFileTypeId(entry) !== type) return false;
   const words = $('#saved-file-search').value.toLowerCase().trim().split(/\s+/).filter(Boolean);
-  const haystack = [savedFileLabel(entry), entry.path, ...currentFileNumbers(entry), ...(entry.references || [])]
+  const record = savedFileRecord(entry);
+  const reference = record && savedCertificateDetails(record).reference;
+  const haystack = [savedFileLabel(entry), reference, entry.path, ...currentFileNumbers(entry), ...(entry.references || [])]
     .join(' ').replaceAll('_', ' ').toLowerCase();
   return words.every(word => haystack.includes(word));
 }
@@ -998,10 +1020,7 @@ function setWorkspaceView(view) {
   $('#folder-inventory').hidden = !files;
   $('#view-records').setAttribute('aria-pressed', String(!files && !analytics));
   $('#view-files').setAttribute('aria-pressed', String(files));
-  if (files) {
-    $('#saved-plant-filter').value = 'all';
-    renderFolderInventory();
-  }
+  if (files) renderFolderInventory();
   $('#page-title').textContent = files ? 'Saved certificates' : 'Your certificates';
   $('#page-description').textContent = files ? 'Find a PDF and open it. Files added manually appear here too.'
     : 'Find a company, check its certificate, and create the PDF.';
@@ -1012,34 +1031,138 @@ function setWorkspaceView(view) {
   }
 }
 
-function resetRecordFilters() {
-  $('#search').value = '';
-  $('#status-filter').value = 'all';
-  $('#template-filter').value = 'all';
-  $('#serial-filter').value = ''; $('#received-date-filter').value = ''; $('#company-sort').value = 'received-oldest';
-  app.page = 1; app.expanded = null;
-  render(); // A reset must never unexpectedly switch the selected plant.
+const recordFilterDefaults = {
+  search:'', 'plant-filter':'all', 'status-filter':'all', 'template-filter':'all',
+  'serial-filter':'', 'received-date-filter':'', 'received-to-filter':'', 'record-followup-filter':'all',
+};
+const recordStatusTitles = {
+  all:'All companies', ready:'Ready', needs_attention:'Needs attention', details_to_finish:'Details to finish',
+  generated:'Generated', generated_manual:'Generated Externally', completed:'Completed', blank:'No status selected',
+  na:'N/A', pending_review:'Not ready yet', awaiting_send:'Created, not completed',
+  destruction_pending:'Data Destruction follow-up', overdue_unissued:'No certificate after 30 days',
+  needs_inward_date:'Inwards that need a received date', pdf_missing:'Missing or unavailable PDF',
+  missing_paperwork:'Missing Form 6 or reference',
+};
+const savedFilterDefaults = {'saved-file-search':'', 'saved-plant-filter':'all', 'saved-template-filter':'all'};
+
+function clearSavedFilter(id) {
+  $(`#${id}`).value = savedFilterDefaults[id];
 }
 
-function updateRecordFilterButton() {
-  const count = Number(!['all',''].includes($('#template-filter').value))
-    + Number(Boolean($('#serial-filter').value.trim()))
-    + Number(Boolean($('#received-date-filter').value))
-    + Number(!['','received-oldest'].includes($('#company-sort').value));
-  $('#record-filter-count').textContent = String(count);
-  $('#record-filter-count').hidden = count === 0;
+function restartSavedList() {
+  app.savedFilesPage = 1;
+  renderFolderInventory();
+}
+
+function updateSavedFilters() {
+  const search = $('#saved-file-search').value.trim();
+  const plant = $('#saved-plant-filter').value || 'all';
+  const type = $('#saved-template-filter').value || 'all';
+  const chips = [];
+  if (plant !== 'all') chips.push([plant === 'unknown' ? 'Plant not identified' : labelPlant(plant), ['saved-plant-filter']]);
+  if (type !== 'all') chips.push([templateNames[type] || type, ['saved-template-filter']]);
+  if (search) chips.push([`Search: ${search}`, ['saved-file-search']]);
+  $('#clear-file-search').hidden = chips.length === 0;
+  $('#saved-filter-count').textContent = String(chips.length);
+  renderFilterChips($('#saved-filter-chips'), chips, clearSavedFilter, restartSavedList, $('#saved-file-search'));
+}
+
+function clearRecordFilter(id) {
+  const control = $(`#${id}`);
+  if (id === 'attention-only') control.checked = false;
+  else control.value = recordFilterDefaults[id];
+  if (id === 'received-date-filter' || id === 'received-to-filter') control.setCustomValidity('');
+}
+
+function clearRecordFilterValues() {
+  for (const id of [...Object.keys(recordFilterDefaults), 'attention-only']) clearRecordFilter(id);
+  app.analyticsAsOf = null;
+}
+
+function restartRecordList() {
+  app.page = 1; app.expanded = null;
+  render();
+}
+
+function resetRecordFilters() {
+  clearRecordFilterValues();
+  restartRecordList();
+  $('#search').focus();
+}
+
+function readRecordFilters() {
+  const plant = $('#plant-filter').value || 'all', status = $('#status-filter').value || 'all';
+  const template = $('#template-filter').value || 'all', followup = $('#record-followup-filter').value || 'all';
+  const search = $('#search').value.trim(), serial = $('#serial-filter').value.trim();
+  const fromText = $('#received-date-filter').value.trim(), toText = $('#received-to-filter').value.trim();
+  const from = normalizeDate(fromText), to = normalizeDate(toText);
+  const attentionOnly = status === 'needs_attention' && Boolean($('#attention-only').checked);
+  return {plant, status, template, followup, search, serial, fromText, toText, from, to, attentionOnly};
+}
+
+function updateRecordFilterButton(filters = readRecordFilters()) {
+  const {plant, status, template, followup, search, serial, fromText, toText, from, to, attentionOnly} = filters;
+  const chips = [];
+  if (plant !== 'all') chips.push([labelPlant(plant), ['plant-filter']]);
+  if (status !== 'all') chips.push([recordStatusTitles[status] || status, ['status-filter']]);
+  if (attentionOnly) chips.push(['Needs attention status only', ['attention-only']]);
+  if (template !== 'all') chips.push([templateNames[template] || template, ['template-filter']]);
+  if (followup !== 'all') chips.push([$('#record-followup-filter').selectedOptions?.[0]?.textContent || recordStatusTitles[followup], ['record-followup-filter']]);
+  if (search) chips.push([`Search: ${search}`, ['search']]);
+  if (serial) chips.push([`SN: ${serial}`, ['serial-filter']]);
+  if (fromText || toText) {
+    const label = fromText && toText ? `Received: ${dateLabel(fromText)}–${dateLabel(toText)}`
+      : fromText ? `Received from ${dateLabel(fromText)}` : `Received through ${dateLabel(toText)}`;
+    chips.push([label, ['received-date-filter', 'received-to-filter']]);
+  }
+  const count = chips.length;
+  const badge = $('#record-filter-count');
+  badge.textContent = String(count);
+  badge.hidden = count === 0;
+  $('#reset-record-filters').hidden = count === 0;
+  $('#clear-filters').disabled = count === 0;
   $('#open-record-filters').classList.toggle('has-filters', count > 0);
   $('#open-record-filters').setAttribute('aria-label', count ? `Filters, ${count} active` : 'Filters');
+  const dateError = $('#received-range-error');
+  dateError.textContent = (fromText && !from) || (toText && !to) ? 'Enter dates as DD/MM/YY.'
+    : from && to && from > to ? 'Received from must be on or before Received to.' : '';
+  dateError.hidden = !dateError.textContent;
+
+  renderFilterChips($('#record-filter-chips'), chips, clearRecordFilter, restartRecordList, $('#search'));
+}
+
+function renderFilterChips(strip, chips, clearFilter, restartList, searchInput) {
+  strip.hidden = chips.length === 0;
+  const signature = JSON.stringify(chips);
+  if (strip.dataset.filters === signature) return;
+  strip.dataset.filters = signature;
+  strip.replaceChildren();
+  chips.forEach(([label, ids], index) => {
+    const button = element('button', 'record-filter-chip');
+    button.type = 'button';
+    button.setAttribute('aria-label', `Remove filter ${label}`);
+    const cross = element('span', '', '×');
+    cross.setAttribute('aria-hidden', 'true');
+    button.append(element('span', '', label), cross);
+    button.addEventListener('click', () => {
+      ids.forEach(clearFilter);
+      restartList();
+      (strip.children[index] || strip.children[index - 1] || searchInput).focus();
+    });
+    strip.append(button);
+  });
 }
 
 function positionRecordFilters() {
   const panel = $('#more-filters');
   const rect = $('#open-record-filters').getBoundingClientRect();
   const viewportHeight = window.innerHeight || 800;
+  const viewportWidth = window.innerWidth || 1280;
+  const width = Math.min(panel.getBoundingClientRect().width || 480, viewportWidth - 32);
   const height = Math.min((panel.scrollHeight || 418) + 2, viewportHeight - 32);
   const top = Math.max(16, Math.min(rect.bottom + 8, viewportHeight - height - 16));
   panel.style.top = `${top}px`;
-  panel.style.right = `${Math.max(16, (window.innerWidth || 1280) - rect.right)}px`;
+  panel.style.right = `${Math.max(16, Math.min(viewportWidth - rect.right, viewportWidth - width - 16))}px`;
   panel.style.maxHeight = `${viewportHeight - top - 16}px`;
 }
 
@@ -1088,8 +1211,8 @@ function inwardPicker(id, onSelection = () => {}) {
   let rows = [], matches = [], selected = null, active = -1;
   let emptyMessage = 'No available Excel inwards.';
   const key = row => row.record_id || `${row.plant}:${row.sn}`;
-  const company = row => row.supplier || 'Company name missing';
-  const identity = row => [labelPlant(row.plant), row.plant && `SN ${row.sn}`,
+  const company = row => savedCertificateDetails(row).supplier || 'Company name missing';
+  const identity = row => [labelPlant(row.plant), row.plant && `SN ${row.sn}`, templateNames[templateId(row)],
     row.certificate_no && `COD ${row.certificate_no}`].filter(Boolean).join(' · ');
   const label = row => `${company(row)} · ${identity(row)}`;
   const normalize = value => String(value).toLocaleLowerCase()
@@ -1174,6 +1297,10 @@ function inwardPicker(id, onSelection = () => {}) {
   });
 
   return {
+    select(row) {
+      const candidate = rows.find(item => key(item.row) === key(row));
+      if (candidate) choose(candidate.row);
+    },
     update(candidates, {reset = false, disabled = false, empty = 'No available Excel inwards.'} = {}) {
       emptyMessage = empty;
       rows = candidates.map(row => ({row, search:normalize(label(row)), serial:normalize(row.sn)}));
@@ -1195,9 +1322,13 @@ function inwardPicker(id, onSelection = () => {}) {
 }
 
 const uploadInwardPicker = inwardPicker('upload-inward', updateUploadSelection);
-const externalInwardPicker = inwardPicker('external-inward');
 const uploadDetailFields = ['supplier', 'location', 'inward_date', 'reference', 'form6', 'certificate_weight'];
 let uploadDetailDraft = null;
+
+function uploadDestructionRequest(row) {
+  return linkedDestructionRequest(isManual(row) ? {record_id:row.record_id}
+    : {plant:row.plant, case_id:row.sn});
+}
 
 function updateUploadTarget(reset = false) {
   const mode = $('#external-upload-target').value;
@@ -1205,7 +1336,7 @@ function updateUploadTarget(reset = false) {
   const replace = mode === 'replace';
   if (reset) uploadDetailDraft = null;
   $('#upload-inward-field').hidden = local;
-  $('#upload-inward-label').textContent = replace ? 'Existing certificate' : 'Excel inward';
+  $('#upload-inward-label').textContent = replace ? 'Existing certificate' : 'Client';
   $('#upload-inward').placeholder = replace ? 'Search company, COD or plant' : 'Search company, SN or plant';
   $('#upload-replacement-note').hidden = !replace;
   $('#save-uploaded-certificate').textContent = replace ? 'Replace PDF' : 'Save certificate';
@@ -1213,6 +1344,7 @@ function updateUploadTarget(reset = false) {
   const type = form.elements.namedItem('certificate_type');
   if (type.disabled && !replace) {
     type.value = '';
+    app.uploadTypeExplicit = false;
     form.elements.namedItem('cod_date').value = '';
   }
   type.disabled = replace;
@@ -1228,11 +1360,19 @@ function updateUploadTarget(reset = false) {
       return !link?.plant || app.state.rows.some(inward => hasInward(inward) && inward.plant === link.plant
         && String(inward.sn) === String(link.case_id) && !inward.workbook_read_only && !recordIdentityIssue(inward));
     }
-    return hasInward(row) && (hdd ? !row.hdd_cod_no && stateOf(row) !== 'na'
-      : !row.external_pdf && !row.pdf_missing && ['blank','alert','ready','generated_manual'].includes(stateOf(row)));
+    if (hdd) {
+      if (!hasInward(row) && !(isManual(row) && row.record_id && templateId(row) !== 'destruction')) return false;
+      const linked = uploadDestructionRequest(row);
+      return !row.hdd_cod_no && !(templateId(row) === 'destruction' && row.certificate_no)
+        && (!linked || (!linked.certificate_no && stateOf(linked) !== 'na'));
+    }
+    return hasInward(row) && !row.external_pdf && !row.pdf_relative_path && !row.pdf_missing
+      && ['blank','alert','ready','generated_manual'].includes(stateOf(row));
   });
   uploadInwardPicker.update(eligible, {reset, disabled:local,
-    empty:replace ? 'No issued certificates with a current PDF.' : 'No available Excel inwards.'});
+    empty:replace ? 'No issued certificates with a current PDF.' : hdd
+      ? 'No matching clients without a Data Destruction certificate.'
+      : 'No available Excel inwards. To add an HDD certificate, choose Data Destruction above.'});
   updateUploadSelection();
 }
 
@@ -1245,17 +1385,16 @@ function updateUploadSelection() {
   const replace = mode === 'replace';
   const company = $('#upload-company-fields');
   company.disabled = company.hidden = !local && !row;
-  $('#upload-detail-scope').hidden = local || !row || (replace && isManual(row) && !row.destruction_source?.plant);
+  $('#upload-detail-scope').hidden = company.hidden;
   const rowKey = JSON.stringify([mode, uploadInwardPicker.selection()]);
-  if (replace || (row && rowKey !== uploadDetailDraft?.rowKey && type.value !== 'destruction')) {
+  if (replace || (row && rowKey !== uploadDetailDraft?.rowKey && !app.uploadTypeExplicit && type.value !== 'destruction')) {
     type.value = row ? templateId(row) : '';
   }
   const hdd = type.value === 'destruction';
-  const pending = row && mode === 'workbook' && hdd && app.state.rows.find(item =>
-    item.destruction_source?.plant === row.plant && String(item.destruction_source.case_id) === String(row.sn)
-    && item.destruction_requested !== false);
+  const pending = row && mode === 'workbook' && hdd && uploadDestructionRequest(row);
   const saved = pending ? { ...pending, ...pending.raw_details }
-    : replace && row ? { ...row, ...row.raw_details, ...row.last_certificate_details } : row;
+    : row && (replace || isManual(row)) ? { ...row, ...row.raw_details, ...row.last_certificate_details }
+    : row && hdd ? savedCertificateDetails(row) : row;
   const key = JSON.stringify([rowKey, mode === 'workbook' && hdd]);
   const prior = uploadDetailDraft?.key === key ? uploadDetailDraft.defaults : null;
   const defaults = {};
@@ -1293,34 +1432,55 @@ function updateUploadCod() {
   if (replace) {
     const cod = row?.certificate_no || '';
     input.value = cod;
+    input.readOnly = true;
     hint.textContent = cod ? 'The replacement PDF must use this COD.' : 'Choose the existing certificate first.';
     return;
   }
   const form = $('#upload-certificate-form');
   const existing = row && form.elements.namedItem('certificate_type').value !== 'destruction' ? row.certificate_no : '';
   if (!upload) {
+    input.readOnly = true;
     input.value = existing || '';
     hint.textContent = existing ? 'Using the inward’s existing COD.' : 'Choose a PDF to check its COD.';
     return;
   }
-  input.value = upload.ambiguous_cod ? '' : upload.cod || existing || app.state.numbering?.next_cod || '';
+  const editable = !upload.ambiguous_cod && !upload.cod && !existing;
+  input.readOnly = !editable;
+  input.value = upload.ambiguous_cod ? '' : upload.cod || existing || upload.manualCod || upload.filename_cod || '';
+  input.placeholder = editable ? app.state.numbering?.next_cod || 'Assigned automatically' : 'Assigned automatically';
   hint.textContent = upload.ambiguous_cod ? 'The first page has multiple CODs. Choose a PDF with one certificate number.'
     : upload.cod ? 'Read from the PDF.'
     : existing ? 'Using the inward’s existing COD.'
-    : 'The app assigns the next available COD when you save.';
+    : 'Enter the COD printed on the file, or leave blank to assign the next available number.';
 }
 
-function openUploadCertificate() {
+function openUploadCertificate({entry = null, replacement = null} = {}) {
   if (app.loadingWorkspace || app.uploadingCertificate || app.generationBusy) return;
   const form = $('#upload-certificate-form');
   form.reset();
   app.uploadedFile = null;
-  $('#save-uploaded-certificate').disabled = false;
+  app.uploadTypeExplicit = false;
+  const fileInput = $('#external-upload-file');
+  fileInput.disabled = Boolean(entry);
+  $('#upload-file-field').hidden = Boolean(entry);
+  const filename = $('#upload-saved-filename');
+  filename.hidden = !entry;
+  filename.textContent = entry ? certificateFileName(entry) : '';
+  $('#save-uploaded-certificate').disabled = Boolean(entry);
   formatFormDates(form);
   $('#upload-certificate-error').hidden = true;
-  if (!app.state.rows.some(hasInward)) $('#external-upload-target').value = 'local';
+  const kind = entry && savedFileTypeId(entry);
+  if (kind) {
+    form.elements.namedItem('certificate_type').value = kind;
+    app.uploadTypeExplicit = true;
+  }
+  const hasClient = app.state.rows.some(row => hasInward(row) || (kind === 'destruction' && isManual(row)));
+  $('#external-upload-target').value = replacement ? 'replace' : hasClient ? 'workbook' : 'local';
   updateUploadTarget(true);
+  if (replacement) uploadInwardPicker.select(replacement);
+  if (entry) $('#saved-file-modal').close();
   $('#upload-certificate-modal').showModal();
+  if (entry) inspectSavedCertificate(entry);
 }
 
 function fillUploadReference() {
@@ -1345,11 +1505,13 @@ async function inspectUploadedCertificate() {
   updateUploadCod();
   if (!file) return;
   try {
+    const contentType = /\.png$/i.test(file.name) ? 'image/png'
+      : /\.jpe?g$/i.test(file.name) ? 'image/jpeg' : 'application/pdf';
     const response = await fetch('/api/certificates/upload-file', {method:'POST',
-      headers:{'Content-Type':'application/pdf'}, body:file});
+      headers:{'Content-Type':contentType}, body:file});
     const upload = await response.json();
     if ($('#external-upload-file').files[0] !== file || !$('#upload-certificate-modal').open) return;
-    if (!response.ok || !upload.token) throw new Error(upload.error || 'The PDF could not be uploaded.');
+    if (!response.ok || !upload.token) throw new Error(upload.error || 'The certificate file could not be uploaded.');
     app.uploadedFile = {file, ...upload};
     if ($('#external-upload-target').value === 'local') fillUploadReference();
     updateUploadCod();
@@ -1363,21 +1525,43 @@ async function inspectUploadedCertificate() {
   }
 }
 
+async function inspectSavedCertificate(entry) {
+  const input = $('#external-upload-file');
+  try {
+    const result = await api('/api/certificates/upload-saved-file', {
+      relative_path:entry.path.replace(/^Certificates\//i, ''), sha256:entry.sha256,
+    });
+    if (!$('#upload-certificate-modal').open || !input.disabled || app.savedFileEntry !== entry) return;
+    app.uploadedFile = result;
+    if ($('#external-upload-target').value === 'local') fillUploadReference();
+    updateUploadCod();
+    $('#save-uploaded-certificate').disabled = false;
+  } catch (exception) {
+    if (!$('#upload-certificate-modal').open || !input.disabled || app.savedFileEntry !== entry) return;
+    const error = $('#upload-certificate-error');
+    error.textContent = exception.message;
+    error.hidden = false;
+  }
+}
+
 async function saveUploadedCertificate(event) {
   event.preventDefault();
   if (app.uploadingCertificate) return;
   const form = event.currentTarget;
   const upload = app.uploadedFile;
-  if (!upload || upload.file !== $('#external-upload-file').files[0]) return;
+  const input = $('#external-upload-file');
+  if (!upload || (!input.disabled && upload.file !== input.files[0])) return;
   const details = Object.fromEntries([...new FormData(form)].map(([key, value]) => [key, String(value).trim()]));
   const selected = uploadInwardPicker.selection();
   const mode = $('#external-upload-target').value;
   const replace = mode === 'replace';
+  const cod = $('#upload-cod');
+  if (!replace && !cod.readOnly && cod.value.trim()) details.cod_no = cod.value.trim();
   if (mode !== 'local' && !selected) return;
   const certificateEdits = {};
   if (selected) {
     for (const name of uploadDetailFields) {
-      if (name in details && details[name] !== uploadDetailDraft?.defaults[name]) certificateEdits[name] = details[name];
+      if (name in details) certificateEdits[name] = details[name];
       delete details[name];
     }
   }
@@ -1405,7 +1589,12 @@ async function saveUploadedCertificate(event) {
     toast(saved.state?.setup_warning || `Certificate ${saved.certificate_no}: ${action}.`, Boolean(saved.state?.setup_warning));
   } catch (exception) {
     if (exception.workspaceRecovered) updateUploadTarget();
-    if (/upload has expired/i.test(exception.message)) $('#external-upload-file').value = '';
+    if (/upload has expired/i.test(exception.message)) {
+      app.uploadedFile = null;
+      $('#save-uploaded-certificate').disabled = true;
+      if (input.disabled && app.savedFileEntry) inspectSavedCertificate(app.savedFileEntry);
+      else input.value = '';
+    }
     error.textContent = exception.message;
     error.hidden = false;
   } finally {
@@ -1424,7 +1613,15 @@ function showSavedFile(entry) {
   const folder = pathParts.length > 2 ? pathParts.slice(1, -1).map(part => part === 'Created in App' ? 'Auto Generated' : part).join(' / ') : '';
   const details = [['Source', savedFileSource(entry)], ['Certificate type', savedFileType(entry)],
     ['Certificate number', currentFileNumbers(entry).join(', ') || 'Could not be read']];
-  if (!/(?:_hdd\.pdf$|^hdd[ _-]*\d+)/i.test(certificateFileName(entry))) details.push(['Reference number', entry.references?.join(', ') || 'Not entered']);
+  const record = savedFileRecord(entry);
+  const certificate = record && savedCertificateDetails(record);
+  if (certificate && record.uploaded_pdf_sha256) {
+    details.push(['Company', certificate.supplier || 'Not entered'], ['City / site', certificate.location || 'Not entered'],
+      ['Received date', dateLabel(certificate.inward_date) || 'Not entered']);
+  }
+  if (savedFileTypeId(entry) !== 'destruction') {
+    details.push(['Reference number', (certificate && record.uploaded_pdf_sha256 ? certificate.reference : entry.references?.join(', ')) || 'Not entered']);
+  }
   if (folder) details.push(['Folder', folder]);
   details.push(['PDF file', certificateFileName(entry)]);
   for (const [label, value] of details) {
@@ -1432,25 +1629,13 @@ function showSavedFile(entry) {
   }
   const typeChoice = $('#saved-type-choice');
   const selectType = $('#saved-type-select');
-  const identifiedByApp = Boolean(savedFileRecord(entry));
+  const identifiedByApp = Boolean(record);
   const filenameType = /_hdd\.pdf$/i.test(certificateFileName(entry)) ? 'destruction' : '';
   typeChoice.hidden = identifiedByApp;
   selectType.value = entry.certificate_type || filenameType || '';
   $('#saved-type-status').textContent = '';
-  const linkForm = $('#external-link-form');
-  if (linkForm) {
-    const numbers = currentFileNumbers(entry).map(value => String(value).trim().toUpperCase().replace(/^0+(?=\d+$)/, ''));
-    const candidates = app.state.rows.filter(row => hasInward(row) && !recordIdentityIssue(row)
-      && ['blank','alert','ready','generated_manual'].includes(stateOf(row))
-      && (!row.has_issued_certificate || stateOf(row) === 'generated_manual')
-      && (!row.certificate_no || numbers.includes(String(row.certificate_no).trim().toUpperCase().replace(/^0+(?=\d+$)/, ''))));
-    linkForm.hidden = !((entry.linkable_external ?? entry.external) && entry.sha256
-      && !identifiedByApp && numbers.length && candidates.length
-      && savedFileTypeId(entry) !== 'destruction');
-    externalInwardPicker.update(candidates, {reset:true, disabled:linkForm.hidden});
-    $('#external-issued-date').value = '';
-    $('#external-link-status').textContent = '';
-  }
+  $('#use-saved-upload').hidden = !(entry.present && (entry.linkable_external ?? entry.external)
+    && entry.sha256 && !identifiedByApp);
   renderWarningList($('#saved-file-warnings'), entry.warnings || []);
   $('#saved-file-warnings').hidden = !entry.warnings?.length;
   const url = savedFileUrl(entry);
@@ -1532,7 +1717,7 @@ function renderFolderInventory() {
   $('#saved-files-previous').disabled = page.page === 1;
   $('#saved-files-next').disabled = page.page === page.pages;
   $('#saved-visible-count').textContent = filtered.length ? `${page.start + 1}–${page.start + page.rows.length} of ${filtered.length} PDFs` : 'No matching PDFs';
-  $('#clear-file-search').hidden = !$('#saved-file-search').value.trim() && ['all', ''].includes($('#saved-plant-filter').value) && ['all', ''].includes($('#saved-template-filter').value);
+  updateSavedFilters();
   if (!filtered.length) {
     const empty = element('li', 'file-empty');
     empty.append(element('strong', '', present.length ? 'No PDFs match this search' : 'No PDFs saved yet'),
@@ -1550,12 +1735,12 @@ function readyForBatch(row) {
     && !row.issuance_blocked && !recordIdentityIssue(row);
 }
 
-function summarize() {
+function summarize(filters = readRecordFilters()) {
   const destructionPending = app.state.rows.filter(row => row.destruction_pending).length;
   $('#destruction-pending').hidden = !destructionPending;
   $('#destruction-pending').textContent = `Data Destruction · ${destructionPending} to finish →`;
   $('#destruction-pending').title = 'Open pending HDD certificates. Payment may depend on these.';
-  const rows = app.state.rows.filter(row => matches(row, true));
+  const rows = app.state.rows.filter(row => matches(row, true, filters));
   const ready = rows.filter(row => stateOf(row) === 'ready' && !hasWarnings(row)).length;
   const selectedPlant = $('#plant-filter').value;
   const workbookReady = app.state.rows.filter(row => readyForBatch(row)
@@ -1701,56 +1886,84 @@ async function startBulkGeneration() {
 
 function compareRows(a, b) {
   // ISO dates sort chronologically; unknown dates follow dated inwards.
-  const received = row => normalizeDate(row.inward_date) || '9999-99-99';
+  const received = row => normalizeDate(savedCertificateDetails(row).inward_date);
+  const company = row => String(savedCertificateDetails(row).supplier || '');
   const order = $('#company-sort')?.value;
-  if (order === 'company') return String(a.supplier || '').localeCompare(String(b.supplier || ''), undefined, {numeric:true}) || String(a.plant).localeCompare(String(b.plant));
+  if (order === 'company') return company(a).localeCompare(company(b), undefined, {numeric:true}) || String(a.plant).localeCompare(String(b.plant));
   if (order === 'serial') {
     const first=companySerial(a),second=companySerial(b);
     return (first === '—') - (second === '—') || first.localeCompare(second, undefined, {numeric:true}) || String(a.plant).localeCompare(String(b.plant));
   }
-  if (order === 'received-newest') return (normalizeDate(b.inward_date) || '').localeCompare(normalizeDate(a.inward_date) || '') || companySerial(a).localeCompare(companySerial(b), undefined, {numeric:true});
-  return received(a).localeCompare(received(b))
+  if (order === 'received-newest') return received(b).localeCompare(received(a)) || companySerial(a).localeCompare(companySerial(b), undefined, {numeric:true});
+  return (received(a) || '9999-99-99').localeCompare(received(b) || '9999-99-99')
     || String(a.plant || '').localeCompare(String(b.plant || ''))
     || String(a.sn ?? a.case_id ?? '').localeCompare(String(b.sn ?? b.case_id ?? ''), undefined, {numeric:true})
-    || String(a.supplier || '').localeCompare(String(b.supplier || ''));
+    || company(a).localeCompare(company(b));
 }
 
 function companySerial(row) { return String(isManual(row) ? row.destruction_source?.case_id || row.case_id || '—' : row.sn ?? row.case_id ?? '—'); }
 
-function matches(row, ignoreStatus = false) {
-  const plant = $('#plant-filter').value;
-  const status = ignoreStatus === true ? 'all' : $('#status-filter').value;
-  const template = $('#template-filter').value;
-  const search = $('#search').value.trim().toLowerCase();
-  const serial = $('#serial-filter').value.trim().toLowerCase(), receivedDate = normalizeDate($('#received-date-filter').value);
-  if (serial && !companySerial(row).toLowerCase().includes(serial)) return false;
-  if (receivedDate && normalizeDate(row.inward_date) !== receivedDate) return false;
+const recordFollowupModes = new Set(['needs_inward_date', 'pending_review', 'awaiting_send', 'destruction_pending', 'overdue_unissued', 'pdf_missing', 'missing_paperwork']);
+
+function unavailableCertificatePdf(row) {
+  return Boolean(row.pdf_missing) || row.issue_code === 'pdf_unavailable'
+    || (row.system_alert && /^(?:The external PDF could not be matched|The externally created PDF linked to this completed inward is missing|The PDF is missing, but Excel could not be changed to Ready)/.test(row.detail || ''));
+}
+
+function matchesRecordFollowup(row, mode, state) {
+  switch (mode) {
+    case 'needs_inward_date':
+      return hasInward(row) && !row.destruction_source && !normalizeDate(row.inward_date);
+    case 'awaiting_send':
+      return ['generated', 'generated_manual'].includes(state) && !unavailableCertificatePdf(row);
+    case 'destruction_pending':
+      return row.destruction_requested !== false && templateId(row) === 'destruction' && !['completed', 'na'].includes(state);
+    case 'pdf_missing':
+      return unavailableCertificatePdf(row);
+    case 'missing_paperwork': {
+      const type = templateId(row);
+      return type !== 'destruction' && !['generated', 'generated_manual', 'completed', 'na'].includes(state)
+        && (!String(row.reference || '').trim() || (type === 'standard' && !String(row.form6 || '').trim()));
+    }
+    case 'pending_review':
+      return !['generated', 'generated_manual', 'completed', 'na'].includes(state)
+        && (state !== 'ready' || hasWarnings(row) || row.issuance_blocked || Boolean(recordIdentityIssue(row)));
+    case 'overdue_unissued': {
+      if (['generated', 'generated_manual', 'completed', 'na'].includes(state) || row.destruction_source) return false;
+      const day = normalizeDate(row.inward_date);
+      const today = app.analyticsAsOf || new Date().toLocaleDateString('en-CA');
+      return Boolean(day) && (Date.parse(today) - Date.parse(day)) / 86400000 > 30;
+    }
+    default:
+      return true;
+  }
+}
+
+function matches(row, ignoreStatus = false, filters = readRecordFilters()) {
+  const {plant, template, followup, search, serial, from, to, attentionOnly} = filters;
+  const status = ignoreStatus ? 'all' : filters.status;
   if (plant !== 'all' && (plant === 'local' ? !isManual(row) || Boolean(row.plant) : row.plant !== plant)) return false;
   if (template !== 'all' && templateId(row) !== template) return false;
-  if (status === 'ready' && (stateOf(row) !== 'ready' || hasWarnings(row))) return false;
-  if (status === 'needs_attention') {
-    const statusOnly = $('#attention-only').checked;
-    if (statusOnly ? stateLabel(row) !== 'Needs attention' : !needsAttention(row)) return false;
+  if (serial && !companySerial(row).toLowerCase().includes(serial.toLowerCase())) return false;
+  if (from || to) {
+    const day = normalizeDate(savedCertificateDetails(row).inward_date);
+    if (!day || (from && day < from) || (to && day > to)) return false;
   }
+  const state = stateOf(row);
+  if (!matchesRecordFollowup(row, followup, state)) return false;
+  if (status === 'ready' && (state !== 'ready' || hasWarnings(row))) return false;
+  if (status === 'needs_attention' && (attentionOnly ? stateLabel(row) !== 'Needs attention' : !needsAttention(row))) return false;
   if (status === 'details_to_finish' && !missingFollowup(row).length) return false;
-  if (status === 'needs_inward_date' && (!hasInward(row) || row.destruction_source || normalizeDate(row.inward_date))) return false;
-  const issued = ['generated', 'generated_manual', 'completed'].includes(stateOf(row));
-  const pending = !issued && stateOf(row) !== 'na';
-  const analyticsReady = stateOf(row) === 'ready' && !hasWarnings(row) && !row.issuance_blocked && !recordIdentityIssue(row);
-  if (status === 'pending_review' && !(pending && !analyticsReady)) return false;
-  if (status === 'awaiting_send' && !['generated', 'generated_manual'].includes(stateOf(row))) return false;
-  if (status === 'destruction_pending' && !(row.destruction_requested !== false && templateId(row) === 'destruction' && !['completed', 'na'].includes(stateOf(row)))) return false;
-  if (status === 'overdue_unissued') {
-    const day = normalizeDate(row.inward_date);
-    const today = app.analyticsAsOf || new Date().toLocaleDateString('en-CA');
-    const age = day ? (Date.parse(today) - Date.parse(day)) / 86400000 : 0;
-    if (!(pending && !row.destruction_source && age > 30)) return false;
+  if (recordFollowupModes.has(status)) {
+    if (!matchesRecordFollowup(row, status, state)) return false;
+  } else if (!['all', 'ready', 'needs_attention', 'details_to_finish'].includes(status) && state !== status) {
+    return false;
   }
-  if (status !== 'all' && !['ready', 'needs_attention', 'details_to_finish', 'needs_inward_date', 'pending_review', 'awaiting_send', 'destruction_pending', 'overdue_unissued'].includes(status) && stateOf(row) !== status) return false;
   if (search) {
-    const searchable = [row.supplier, row.sn, row.case_id, row.form6, row.reference, row.certificate_no, row.plant, row.location, templateLabel(row), isManual(row) ? 'local register' : 'plant workbook']
+    const details = savedCertificateDetails(row);
+    const searchable = [details.supplier, details.form6, details.reference, details.location, row.supplier, row.sn, row.case_id, row.form6, row.reference, row.certificate_no, row.plant, row.location, templateLabel(row), isManual(row) ? 'local register' : 'plant workbook']
       .map(value => String(value || '').toLowerCase()).join(' ');
-    if (!searchable.includes(search)) return false;
+    if (!searchable.includes(search.toLowerCase())) return false;
   }
   return true;
 }
@@ -1763,13 +1976,14 @@ function cell(value, className = '') {
 }
 
 function makeClientCell(row, index) {
+  const certificate = savedCertificateDetails(row);
   const td = element('td');
   const wrap = element('div', 'client-cell');
   const copy = element('span', 'client-copy');
-  copy.append(element('strong', '', row.supplier || 'Company name missing'));
+  copy.append(element('strong', '', certificate.supplier || 'Company name missing'));
   const meta = element('span', 'saved-file-meta');
   meta.append(element('span', 'saved-file-type', templateNames[templateId(row)] || templateLabel(row)));
-  const details = [row.certificate_no || '', row.location || ''].filter(Boolean);
+  const details = [row.certificate_no || '', certificate.location || ''].filter(Boolean);
   if (details.length) meta.append(element('small', 'saved-file-cod', details.join(' · ')));
   copy.append(meta);
   const issues = rowWarningSummary(row);
@@ -1812,13 +2026,28 @@ function missingPdfReason(row) {
     : 'PDF missing. Create it again in Review & edit.';
 }
 
+function destructionFollowup(row) {
+  if (!row.destruction_pending) return null;
+  const state = stateOf(row);
+  if (state === 'completed' || state === 'na') return null;
+  if (unavailableCertificatePdf(row)) return 'missing';
+  if (state === 'generated' || state === 'generated_manual') return row.pdf_filename ? 'send' : 'missing';
+  return 'create';
+}
+
+function destructionFollowupAction(row) {
+  return ({
+    missing:'Data Destruction PDF missing. Create it again in Review & edit.',
+    send:'Send the Data Destruction PDF, then click Mark Completed.',
+    create:'Add the device details in Review & edit, then create the Data Destruction PDF.',
+  })[destructionFollowup(row)];
+}
+
 function attentionReason(row) {
   const state = stateOf(row);
   if (recordIdentityIssue(row)) return attentionWarning(recordIdentityIssue(row));
-  if (row.destruction_pending && row.pdf_missing) return 'Data Destruction PDF missing. Create it again in Review & edit.';
-  if (row.destruction_pending) return row.pdf_filename
-    ? 'Send the Data Destruction PDF, then click Mark Completed.'
-    : 'Add the device details in Review & edit, then create the PDF.';
+  const destructionAction = destructionFollowupAction(row);
+  if (destructionAction) return destructionAction;
   if (Number.isFinite(row.age_days) && row.age_days < 0) return 'Received date is in the future. Check the date.';
   const issues = rowWarningSummary(row);
   if (issues.length && (row.issuance_blocked || !['generated', 'generated_manual', 'completed'].includes(state))) return attentionWarning(issues[0]);
@@ -1834,8 +2063,9 @@ function attentionReason(row) {
 
 function makeStatus(row) {
   const td = element('td', 'queue-status');
+  const state = stateOf(row);
   const status = element('span', `status-pill ${statusClass(row)}`, stateLabel(row));
-  if (stateOf(row) === 'blank') {
+  if (state === 'blank') {
     status.setAttribute('aria-label', 'No status selected');
     status.title = 'No status selected';
   }
@@ -1844,13 +2074,13 @@ function makeStatus(row) {
     td.append(element('small', 'age-note attention-reason', attentionReason(row)));
     return td;
   }
-  if (row.destruction_pending) td.append(element('small', 'row-alert-note', 'Data Destruction pending'));
-  if (!isManual(row)) {
-    const linked = app.state.rows.filter(other => other.destruction_requested !== false && !other.destruction_source?.record_id && other.destruction_source?.plant === row.plant
-      && String(other.destruction_source.case_id) === String(row.sn));
-    if (linked.length) td.append(element('small', linked.some(other => other.destruction_pending) ? 'row-alert-note' : 'age-note',
-      linked.some(other => other.destruction_pending) ? 'Data Destruction requested · Pending' : 'Data Destruction completed'));
+  const destruction = destructionFollowup(row);
+  if (destruction) {
+    const note = {missing:'PDF missing', send:'PDF ready to send', create:'PDF to create'}[destruction];
+    td.append(element('small', destruction === 'send' ? 'age-note' : 'row-alert-note', note));
+    return td;
   }
+  if (['generated', 'generated_manual', 'completed', 'na'].includes(state)) return td;
   if (Number.isFinite(row.age_days) && row.age_days < 0 && needsAttention(row)) td.append(element('small', 'age-note', 'Received date is in the future'));
   else if (row.reminder_due) td.append(element('small', 'age-note', `${row.age_days ?? '25+'} days since received · Pending`));
   else if (row.overdue) td.append(element('small', 'age-note', 'Over 30 days since received'));
@@ -1931,6 +2161,7 @@ function makeActions(row, index) {
     if (!wrap.children.length || ![...wrap.children].some(button => button.dataset.action === 'edit-details')) {
       wrap.append(actionButton('Review & edit', 'edit-details', index));
     }
+    if (stateOf(row) === 'completed') wrap.append(actionButton('Undo Completed', 'undo-completed', index));
   }
   if (canSetPrimaryCertificateStatus(row) || (isManual(row) && row.record_id && !recordIdentityIssue(row) && !certificateWasGenerated(row))) {
     const state = stateOf(row);
@@ -1961,13 +2192,15 @@ function makeActions(row, index) {
 }
 
 function makeDetailRow(row, index) {
+  const certificate = savedCertificateDetails(row);
   const tr = element('tr', 'detail-row');
   const td = element('td');
   td.colSpan = 6;
   const content = element('div', 'detail-content');
   content.append(element('p', 'next-step', nextStep(row)));
   const facts = element('dl', 'certificate-facts');
-  for (const [label, value] of [['Certificate Weight', row.display_weight != null ? `${readableNumber(row.display_weight)} kg` : 'Not entered'], ['Form 6', row.form6 || 'Not entered'], ['Reference', row.reference || 'Not entered'], ['SN', row.sn || 'Manual certificate']]) {
+  const weight = certificate.certificate_weight || row.display_weight;
+  for (const [label, value] of [['Certificate Weight', weight != null ? `${readableNumber(weight)} kg` : 'Not entered'], ['Form 6', certificate.form6 || 'Not entered'], ['Reference', certificate.reference || 'Not entered'], ['SN', row.sn || 'Manual certificate']]) {
     if (label === 'Reference' && templateId(row) === 'destruction') continue;
     const fact = element('div'); fact.append(element('dt', '', label), element('dd', '', value)); facts.append(fact);
   }
@@ -1981,7 +2214,7 @@ function makeDetailRow(row, index) {
     warning.append(list);
     content.append(warning);
   }
-  const items = Array.isArray(row.items) ? row.items : [];
+  const items = Array.isArray(certificate.items) ? certificate.items : [];
   if (items.length) {
     const materials = element('details', 'technical-details');
     materials.append(element('summary', '', `Material list (${items.length} item${items.length === 1 ? '' : 's'})`));
@@ -2013,7 +2246,8 @@ function visiblePage(items, requested = 1) {
 }
 
 function render() {
-  summarize();
+  const filters = readRecordFilters();
+  summarize(filters);
   renderWorkbookIssues();
   const view = $('#status-filter').value === 'needs_attention' ? 'attention' : 'queue';
   $('#page-title').textContent = app.workspaceView === 'files' ? 'Saved certificates' : view === 'attention' ? 'Needs attention' : 'Your certificates';
@@ -2025,11 +2259,7 @@ function render() {
     $('#page-title').textContent = 'Dashboard';
     $('#page-description').textContent = 'Your certificates and pending work.';
   }
-  $('#queue-title').textContent = ({all:'All companies', ready:'Ready', needs_attention:'Needs attention', details_to_finish:'Details to finish',
-    generated:'Generated', generated_manual:'Generated Externally', completed:'Completed',
-    blank:'No status selected', na:'N/A', pending_review:'Not ready yet', awaiting_send:'Created, not completed',
-    destruction_pending:'Data Destruction follow-up', overdue_unissued:'No certificate after 30 days',
-    needs_inward_date:'Inwards that need a received date'})[$('#status-filter').value] || 'All companies';
+  $('#queue-title').textContent = recordStatusTitles[filters.status] || recordStatusTitles.all;
   $('#queue-subtitle').textContent = ({
     generated: 'Open a PDF to check it. After sending, mark it Completed.',
     generated_manual: 'These PDFs were prepared outside the app. Send them, then mark them Completed.',
@@ -2043,11 +2273,10 @@ function render() {
   document.querySelectorAll('[data-filter-status]').forEach(button => button.setAttribute('aria-pressed', String(button.dataset.filterStatus === $('#status-filter').value)));
   $('#attention-status-filter').hidden = view !== 'attention';
   if (view !== 'attention') $('#attention-only').checked = false;
-  $('#reset-record-filters').hidden = !$('#search').value.trim() && !$('#serial-filter').value && !$('#received-date-filter').value && $('#status-filter').value === 'all' && $('#template-filter').value === 'all' && ['','received-oldest'].includes($('#company-sort').value);
-  updateRecordFilterButton();
+  updateRecordFilterButton(filters);
 
-  const filtered = app.state.rows.map((row, index) => ({ row, index })).filter(item => matches(item.row));
-    filtered.sort((a, b) => compareRows(a.row, b.row));
+  const filtered = app.state.rows.map((row, index) => ({ row, index })).filter(item => matches(item.row, false, filters));
+  filtered.sort((a, b) => compareRows(a.row, b.row));
   app.filtered = filtered;
   const page = visiblePage(filtered, app.page);
   app.page = page.page;
@@ -2072,7 +2301,7 @@ function render() {
       const plantCell = element('td');
       plantCell.append(element('span', `plant-badge ${row.plant === 'plant2' ? 'plant2' : ''}`, labelPlant(row.plant)));
       tr.append(plantCell);
-      tr.append(cell(dateLabel(row.inward_date), 'field-value'));
+      tr.append(cell(dateLabel(savedCertificateDetails(row).inward_date), 'field-value'));
       tr.append(makeStatus(row));
       tr.append(makeActions(row, index));
       tbody.append(tr);
@@ -2104,14 +2333,9 @@ function renderWorkbookIssues() {
 }
 
 function setView(view) {
-  app.page = 1;
-  app.expanded = null;
-  $('#search').value = '';
-  $('#plant-filter').value = 'all';
-  $('#template-filter').value = 'all';
+  clearRecordFilterValues();
   if (view === 'attention') $('#status-filter').value = 'needs_attention';
-  else $('#status-filter').value = 'all';
-  render();
+  restartRecordList();
 }
 
 function showBusyForApi(label, fn) {
@@ -2202,9 +2426,16 @@ function showWarnings(warnings, continuation) {
   const messages = warnings.filter(row => typeof row === 'string');
   if (messages.length) entries.unshift({supplier:continuation.payload?.details?.supplier || 'Certificate', warnings:messages});
   app.pendingConfirmation = { ...continuation, hasWarnings: entries.length > 0 };
-  $('#warning-go-back').textContent = continuation.fromDetails ? 'Go back and edit' : 'Cancel batch';
+  $('#warning-go-back').textContent = continuation.fromDetails ? 'No, go back' : 'No, cancel';
+  const confirm = $('#confirm-warnings');
+  confirm.textContent = entries.length ? 'Yes, continue anyway' : 'Yes, create';
+  confirm.classList.toggle('button-danger', entries.length > 0);
+  confirm.classList.toggle('button-primary', entries.length === 0);
+  const count = continuation.payload?.selections?.length || 1;
+  $('#warning-title').textContent = entries.length ? 'Check before creating' : count > 1 ? `Create ${count} certificate PDFs?` : 'Create this certificate PDF?';
+  $('#warning-consequence').hidden = entries.length === 0;
   $('#warning-description').textContent = entries.length ? entries.length === 1
-    ? 'Check each issue below before creating this certificate.' : `${entries.length} certificates need a check. Review the issues for each company.` : 'No issues were found. Confirm to create the PDF.';
+    ? 'Check each issue below before creating this certificate.' : `${entries.length} certificates need a check. Review the issues for each company.` : 'This will mark the selected certificates as Generated.';
   const list = $('#warning-list');
   list.replaceChildren();
   for (const row of entries) {
@@ -2217,8 +2448,9 @@ function showWarnings(warnings, continuation) {
     item.append(bullets);
     list.append(item);
   }
-  if (!warnings.length) list.append(element('div', 'warning-item', 'No warnings were found.'));
+  list.hidden = entries.length === 0;
   $('#warning-modal').showModal();
+  $('#warning-go-back').focus();
 }
 
 function returnFromWarnings() {
@@ -2344,7 +2576,13 @@ function deviceReceiptEditor(raw, key) {
   section.append(element('h3', '', 'HDD / data devices received'), element('p', 'form-hint', 'Enter the received date and whole number of HDDs or other data devices for each receipt. Enter dates as DD/MM/YY.'));
   const storage = element('textarea'); storage.hidden = true; storage.dataset.certificateField = key;
   let rows = [];
-  try { const parsed = JSON.parse(raw || '[]'); if (Array.isArray(parsed)) rows = parsed; } catch { /* Keep incomplete entries editable. */ }
+  try {
+    const parsed = JSON.parse(raw || '[]');
+    if (Array.isArray(parsed)) rows = parsed.map(row => ({
+      date: typeof row?.date === 'string' ? row.date : '',
+      count: typeof row?.count === 'string' || typeof row?.count === 'number' ? row.count : '',
+    }));
+  } catch { /* Keep incomplete entries editable. */ }
   if (!rows.length) rows = [{date:'', count:''}];
   const list = element('div', 'device-receipt-list');
   const total = element('p', 'device-receipt-total');
@@ -2489,6 +2727,10 @@ function editorDestructionRequest() {
   const editor = app.editor;
   const link = editor?.destructionSource || (editor?.localInwardId ? {record_id:editor.localInwardId}
     : editor?.sourceSn != null ? {plant:editor.sourcePlant, case_id:editor.sourceSn} : null);
+  return linkedDestructionRequest(link);
+}
+
+function linkedDestructionRequest(link) {
   if (!link) return null;
   const rows = app.state.rows.filter(row => isManual(row) && templateId(row) === 'destruction'
     && (link.record_id ? (row.destruction_source || row.raw_details?.destruction_source)?.record_id === link.record_id
@@ -2496,6 +2738,18 @@ function editorDestructionRequest() {
         && (row.destruction_source || row.raw_details?.destruction_source)?.plant === link.plant
         && String((row.destruction_source || row.raw_details?.destruction_source)?.case_id) === String(link.case_id)));
   return rows.length === 1 ? rows[0] : null;
+}
+
+function activeDestructionRequest(link) {
+  const request = linkedDestructionRequest(link);
+  return request && request.destruction_requested !== false && stateOf(request) !== 'na' ? request : null;
+}
+
+function preferredCertificateRow(row) {
+  if (stateOf(row) !== 'na' || templateId(row) === 'destruction' || recordIdentityIssue(row)) return row;
+  const link = isManual(row) ? (row.record_id ? {record_id:row.record_id} : null)
+    : hasInward(row) ? {plant:row.plant, case_id:row.sn} : null;
+  return activeDestructionRequest(link) || row;
 }
 
 function linkedHddSaveSnapshot() {
@@ -2558,17 +2812,25 @@ function switchLinkedCertificate(type) {
   }, {keepOpen: true});
 }
 
+function bothCertificatesUnchecked() {
+  return !$('#primary-certificate-needed-card').hidden && !$('#primary-certificate-needed').checked
+    && !$('#destruction-needed').disabled && !$('#destruction-needed').checked;
+}
+
 function updateDestructionChoice(payload = null) {
   const editor = app.editor;
   const linkedRequestEditor = editor?.template === 'destruction' && Boolean(editor.destructionSource);
   const available = ((editor?.sourceSn != null || editor?.localInwardId) && editor.template !== 'destruction') || linkedRequestEditor;
   $('#destruction-needed-card').hidden = !available;
   $('#destruction-needed-label').textContent = linkedRequestEditor
-    ? 'Keep this Data Destruction request active' : 'Data Destruction also needed';
+    ? 'Keep this Data Destruction request active' : 'Data Destruction needed';
   const checkbox = $('#destruction-needed');
   const request = available ? editorDestructionRequest() : null;
-  checkbox.disabled = !available || Boolean(editor?.identityIssue) || Boolean(linkedRequestEditor && !request);
-  if (request && editor.destructionChoiceRecordId !== request.record_id) {
+  const issued = Boolean(request && certificateWasGenerated(request));
+  $('#destruction-request-toggle').hidden = issued;
+  $('#destruction-issued-label').hidden = !issued;
+  checkbox.disabled = !available || issued || Boolean(editor?.identityIssue) || Boolean(linkedRequestEditor && !request);
+  if (request && (issued || editor.destructionChoiceRecordId !== request.record_id)) {
     checkbox.checked = request.destruction_requested !== false;
     editor.destructionChoiceRecordId = request.record_id;
   }
@@ -2578,10 +2840,11 @@ function updateDestructionChoice(payload = null) {
     primaryCard.hidden = !inward || templateId(inward) === 'destruction' || !canSetPrimaryCertificateStatus(inward);
     if (!primaryCard.hidden) {
       const label = templateLabel(inward);
-      const needed = stateOf(inward) !== 'na';
+      const needed = stateOf(inward) !== 'na' && !editor.pendingPrimaryNa;
       if (!editor.savingPrimaryChoice) $('#primary-certificate-needed').checked = needed;
       $('#primary-certificate-needed-label').textContent = `${label} certificate needed`;
-      $('#primary-certificate-needed-status').textContent = needed
+      $('#primary-certificate-needed-status').textContent = editor.pendingPrimaryNa
+        ? `Save to mark ${label} N/A and keep the inward.` : needed
         ? `Uncheck to skip ${label}. The inward and any HDD request are kept.`
         : `Check to return ${label} to certificate review.`;
     }
@@ -2591,7 +2854,10 @@ function updateDestructionChoice(payload = null) {
   companion.textContent = linkedRequestEditor && inward
     ? `Open ${templateLabel(inward)}` : 'Open Data Destruction (HDD)';
   const requested = Boolean(request && request.destruction_requested !== false);
-  $('#destruction-choice-status').textContent = linkedRequestEditor
+  $('#destruction-choice-status').textContent = issued
+    ? unavailableCertificatePdf(request) ? 'PDF missing. Recreate it with the same certificate number.'
+      : stateOf(request) === 'completed' ? 'Marked Completed.' : 'PDF ready to send.'
+    : linkedRequestEditor
     ? !request ? 'This request could not be matched to its inward. Refresh before changing it.'
       : !checkbox.checked && requested ? 'Save to remove this request. Any existing HDD files and details will be kept.'
       : checkbox.checked && requested ? 'This request stays in the follow-up list until it is Completed.'
@@ -2601,7 +2867,7 @@ function updateDestructionChoice(payload = null) {
     : request && checkbox.checked ? 'Open the HDD certificate whenever you’re ready.'
     : checkbox.checked ? 'Save this request below to add it to follow-up.'
     : 'You can create the HDD certificate first. Check this box to save an HDD request for later.';
-  const pendingRequest = available && checkbox.checked !== requested;
+  const pendingRequest = available && !issued && checkbox.checked !== requested;
   const excelChanges = editor?.baseline && payload && fieldDifferences(editor.excelBaseline || editor.baseline, payload).length > 0;
   const changes = editor?.baseline && payload ? fieldDifferences(editor.excelBaseline || editor.baseline, payload) : [];
   const newEdits = editor?.baseline && payload ? fieldDifferences(editor.baseline, payload) : [];
@@ -2609,24 +2875,33 @@ function updateDestructionChoice(payload = null) {
   const canSaveLinkedRequest = linkedRequestEditor && Boolean(request) && pendingRequest;
   const canSaveInward = available && !linkedRequestEditor
     && (editor.localInwardId ? pendingRequest : !editor.issuedCertificate || pendingRequest || onlyInwardChanges);
-  $('#save-inward-details').hidden = !(canSaveLinkedRequest || canSaveInward) || Boolean(editor.identityIssue);
-  $('#save-inward-details').textContent = linkedRequestEditor || editor?.localInwardId || (pendingRequest && !onlyInwardChanges && (editor.issuedCertificate || !excelChanges))
+  const bothUnchecked = bothCertificatesUnchecked();
+  const pendingCertificateChoices = (bothUnchecked && pendingRequest) || editor?.pendingPrimaryNa;
+  $('#save-details').hidden = Boolean(editor?.uploadRow || editor?.noCertificate || bothUnchecked || editor?.pendingPrimaryNa);
+  $('#save-inward-details').hidden = !(canSaveLinkedRequest || canSaveInward || pendingCertificateChoices) || Boolean(editor.identityIssue);
+  $('#save-inward-details').textContent = pendingCertificateChoices
+    ? bothUnchecked ? 'Save as N/A' : 'Save certificate choices'
+    : linkedRequestEditor || editor?.localInwardId || (pendingRequest && !onlyInwardChanges && (editor.issuedCertificate || !excelChanges))
     ? 'Save request' : 'Save to Excel';
+  if (bothUnchecked) $('#change-scope').textContent = pendingCertificateChoices
+    ? 'Saves both certificate choices as N/A and keeps the inward.'
+    : 'Both certificates are marked N/A. The inward is kept.';
 }
 
-async function changeDestructionChoice() {
-  const editor = app.editor;
+function changeDestructionChoice() {
   const checkbox = $('#destruction-needed');
   const request = editorDestructionRequest();
-  if (!checkbox.checked && request && (request.has_issued_certificate || ['generated', 'generated_manual', 'completed'].includes(stateOf(request))) && request.destruction_requested !== false) {
-    const approved = await confirmAction({title:'Remove the Data Destruction request?',
-      message:'An HDD certificate already exists. Its PDF, number and details will be kept. Remove this request from the to-do list?',
-      confirmLabel:'Yes, remove request', cancelLabel:'No, keep request'});
-    if (app.editor !== editor || !$('#details-modal').open) return;
-    checkbox.checked = !approved;
-    editor.destructionRemovalConfirmed = approved;
-  } else editor.destructionRemovalConfirmed = false;
+  if (checkbox.disabled || (request && certificateWasGenerated(request))) {
+    updateDestructionChoice();
+    return;
+  }
   renderChangeSummary(); saveWorkingDraft();
+}
+
+function destructionRequestNeeded() {
+  const request = editorDestructionRequest();
+  return request && certificateWasGenerated(request)
+    ? request.destruction_requested !== false : Boolean($('#destruction-needed').checked);
 }
 
 async function changePrimaryCertificateNeeded() {
@@ -2635,13 +2910,17 @@ async function changePrimaryCertificateNeeded() {
   const editor = app.editor;
   const checkbox = $('#primary-certificate-needed');
   const needed = checkbox.checked;
+  if ((editor.pendingPrimaryNa && needed) || (!needed && bothCertificatesUnchecked())) {
+    editor.pendingPrimaryNa = !needed;
+    renderChangeSummary();
+    if (editorDirty()) saveWorkingDraft();
+    else if (clearWorkingDraft()) editor.workingDraftSaved = false;
+    return;
+  }
   editor.savingPrimaryChoice = true;
   setDetailsBusy(true);
   try {
-    const response = await api('/api/clients/status', {plant:row.plant, sn:String(row.sn),
-      expected_revision:editor.workspaceRevision, action:needed ? 'undo_na' : 'mark_na'});
-    setState(response.state);
-    editor.workspaceRevision = response.workspace_revision ?? app.workspaceRevision;
+    const response = await persistPrimaryCertificateChoice(row, needed);
     if (editor.template !== 'destruction') {
       editor.noCertificate = !needed;
       editor.certificateStatus = needed ? '' : 'N/A';
@@ -2660,6 +2939,14 @@ async function changePrimaryCertificateNeeded() {
     editor.savingPrimaryChoice = false;
     setDetailsBusy(false);
   }
+}
+
+async function persistPrimaryCertificateChoice(row, needed) {
+  const response = await api('/api/clients/status', {plant:row.plant, sn:String(row.sn),
+    expected_revision:app.editor.workspaceRevision, action:needed ? 'undo_na' : 'mark_na'});
+  if (response.state) setState(response.state);
+  app.editor.workspaceRevision = response.workspace_revision ?? app.workspaceRevision;
+  return response;
 }
 
 function updateSourceControls() {
@@ -2793,7 +3080,7 @@ function applyCertificateWeight(value) {
 }
 
 function usesSummaryEditor() {
-  return Boolean(app.editor?.existing && !app.editor.firstGeneration && app.editor.template !== 'destruction');
+  return Boolean(app.editor?.uploadRow || (app.editor?.existing && !app.editor.firstGeneration && app.editor.template !== 'destruction'));
 }
 
 function summaryEditorVisible() {
@@ -2998,11 +3285,15 @@ function renderEditorSummary() {
   const rows = [['Company', value('supplier') || 'Company name missing'],
     ['COD number (preview)', preview?.certificate_no || value('cod_no') || (app.editor.needsStartingCod ? 'Enter the starting COD above' : 'Assigned automatically')],
     ['COD date', codDate ? dateLabel(codDate) : 'Set automatically']];
-  if (value('certificate_type') !== 'destruction') rows.push(['Reference number', value('reference') || 'Not entered']);
-  if (value('certificate_type') === 'standard') rows.push(['Form 6', value('form6') || 'Not entered']);
+  if (value('certificate_type') !== 'destruction' || (app.editor.uploadRow && value('reference'))) {
+    rows.push(['Reference number', value('reference') || 'Not entered']);
+  }
+  if (value('certificate_type') === 'standard' || (app.editor.uploadRow && value('form6'))) {
+    rows.push(['Form 6', value('form6') || 'Not entered']);
+  }
   rows.push(['City', value('location') || 'Not entered'], ['Received', dateLabel(value('inward_date'))],
     ['Plant', labelPlant(value('plant'))], ['SN', value('case_id') || 'Not entered'],
-    ['Certificate Weight', weightText ? `${weightText} · ${source}` : 'Weight missing in Excel']);
+    ['Certificate Weight', weightText ? (app.editor.uploadRow ? weightText : `${weightText} · ${source}`) : 'Not entered']);
   const companyOnPdf = preview?.printed_details?.company_display;
   const expectedCompany = [value('supplier'), value('location').trim()].filter(Boolean).join(', ').toUpperCase();
   if (companyOnPdf && companyOnPdf !== expectedCompany && value('certificate_type') === 'standard' && !usesSummaryEditor()) rows.splice(1, 0, ['Company on PDF', companyOnPdf]);
@@ -3079,6 +3370,7 @@ function setEditorMode(editing = false) {
   $('#change-details').hidden = true;
   $('#finish-editing').hidden = true;
   $('#edit-pdf-details').hidden = !(first || usesSummaryEditor());
+  if (app.editor?.uploadRow) $('#edit-pdf-details').hidden = true;
   $('#edit-pdf-details').textContent = editing ? 'Done editing' : '✎ Edit details';
   $('#edit-pdf-details').setAttribute('aria-pressed', String(Boolean(editing)));
   $('#editor-mode-title').textContent = editing ? 'Edit details' : app.editor?.existing ? 'Review & edit' : 'Certificate details';
@@ -3099,13 +3391,14 @@ function setEditorMode(editing = false) {
   }
   $('#save-details').textContent = first ? 'Generate certificate' : app.editor?.existing ? 'Save corrected certificate' : 'Create PDF';
   const noCertificate = Boolean(app.editor?.noCertificate);
-  $('#save-details').hidden = noCertificate;
-  $('#preview-details').hidden = noCertificate;
+  $('#save-details').hidden = noCertificate || bothCertificatesUnchecked() || Boolean(app.editor?.pendingPrimaryNa || app.editor?.uploadRow);
+  $('#replace-uploaded-pdf').hidden = !app.editor?.uploadRow || Boolean(app.editor.identityIssue || app.editor.uploadRow.workbook_read_only);
+  $('#preview-details').hidden = noCertificate || Boolean(app.editor?.uploadRow);
   if (noCertificate) {
     $('#details-description').textContent = app.editor.sourceSn != null
-      ? 'This inward is marked N/A. Use Save to Excel to update its details.'
+      ? `The ${templateNames[app.editor.template]} certificate is marked N/A. Use Save to Excel to update the inward.`
       : 'This certificate is marked N/A. Choose Undo N/A in Companies to create its PDF.';
-    $('#preview-status').textContent = 'No certificate is needed for this inward.';
+    $('#preview-status').textContent = `${templateNames[app.editor.template]} certificate marked N/A.`;
   }
   if (app.editor?.template === 'destruction' && !noCertificate) {
     $('#save-details').textContent = app.editor.issuedCertificate ? 'Save corrected certificate' : 'Create data destruction PDF';
@@ -3113,6 +3406,7 @@ function setEditorMode(editing = false) {
       ? `Data Destruction for ${labelPlant(app.editor.destructionSource.plant)} inward ${app.editor.destructionSource.case_id}. Check the actual destruction details and both preview pages.`
       : 'Enter the company and actual destruction details, then check both preview pages. An inward entry is optional.';
   }
+  if (app.editor?.uploadRow) $('#details-description').textContent = 'Review the saved details and the original uploaded certificate.';
   renderEditorSummary();
 }
 
@@ -3188,7 +3482,7 @@ function invalidatePreview() {
   $('#editor-checks').hidden = true;
   $('#preview-warnings-title').hidden = true;
   $('#preview-warnings').replaceChildren();
-  $('#preview-status').textContent = app.editor?.noCertificate ? 'No certificate is needed for this inward.' : 'Preview updates automatically.';
+  $('#preview-status').textContent = app.editor?.noCertificate ? `${templateNames[app.editor.template]} certificate marked N/A.` : 'Preview updates automatically.';
   $('#preview-details').textContent = 'Update preview';
   if (app.editor?.baseline && $('#details-modal').open) {
     updatePrintedWeight();
@@ -3200,12 +3494,29 @@ function invalidatePreview() {
     }
   }
   if (app.editor?.identityIssue) updateDetailsButtons();
+  if (app.editor?.uploadRow && $('#details-modal').open) showUploadedCertificate(app.editor.uploadRow);
+}
+
+function showUploadedCertificate(row) {
+  const url = certificateUrl({filename:row.pdf_filename, relative_path:row.pdf_relative_path});
+  if (!url) return;
+  const pdf = new URL(url);
+  pdf.searchParams.set('sha256', row.uploaded_pdf_sha256);
+  const query = new URLSearchParams({path:row.pdf_relative_path, sha256:row.uploaded_pdf_sha256});
+  const image = $('#preview-image');
+  $('#preview-link').href = pdf.href;
+  $('#preview-document').hidden = false;
+  $('#preview-status').textContent = 'Original uploaded certificate';
+  $('#preview-number').textContent = `${row.certificate_no}${row.certificate_date ? ` · ${dateLabel(row.certificate_date)}` : ''}`;
+  $('#preview-number').hidden = !row.certificate_no;
+  image.hidden = false;
+  image.src = `/api/certificate-preview-image?${query}`;
 }
 
 function schedulePreview({initial = false} = {}) {
   clearTimeout(app.previewTimer);
   const editor = app.editor;
-  if (!editor || editor.identityIssue || editor.noCertificate || !$('#details-modal').open || !app.templatesLoaded) return;
+  if (!editor || editor.uploadRow || editor.identityIssue || editor.noCertificate || !$('#details-modal').open || !app.templatesLoaded) return;
   app.previewTimer = setTimeout(async () => {
     if (app.editor !== editor || !$('#details-modal').open || app.detailsBusy || app.generationBusy || app.pendingConfirmation) return;
     if (app.previewLoading) { schedulePreview({initial}); return; }
@@ -3221,8 +3532,9 @@ async function openDetails(row = null, skipRecovery = false, startEditing = fals
   if (app.loadingWorkspace || app.generationBusy || app.backupBusy || app.completionBusy
       || app.clientBusy || app.settingsBusy || app.stopping) return;
   if ($('#details-modal').open || app.detailsBusy) return;
-  if (!skipRecovery && offerDraftRecovery(row, true, startEditing)) return;
+  if (showWorkingDraftRecovery && !skipRecovery && offerDraftRecovery(row, true, startEditing)) return;
   const sourceRow = row;
+  const uploadRow = row?.uploaded_pdf_sha256 && row.pdf_relative_path ? row : null;
   const issued = row && (row.has_issued_certificate || ['generated', 'generated_manual', 'completed'].includes(stateOf(row)));
   if (row?.last_certificate_details && !recordIdentityIssue(row)) {
     row = { ...row, ...row.last_certificate_details };
@@ -3235,11 +3547,12 @@ async function openDetails(row = null, skipRecovery = false, startEditing = fals
   for (const disclosure of form.querySelectorAll('details')) disclosure.open = false;
   const id = templateId(row || {});
   app.editor = { existing: Boolean(row), recordId: row?.record_id || null, template: id,
+    uploadRow,
     noCertificate: Boolean(sourceRow && stateOf(sourceRow) === 'na'),
     certificateStatus: sourceRow ? issued ? stateLabel(sourceRow) : 'Not created' : '',
     destructionSource: row?.destruction_source || row?.raw_details?.destruction_source || null,
     localInwardId: row && isManual(row) && id !== 'destruction' ? row.record_id : null,
-    editingDetails: Boolean(startEditing || !row || (row && !isManual(row) && !issued && (!row.form6 || !row.reference))),
+    editingDetails: !uploadRow && Boolean(startEditing || !row || (row && !isManual(row) && !issued && (!row.form6 || !row.reference))),
     pdfEditUsed: Boolean(startEditing && row && !isManual(row) && !issued),
     firstGeneration: Boolean(row && !isManual(row) && !issued), sourceLocation: sourceRow?.location || '',
     reviewEdits: Boolean(row && !isManual(row)),
@@ -3318,6 +3631,7 @@ async function openDetails(row = null, skipRecovery = false, startEditing = fals
   $('#details-error').hidden = true;
   $('#details-modal').showModal();
   setEditorMode(app.editor.editingDetails);
+  if (uploadRow) showUploadedCertificate(uploadRow);
   $('#record-options').open = !row;
   const editor = app.editor;
   const initialPreviewRevision = app.previewRevision;
@@ -3394,7 +3708,7 @@ function changeDisplay(key, value) {
 function editorDirty() {
   if (!app.editor?.baseline || !$('#details-modal').open) return false;
   const current = detailsBody($('#details-form'));
-  return fieldDifferences(app.editor.baseline, current).length > 0 || current.edit_scope !== app.editor.baseline.edit_scope
+  return Boolean(app.editor.pendingPrimaryNa) || fieldDifferences(app.editor.baseline, current).length > 0 || current.edit_scope !== app.editor.baseline.edit_scope
     || Boolean(current.data_destruction_needed) !== Boolean(app.editor.baseline.data_destruction_needed);
 }
 
@@ -3417,7 +3731,7 @@ function scopeDescription(payload) {
 function renderChangeSummary() {
   if (!app.editor?.baseline) return;
   const payload = detailsBody($('#details-form'));
-  $('#change-scope').textContent = scopeDescription(payload);
+  $('#change-scope').textContent = app.editor.uploadRow ? '' : scopeDescription(payload);
   const changes = fieldDifferences(app.editor.baseline, payload);
   const list = $('#change-list'); list.replaceChildren();
   for (const change of changes) {
@@ -3461,7 +3775,7 @@ function saveWorkingDraft() {
   values.source_kind = form.elements.namedItem('source_kind').value;
   values.certificate_type = form.elements.namedItem('certificate_type').value;
   values.use_certificate_weight = Boolean(form.elements.namedItem('use_certificate_weight')?.checked);
-  values.data_destruction_needed = Boolean($('#destruction-needed').checked);
+  values.data_destruction_needed = destructionRequestNeeded();
   // Disabled override controls are omitted by FormData, but their local edit
   // must survive recovery. This is not sent to Excel unless explicitly ticked.
   values.certificate_weight = form.elements.namedItem('certificate_weight')?.value || '';
@@ -3476,6 +3790,7 @@ function saveWorkingDraft() {
     $('#keep-working-draft').hidden = true;
     return true;
   } catch {
+    if (!showWorkingDraftRecovery) return false;
     $('#working-draft-status').textContent = 'The browser could not save your working draft. Keep this form open to avoid losing edits.';
     $('#draft-options').hidden = false;
     $('#keep-working-draft').hidden = false;
@@ -3753,8 +4068,7 @@ function detailsBody(form) {
     ...(app.editor?.firstGeneration && app.editor.pdfEditUsed && !app.editor.reviewEdits ? {pdf_only_edits:true} : {}),
     ...(source === 'workbook' && app.editor.reviewEdits ? {review_edits:true} : {}),
     ...((source === 'workbook' && app.editor.sourceSn != null) || app.editor?.localInwardId
-      || (app.editor?.template === 'destruction' && app.editor?.destructionSource) ? {data_destruction_needed:Boolean($('#destruction-needed').checked),
-      ...(app.editor.destructionRemovalConfirmed && !$('#destruction-needed').checked ? {destruction_removal_confirmed:true} : {})} : {}),
+      || (app.editor?.template === 'destruction' && app.editor?.destructionSource) ? {data_destruction_needed:destructionRequestNeeded()} : {}),
     ...(source === 'workbook' && app.editor.sourceSn == null ? {create_new:true} : {}),
     use_certificate_weight: source === 'workbook' && Boolean(form.elements.namedItem('use_certificate_weight')?.checked),
     edit_scope: data.get('edit_scope') || 'certificate_only',
@@ -3765,7 +4079,8 @@ function detailsBody(form) {
 
 async function saveDetails(event) {
   event.preventDefault();
-  if (app.editor?.noCertificate) return saveInwardDetails();
+  if (app.editor?.uploadRow) return;
+  if (app.editor?.noCertificate || app.editor?.pendingPrimaryNa || bothCertificatesUnchecked()) return saveInwardDetails();
   if (app.detailsBusy || !app.templatesLoaded) return;
   if (app.editor?.identityIssue) { updateDetailsButtons(); return; }
   finishInlineEdit();
@@ -3839,40 +4154,92 @@ function showExcelSaveChoice(payload, mode) {
   $('#excel-save-no').focus();
 }
 
+async function persistDestructionChoice(link, needed) {
+  const editor = app.editor;
+  const response = await api('/api/destruction/request', {plant:link.plant, sn:String(link.case_id),
+    ...(link.record_id ? {record_id:link.record_id} : {}), expected_revision:editor.workspaceRevision, needed});
+  if (response.state) setState(response.state);
+  editor.workspaceRevision = response.workspace_revision ?? app.workspaceRevision;
+  editor.baseline.data_destruction_needed = needed;
+  return response;
+}
+
+async function saveCertificateChoices(inward, requestChanged, needed) {
+  const editor = app.editor;
+  let saveError = null;
+  setDetailsBusy(true);
+  $('#details-error').hidden = true;
+  try {
+    if (!inward || !canSetPrimaryCertificateStatus(inward)) throw new Error('Refresh and reopen this inward before changing its certificate status.');
+    if (editor.pendingPrimaryNa) {
+      if (stateOf(inward) !== 'na') await persistPrimaryCertificateChoice(inward, false);
+      editor.pendingPrimaryNa = false;
+      if (editor.template !== 'destruction') {
+        editor.noCertificate = true;
+        editor.certificateStatus = 'N/A';
+      }
+    }
+    if (requestChanged) {
+      await persistDestructionChoice({plant:inward.plant, case_id:inward.sn}, needed);
+      if (editor.template === 'destruction') {
+        editor.noCertificate = !needed;
+        editor.certificateStatus = needed ? 'Not created' : 'N/A';
+      }
+    }
+    toast(needed ? 'Certificate choices saved.' : 'Both certificates marked N/A. The inward was kept.');
+  } catch (error) {
+    saveError = error;
+  } finally {
+    if (editor.noCertificate) invalidatePreview();
+    setEditorMode(editor.editingDetails);
+    renderChangeSummary();
+    if (editorDirty()) saveWorkingDraft();
+    else if (clearWorkingDraft()) editor.workingDraftSaved = false;
+    setDetailsBusy(false);
+    if (saveError) showDetailsError(saveError.message);
+    else schedulePreview();
+  }
+}
+
 async function saveInwardDetails() {
   const linkedRequestEditor = app.editor?.template === 'destruction' && Boolean(app.editor.destructionSource);
   if (app.detailsBusy || !app.templatesLoaded || (app.editor?.sourceSn == null && !app.editor?.localInwardId && !linkedRequestEditor) || app.editor.identityIssue) return;
   finishInlineEdit();
   const form = $('#details-form');
   const payload = detailsBody(form);
+  const request = editorDestructionRequest();
+  const needed = Boolean(payload.data_destruction_needed);
+  const requestChanged = needed !== Boolean(request && request.destruction_requested !== false);
+  if (app.editor.pendingPrimaryNa || (bothCertificatesUnchecked() && requestChanged)) {
+    return saveCertificateChoices(editorInwardRow(), requestChanged, needed);
+  }
   const changes = fieldDifferences(app.editor.excelBaseline || app.editor.baseline, payload);
   if (!app.editor.localInwardId && inwardChanges(payload).length && fieldDifferences(app.editor.baseline, payload).every(change => Object.hasOwn(followupFields, change.key))) {
     showExcelSaveChoice(payload, 'inward_only'); return;
   }
-  const request = editorDestructionRequest();
-  const needed = Boolean(payload.data_destruction_needed);
-  const requestOnly = needed !== Boolean(request && request.destruction_requested !== false)
-    && (linkedRequestEditor || app.editor.issuedCertificate || !changes.length);
+  const requestOnly = requestChanged && (linkedRequestEditor || app.editor.issuedCertificate || !changes.length);
   if (requestOnly) {
+    let openRequest = null;
     setDetailsBusy(true);
     try {
       const link = linkedRequestEditor ? app.editor.destructionSource
         : {plant:app.editor.sourcePlant, case_id:app.editor.sourceSn, ...(app.editor.localInwardId ? {record_id:app.editor.localInwardId} : {})};
-      const response = await api('/api/destruction/request', {plant:link.plant, sn:String(link.case_id),
-        ...(link.record_id ? {record_id:link.record_id} : {}),
-        expected_revision:app.editor.workspaceRevision, needed,
-        confirmed:payload.destruction_removal_confirmed === true});
-      if (response.state) setState(response.state);
-      app.editor.workspaceRevision = response.workspace_revision ?? app.workspaceRevision;
-      app.editor.baseline.data_destruction_needed = needed;
-      app.editor.destructionRemovalConfirmed = false;
+      const response = await persistDestructionChoice(link, needed);
       updateDestructionChoice(detailsBody(form));
       renderChangeSummary();
       if (editorDirty()) saveWorkingDraft();
-      else { clearWorkingDraft(); app.editor.workingDraftSaved = false; }
-      toast(needed ? 'Data Destruction marked as needed. You can create its PDF later.' : 'Data Destruction request removed.');
+      else if (clearWorkingDraft()) {
+        app.editor.workingDraftSaved = false;
+        const saved = needed && !linkedRequestEditor ? activeDestructionRequest(link) : null;
+        if (saved && saved.record_id === response.record_id) openRequest = saved;
+      }
+      toast(needed ? 'Data Destruction request saved.' : 'Data Destruction request removed.');
     } catch (error) { showDetailsError(error.message); }
     finally { setDetailsBusy(false); }
+    if (openRequest) {
+      $('#details-modal').close();
+      await openDetails(openRequest, true, true);
+    }
     return;
   }
   if (linkedRequestEditor || app.editor.issuedCertificate || app.editor.localInwardId) return;
@@ -3916,6 +4283,7 @@ async function saveExcelChoice(updateExcel) {
   }
   app.excelSavePayload = null;
   $('#excel-save-modal').close();
+  const addedDestruction = next.payload.data_destruction_needed && !app.editor.baseline?.data_destruction_needed;
   if (next.mode === 'create' && !updateExcel && workbookTypeChanged(next.payload)) {
     const inward = editorInwardRow();
     if (app.editor.issuedCertificate || (inward && !canDeleteEntry(inward))) return;
@@ -3943,7 +4311,13 @@ async function saveExcelChoice(updateExcel) {
         if (app.editor.excelBaseline) app.editor.excelBaseline.details[key] = values[key];
       }
       if (response.state?.setup_warning) { showDetailsError(response.state.setup_warning); renderChangeSummary(); }
-      else { clearWorkingDraft(); $('#details-modal').close(); toast('Inward details saved to Excel.'); }
+      else {
+        const request = addedDestruction
+          ? activeDestructionRequest({plant:next.payload.plant, case_id:app.editor.sourceSn}) : null;
+        clearWorkingDraft(); $('#details-modal').close();
+        toast('Inward details saved to Excel.');
+        if (request) { setDetailsBusy(false); await openDetails(request, true, true); }
+      }
     } catch (error) { showDetailsError(error.message); }
     finally { setDetailsBusy(false); }
     return;
@@ -3954,12 +4328,15 @@ async function saveExcelChoice(updateExcel) {
     try {
       const response = await api('/api/clients/update', {...next.payload, confirmed_excel:true});
       if (response.state) setState(response.state);
+      const request = addedDestruction && !response.state?.setup_warning
+        ? activeDestructionRequest({plant:next.payload.plant, case_id:response.sn ?? app.editor.sourceSn}) : null;
       clearWorkingDraft();
       app.editor.baseline = detailsBody($('#details-form'));
       $('#details-modal').close();
       const moved = response.sn && response.sn !== app.editor.sourceSn;
       toast(response.state?.setup_warning || (moved ? `Changes saved to Excel. This inward is now SN ${response.sn}.`
         : 'Changes saved to Excel. No PDF was created.'), Boolean(response.state?.setup_warning));
+      if (request) { setDetailsBusy(false); await openDetails(request, true, true); }
     } catch (error) { showDetailsError(error.message); }
     finally { setDetailsBusy(false); }
     return;
@@ -4048,6 +4425,7 @@ function renderAttachmentPreview(attachment, previewPath) {
 }
 
 async function previewDetails({automatic = false} = {}) {
+  if (app.editor?.uploadRow) return;
   if (app.editor?.noCertificate) return;
   const form = $('#details-form');
   if (app.editor?.needsStartingCod && !form.elements.namedItem('starting_cod').value.trim()) {
@@ -4268,7 +4646,8 @@ async function confirmEntryDeletion() {
     const response=await api('/api/entries/delete',{...state.pending,checked:true});
     if(response.state)setState(response.state);
     app.entryDeletionBusy=false;$('#entry-deletion-modal').close();app.entryDeletion=null;
-    toast(response.state?.setup_warning || 'Selected entries deleted. Recovery copies were kept.');
+    if (response.deleted) rememberDeletion({kind:'entries', request_id:state.pending.request_id});
+    toast(response.state?.setup_warning || 'Selected entries deleted.', false, response.deleted === true);
   }catch(error){
     if (error.workspaceRecovered) {
       $('#entry-deletion-modal').close();app.entryDeletion=null;
@@ -4285,12 +4664,14 @@ async function confirmInwardRemoval() {
   $('#confirm-remove-inward').disabled = true;
   setBusy(true, 'Removing this inward…');
   try {
-    const result = await api('/api/clients/remove', {...app.removalPending, checked:true});
+    const pending = app.removalPending;
+    const result = await api('/api/clients/remove', {...pending, checked:true});
     app.removalPending = null;
     $('#remove-inward-modal').close();
     app.expanded = null;
     setState(result.state);
-    toast('Inward removed from Excel.');
+    if (result.removed) rememberDeletion({kind:'inward', request_id:pending.request_id});
+    toast('Inward removed from Excel.', false, result.removed === true);
   } catch (error) {
     if (error.workspaceRecovered) {
       app.removalPending = null;
@@ -4303,6 +4684,45 @@ async function confirmInwardRemoval() {
     $('#remove-inward-checked').checked = false;
     $('#keep-inward').focus();
   } finally { app.removalBusy = false; setBusy(false); }
+}
+
+function rememberDeletion(target) {
+  const history = app.deletionHistory ||= [];
+  if (target) {
+    if (!history.some(entry => entry.request_id === target.request_id)) history.push(target);
+    if (history.length > 50) history.shift();
+  } else {
+    history.pop();
+  }
+  updateDeletionUndo();
+}
+
+function updateDeletionUndo() {
+  app.deletionUndo = app.deletionHistory.at(-1);
+  $('#undo-last-deletion').hidden = !app.deletionUndo;
+  try {
+    if (app.deletionUndo) localStorage.setItem(deletionUndoKey, JSON.stringify(app.deletionHistory));
+    else localStorage.removeItem(deletionUndoKey);
+  } catch { /* The action still works for this open dashboard. */ }
+}
+
+async function undoLastDeletion() {
+  if (!app.deletionUndo || app.removalBusy || app.entryDeletionBusy || app.generationBusy
+      || app.backupBusy || app.clientBusy || app.completionBusy || app.settingsBusy || app.detailsBusy) return;
+  app.removalBusy = true;
+  setBusy(true, 'Restoring deleted entries…');
+  try {
+    const response = await api('/api/entries/undo-delete', app.deletionUndo);
+    if (!response.undone) throw new Error('The deletion could not be restored. Refresh the company list.');
+    if (response.state) setState(response.state);
+    rememberDeletion(null);
+    toast(response.state?.setup_warning || 'Deletion undone.');
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    app.removalBusy = false;
+    setBusy(false);
+  }
 }
 
 function renderEditorFollowup() {
@@ -4371,24 +4791,30 @@ async function handleAction(button) {
     } else await openInwardRemoval(row);
     return;
   }
-  if (action === 'details') { openDetails(row); return; }
-  if (action === 'edit-details') { openDetails(row, false, true); return; }
+  if (action === 'details' || action === 'edit-details') {
+    await openDetails(preferredCertificateRow(row), false, action === 'edit-details');
+    return;
+  }
   if (action === 'generate') {
     await submitGeneration(isManual(row) ? { plant: row.plant, record_id: row.record_id } : { plant: row.plant, sn: row.sn }, false,
       isManual(row) ? '/api/manual/generate' : '/api/generate');
     return;
   }
-  if (action === 'complete') {
+  if (action === 'complete' || action === 'undo-completed') {
     if (app.completionBusy || app.generationBusy || app.backupBusy) return;
+    const undo = action === 'undo-completed';
     const expectedRevision = app.workspaceRevision ?? app.state.workspace_revision ?? '';
-    const approved = await confirmAction({ title: 'Mark certificate Completed?',
+    const approved = await confirmAction(undo ? { title: 'Undo Completed?',
+      message: `This returns the ${templateLabel(row)} certificate for ${row.supplier || `Client ${row.sn}`}${row.certificate_no ? ` (COD ${row.certificate_no})` : ''} to the send queue.`,
+      confirmLabel: 'Yes, undo', cancelLabel: 'No, keep Completed' } : { title: 'Mark certificate Completed?',
       message: `Confirm that you have sent the certificate for ${row.supplier || `Client ${row.sn}`}. This marks it Completed in ${isManual(row) ? 'the local certificate register' : 'Excel'} and stops its reminder.`,
       confirmLabel: 'Mark Completed', cancelLabel: 'Go back' });
     if (!approved || app.completionBusy || app.generationBusy || app.backupBusy) return;
     app.completionBusy = true;
     setBusy(true, isManual(row) ? 'Updating your local register…' : 'Updating the workbook…');
     try { const response = await api(isManual(row) ? '/api/manual/complete' : '/api/complete', { expected_revision: expectedRevision,
-      ...(isManual(row) ? { record_id: row.record_id } : { plant: row.plant, sn: row.sn }) }); setState(response.state); toast('Marked Completed.'); }
+      ...(undo ? {undo_completed:true} : {}),
+      ...(isManual(row) ? { record_id: row.record_id } : { plant: row.plant, sn: row.sn }) }); setState(response.state); toast(undo ? 'Completion undone.' : 'Marked Completed.'); }
     catch (error) { toast(error.message, true); }
     finally { app.completionBusy = false; setBusy(false); }
     return;
@@ -4733,17 +5159,19 @@ function wire() {
   $('#view-analytics').addEventListener('click', () => setWorkspaceView('analytics'));
   $('#analytics-workspace').addEventListener('analytics:review', event => {
     const detail = event.detail || {};
+    clearRecordFilterValues();
     app.analyticsAsOf = detail.asOf;
     setWorkspaceView('records');
     $('#plant-filter').value = $('#analytics-plant').value;
     $('#search').value = detail.search || '';
-    $('#serial-filter').value = ''; $('#received-date-filter').value = '';
     $('#status-filter').value = detail.status || 'all';
     $('#template-filter').value = detail.type || 'all';
-    app.page = 1; app.expanded = null; render();
+    restartRecordList();
   });
   $('#analytics-workspace').addEventListener('analytics:files', () => {
-    $('#plant-filter').value = $('#analytics-plant').value;
+    Object.keys(savedFilterDefaults).forEach(clearSavedFilter);
+    $('#saved-plant-filter').value = $('#analytics-plant').value;
+    app.savedFilesPage = 1;
     setWorkspaceView('files');
   });
   $('#view-files').addEventListener('click', () => {
@@ -4752,6 +5180,15 @@ function wire() {
   });
   $('#reset-record-filters').addEventListener('click', resetRecordFilters);
   $('#dismiss-toast').addEventListener('click', dismissToast);
+  $('#undo-deletion-toast').addEventListener('click', undoLastDeletion);
+  $('#undo-last-deletion').addEventListener('click', undoLastDeletion);
+  try {
+    const saved = JSON.parse(localStorage.getItem(deletionUndoKey) || 'null');
+    app.deletionHistory = (Array.isArray(saved) ? saved : [saved])
+      .filter(entry => entry && ['inward', 'entries'].includes(entry.kind) && /^[a-f0-9]{32}$/.test(entry.request_id))
+      .slice(-50);
+    updateDeletionUndo();
+  } catch { /* Ignore an unavailable or invalid stored action. */ }
   $('#saved-file-excel').addEventListener('click', () => {
     const button = $('#saved-file-excel');
     if (!button.hidden && button.dataset.plant && button.dataset.sn) openClientInExcel(button.dataset.plant, button.dataset.sn);
@@ -4778,25 +5215,8 @@ function wire() {
       status.textContent = error.message;
     } finally { button.disabled = false; }
   });
-  $('#external-link-form')?.addEventListener('submit', async event => {
-    event.preventDefault();
-    const entry = app.savedFileEntry;
-    const selection = externalInwardPicker.selection();
-    const issuedDate = normalizeDate($('#external-issued-date').value);
-    const status = $('#external-link-status');
-    const button = $('#link-external');
-    if (!(entry?.linkable_external ?? entry?.external) || !selection || !issuedDate) return;
-    button.disabled = true;
-    try {
-      const result = await api('/api/certificates/link-external', {
-        ...selection, sha256:entry.sha256,
-        relative_path:entry.path.replace(/^Certificates\//i, ''), certificate_date:issuedDate
-      });
-      setState(result.state);
-      showSavedFile(entry);
-      toast('External PDF linked to the Excel inward.');
-    } catch (error) { status.textContent = error.message; }
-    finally { button.disabled = false; }
+  $('#use-saved-upload').addEventListener('click', () => {
+    if (!$('#use-saved-upload').hidden && app.savedFileEntry) openUploadCertificate({entry:app.savedFileEntry});
   });
   $('#add-client-button').addEventListener('click', openAddClient);
   $('#add-client-form').addEventListener('submit', event => { event.preventDefault(); saveClient(); });
@@ -4812,22 +5232,17 @@ function wire() {
     if (!app.clientBusy && (app.clientMaterialRows || []).length < 100) renderClientMaterials([...clientMaterialValues(), {}]);
   });
   for (const id of ['reconnect', 'dialog-reconnect']) $(`#${id}`).addEventListener('click', reconnectDashboard);
-  for (const id of ['saved-file-search', 'saved-plant-filter', 'saved-template-filter', 'saved-file-sort']) {
-    $(`#${id}`).addEventListener(id === 'saved-file-search' ? 'input' : 'change', () => {
-      app.savedFilesPage = 1;
-      if (id === 'saved-plant-filter' && ['all', 'plant1', 'plant2'].includes($('#saved-plant-filter').value)) {
-        $('#plant-filter').value = $('#saved-plant-filter').value; app.page = 1; render();
-      }
-      renderFolderInventory();
-    });
+  for (const id of [...Object.keys(savedFilterDefaults), 'saved-file-sort']) {
+    $(`#${id}`).addEventListener(id === 'saved-file-search' ? 'input' : 'change', restartSavedList);
   }
   $('#clear-file-search').addEventListener('click', () => {
-    $('#saved-file-search').value = ''; $('#saved-plant-filter').value = 'all'; $('#saved-template-filter').value = 'all';
-    $('#plant-filter').value = 'all'; app.savedFilesPage = 1; app.page = 1; render(); renderFolderInventory();
+    Object.keys(savedFilterDefaults).forEach(clearSavedFilter);
+    restartSavedList();
+    $('#saved-file-search').focus();
   });
   document.querySelectorAll('[data-quick-status]').forEach(button => button.addEventListener('click', () => {
     $('#status-filter').value = button.dataset.quickStatus;
-    app.page = 1; app.expanded = null; render();
+    restartRecordList();
   }));
   $('#confirm-action').addEventListener('click', () => settleActionConfirmation(true));
   $('#open-entry-deletion').addEventListener('click', openEntryDeletion);
@@ -4879,6 +5294,7 @@ function wire() {
   $('#saved-file-open').addEventListener('click', () => openCertificateLocally($('#saved-file-open').dataset.relativePath));
   $('#create-backup').addEventListener('click', () => backupAction('create'));
   $('#pick-backup-destination').addEventListener('click', () => backupAction('pick-destination'));
+  $('#working-draft-status').hidden = !showWorkingDraftRecovery;
   $('#restore-backup').addEventListener('click', openBackupRestore);
   $('#confirm-backup-restore').addEventListener('click', restoreBackup);
   $('#reload-history').addEventListener('click', loadHistory);
@@ -4900,16 +5316,22 @@ function wire() {
   $('#refresh-button').addEventListener('click', refreshState);
   $('#upload-certificate').addEventListener('click', openUploadCertificate);
   $('#external-upload-file').addEventListener('change', inspectUploadedCertificate);
+  $('#upload-cod').addEventListener('input', event => {
+    if (app.uploadedFile && !event.target.readOnly) app.uploadedFile.manualCod = event.target.value;
+  });
   $('#upload-certificate-form').addEventListener('submit', saveUploadedCertificate);
   $('#external-upload-target').addEventListener('change', () => updateUploadTarget(true));
   $('#upload-certificate-form').addEventListener('change', event => {
-    if (event.target.name === 'certificate_type') updateUploadTarget();
+    if (event.target.name === 'certificate_type') {
+      app.uploadTypeExplicit = Boolean(event.target.value);
+      updateUploadTarget();
+    }
   });
   $('#new-button').addEventListener('click', () => openDetails());
   $('#destruction-pending').addEventListener('click', () => {
-    $('#plant-filter').value = 'all'; $('#search').value = '';
-    $('#template-filter').value = 'destruction'; $('#status-filter').value = 'needs_attention';
-    app.page = 1; render();
+    clearRecordFilterValues();
+    $('#record-followup-filter').value = 'destruction_pending';
+    restartRecordList();
   });
   $('#open-bulk').addEventListener('click', openBulkGeneration);
   $('#bulk-start-cod').addEventListener('input', updateBulkCodHint);
@@ -4931,23 +5353,16 @@ function wire() {
   });
   window.addEventListener('resize', positionRecordFilters);
   $('#clear-filters').addEventListener('click', () => {
-    $('#template-filter').value = 'all';
-    $('#serial-filter').value = ''; $('#received-date-filter').value = ''; $('#company-sort').value = 'received-oldest';
-    app.page = 1; app.expanded = null; render();
+    $('#more-filters').hidePopover();
+    resetRecordFilters();
   });
-  const restartList = () => { app.page = 1; app.expanded = null; render(); };
-  $('#attention-only').addEventListener('change', restartList);
   document.querySelectorAll('[data-filter-status]').forEach(button => button.addEventListener('click', () => {
     $('#status-filter').value = button.dataset.filterStatus;
-    restartList();
+    restartRecordList();
   }));
-  $('#status-filter').addEventListener('change', restartList);
-  $('#plant-filter').addEventListener('change', restartList);
-  $('#template-filter').addEventListener('change', restartList);
-  $('#search').addEventListener('input', restartList);
-  $('#serial-filter').addEventListener('input', restartList);
-  $('#received-date-filter').addEventListener('change', restartList);
-  $('#company-sort').addEventListener('change', restartList);
+  for (const id of [...Object.keys(recordFilterDefaults), 'attention-only', 'company-sort']) {
+    $(`#${id}`).addEventListener(['search', 'serial-filter'].includes(id) ? 'input' : 'change', restartRecordList);
+  }
   for (const [id, change] of [['previous-page', -1], ['next-page', 1]]) {
     $(`#${id}`).addEventListener('click', () => {
       app.page += change;
@@ -4969,6 +5384,10 @@ function wire() {
   });
   document.querySelectorAll('[data-view]').forEach(button => button.addEventListener('click', () => setView(button.dataset.view)));
   $('#details-form').addEventListener('submit', saveDetails);
+  $('#replace-uploaded-pdf').addEventListener('click', () => {
+    const replacement = app.editor?.uploadRow;
+    if (replacement) requestDetailsClose(() => openUploadCertificate({replacement}));
+  });
   $('#edit-pdf-details').addEventListener('click', async () => {
     if (!app.editor || app.detailsBusy || app.generationBusy) return;
     if (summaryEditorVisible()) {
@@ -5182,6 +5601,7 @@ async function init() {
   const now = new Date();
   $('#today-label').textContent = dateLabel(validDate(now.getFullYear(), now.getMonth() + 1, now.getDate()));
   configureDateInput($('#received-date-filter'));
+  configureDateInput($('#received-to-filter'));
   const externalDate = $('#external-issued-date');
   if (externalDate) configureDateInput(externalDate);
   formatFormDates($('#add-client-form'));
@@ -5203,7 +5623,7 @@ async function init() {
       // response carries no new revision and must not erase this snapshot.
       app.workspaceRevision = response.workspace_revision;
     }
-    offerDraftRecovery();
+    if (showWorkingDraftRecovery) offerDraftRecovery();
   } catch (error) {
     toast(error.message, true);
     $('#queue-body').replaceChildren();

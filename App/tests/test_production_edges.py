@@ -255,11 +255,22 @@ class ProductionEdgeTests(unittest.TestCase):
         handler._do_post()
         return responses[0]
 
+    def review_manual(self, body):
+        before = list((self.root / "Certificates").rglob("*.pdf"))
+        status, review = self.post_manual(body)
+        self.assertEqual(status, 200, review)
+        self.assertTrue(review["requires_confirmation"])
+        self.assertEqual(review["created"], 0)
+        self.assertEqual(list((self.root / "Certificates").rglob("*.pdf")), before)
+        return dict(body, confirmed=True, review_token=review["review_token"],
+                    expected_revision=review["workspace_revision"])
+
     def test_manual_endpoint_retains_success_if_postcommit_state_read_fails(self):
         body = dict(plant="plant1", details=self.details(
             case_id="MANUAL-ENDPOINT", form6="FORM-MANUAL-ENDPOINT"),
             expected_revision=workspace_revision(self.root))
         with patch.object(web_app, "workspace_state", side_effect=OSError("postcommit dashboard read failed")):
+            body = self.review_manual(body)
             status, response = self.post_manual(body)
         self.assertEqual(safety.audit_records(self.root)[0]["state"], "complete")
         self.assertEqual(status, 200, response)
@@ -270,6 +281,7 @@ class ProductionEdgeTests(unittest.TestCase):
         revision = workspace_revision(self.root)
         body = dict(plant=None, details=self.details(case_id="MANUAL-ENDPOINT", form6="FORM-MANUAL-ENDPOINT"),
                     expected_revision=revision)
+        body = self.review_manual(body)
         with patch.object(web_app, "WORKSPACE_STATE_CACHE", (revision, checked)), \
                 patch.object(web_app, "read_register", side_effect=PermissionError("Post-save register read unavailable")):
             status, response = self.post_manual(body)
@@ -289,6 +301,7 @@ class ProductionEdgeTests(unittest.TestCase):
         revision = workspace_revision(self.root)
         body = dict(plant=None, details=dict(details, supplier="Corrected name"), record_id=first["record_id"],
                     expected_revision=revision)
+        body = self.review_manual(body)
         with saved_workbook_open_for_reading(old), patch.object(web_app, "WORKSPACE_STATE_CACHE", (revision, checked)):
             status, result = self.post_manual(body)
             self.assertEqual(status, 200, result)

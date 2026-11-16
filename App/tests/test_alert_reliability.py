@@ -71,6 +71,7 @@ class AlertReliabilityTests(unittest.TestCase):
                 patch.object(web_app, 'WORKBOOK_CHECK_STAMPS', {}), \
                 patch.object(web_app, 'configured_paths', return_value=[]), \
                 patch.object(web_app, 'load_settings', return_value={'workbook_paths': ['a', 'b']}), \
+                patch.object(web_app, 'latest_result', return_value={'rows': [], 'scan_complete': True}), \
                 patch.object(web_app, 'refresh', return_value={'rows': []}) as refresh:
             day.today.return_value = date(2026, 10, 25)
             web_app.WORKBOOK_CHECK_STAMPS[str(self.root)] = web_app.workbook_check_stamp([])

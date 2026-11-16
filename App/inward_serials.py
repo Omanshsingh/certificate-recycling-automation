@@ -234,7 +234,27 @@ def resequence_date_ordered_inwards(data, original_data, *, root, plant):
 def resequence_removed_inwards(data, original_data, *, root, plant):
     """Close numeric SN gaps after deletion, keeping issued records and HDD links attached."""
     from certificate_core import read_batches
+    from workflow_support import load_settings
+
     remaining = read_batches(BytesIO(data))
+    remaining_ids = {row['case_id'] for row in remaining}
+    removed_ids = {row['case_id'] for row in read_batches(BytesIO(original_data))} - remaining_ids
+    saved = read_details(BytesIO(data))
+    links = links_from(data)
+    additions = links.setdefault('additions', {})
+    path = Path(load_settings(root)['workbook_paths'][int(plant[-1]) - 1]).expanduser().resolve()
+    changed = False
+    for journal_path in (Path(root) / 'Data' / 'Client Additions').glob('*.json'):
+        journal = json.loads(journal_path.read_text(encoding='utf-8'))
+        request_id = journal_path.stem
+        current = additions.get(request_id, journal.get('sn'))
+        if journal.get('plant') == plant and journal.get('path') == str(path) and current in removed_ids:
+            # The number can immediately be assigned to the next inward.
+            additions[request_id] = None
+            changed = True
+    if changed:
+        saved[LINK_KEY] = links
+        data = _replace_details(data, saved)
     if not remaining:
         return data, {}
     updated, _, changes = resequence_added_inward(

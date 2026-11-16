@@ -127,7 +127,7 @@ def ensure_material_capacity(data, sn, required):
         book.close()
 
 
-def shift_register_rows(data, first, count, *, delete=False):
+def shift_register_rows(data, first, count, *, delete=False, expand_shared=False):
     """Insert blank rows or remove a complete block and shift everything below it."""
     last = first + count - 1
     book = load_workbook(BytesIO(data), data_only=False)
@@ -186,8 +186,9 @@ def shift_register_rows(data, first, count, *, delete=False):
                 raise ValueError('This workbook has macros. Move its rows in Excel instead.')
             member = _sheet_member(archive, sheet.title)
             xml = archive.read(member).decode('utf-8')
-            if any(_attributes(match.group()) for match in _element(xml, 'f').finditer(xml)):
-                raise ValueError('This workbook has shared calculations. Move its rows in Excel instead.')
+            if any((attrs := _attributes(match.group())) and not (expand_shared and attrs.get('t') == 'shared')
+                   for match in _element(xml, 'f').finditer(xml)):
+                raise ValueError('This workbook has shared calculations or other special formulas. Move its rows in Excel instead.')
             if any(_element(xml, tag).search(xml) for tag in ('drawing', 'legacyDrawing', 'oleObjects', 'controls', 'rowBreaks')):
                 raise ValueError('This register has objects anchored to rows. Move its rows in Excel instead.')
             for other in book:
@@ -208,9 +209,28 @@ def shift_register_rows(data, first, count, *, delete=False):
                 if new is None:
                     return ''
                 block = re.sub(r'\br=(["\x27])\d+\1', f'r="{new}"', block, count=1)
-                block = _element(block, 'c').sub(lambda m: re.sub(
-                    r'\br=(["\x27])([A-Z]+)\d+\1', lambda c: f'r={quoteattr(c[2] + str(new))}', m.group(), count=1), block)
-                return _element(block, 'f').sub(patch_formula, block)
+
+                def patch_cell(cell_match):
+                    cell_xml = cell_match.group()
+                    coordinate = _attributes(cell_xml)['r']
+
+                    def patch_cell_formula(formula_match):
+                        if _attributes(formula_match.group()).get('t') != 'shared':
+                            return patch_formula(formula_match)
+                        # openpyxl expands each shared formula at its original
+                        # cell. Write the moved formulas independently so the
+                        # group can safely span the inserted/deleted rows.
+                        value = sheet[coordinate].value
+                        if not isinstance(value, str) or not value.startswith('=') or len(value) == 1:
+                            raise ValueError(f'Excel could not expand the shared formula at {coordinate}. Check it before moving rows.')
+                        prefix = formula_match.group('p')
+                        return f'<{prefix}f>{escape(formula(value))}</{prefix}f>'
+
+                    cell_xml = _element(cell_xml, 'f').sub(patch_cell_formula, cell_xml)
+                    return re.sub(r'\br=(["\x27])([A-Z]+)\d+\1',
+                                  lambda c: f'r={quoteattr(c[2] + str(new))}', cell_xml, count=1)
+
+                return _element(block, 'c').sub(patch_cell, block)
 
             section = _element(xml, 'sheetData').search(xml)
             body = _element(section.group(), 'row').sub(patch_row, section.group())

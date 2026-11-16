@@ -6,8 +6,8 @@ import uuid
 
 
 def prepare_local_certificate(root, plant, source, details, cod, issued_date, destination,
-                              *, hdd_needed=None, hdd_removal_confirmed=False, warnings=()):
-    from certificate_drafts import clean_details, read_register, register_path
+                              *, hdd_needed=None, warnings=()):
+    from certificate_drafts import _manual_record_issued, clean_details, read_register, register_path
     from certificate_core import parse_date
     from issuance_safety import audit_records
     path = register_path(root)
@@ -29,8 +29,8 @@ def prepare_local_certificate(root, plant, source, details, cod, issued_date, de
     new_link = dict(old_link, record_id=identifier)
     linked = [entry for entry in data['records'] if entry['details'].get('destruction_source') == old_link]
     for entry in linked:
-        if hdd_needed is False and entry.get('status') in {'generated', 'generated_manual', 'completed'} and not hdd_removal_confirmed:
-            raise ValueError('Confirm removing the issued Data Destruction request before saving.')
+        if hdd_needed is False and entry.get('destruction_requested', True) and _manual_record_issued(root, entry):
+            raise ValueError('This Data Destruction certificate has been issued. Keep its request when saving this inward.')
         entry['details']['destruction_source'] = deepcopy(new_link)
         if isinstance(hdd_needed, bool):
             entry['destruction_requested'] = hdd_needed

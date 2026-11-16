@@ -1,6 +1,7 @@
 """Keep the operator's original PDF and record its certificate details."""
 from contextlib import ExitStack
 from datetime import date, datetime
+from io import BytesIO
 from pathlib import Path
 import json
 import re
@@ -8,7 +9,7 @@ import uuid
 
 from certificate_core import batch_content, number, parse_date, status_value
 from certificate_drafts import clean_details, current_record_pdf, read_register, register_path, write_register
-from certificate_inventory import (cod_conflicts, identity, issuance_paths,
+from certificate_inventory import (cod_conflicts, filename_cod, identity, issuance_paths,
                                    safe_certificate_path, scan_inventory, text_identifiers)
 from certificate_templates import TEMPLATE_NAMES, template_id
 from identifier_rules import workspace_batches
@@ -48,9 +49,35 @@ def _inspect(root, payload):
     return list(cods.values()), sorted(references)
 
 
-def stage_upload(root, payload):
+def _image_pdf(payload):
+    from PIL import Image, ImageOps, UnidentifiedImageError
+    from reportlab.lib.utils import ImageReader
+    from reportlab.pdfgen.canvas import Canvas
+
+    try:
+        with Image.open(BytesIO(payload)) as source:
+            if (source.format not in {'PNG', 'JPEG'} or getattr(source, 'n_frames', 1) != 1
+                    or source.width * source.height > 25_000_000):
+                raise ValueError('Choose a single PNG or JPEG image under 25 megapixels.')
+            image = ImageOps.exif_transpose(source)
+            ratio = min(1, 842 / max(image.size))
+            width, height = (dimension * ratio for dimension in image.size)
+            output = BytesIO()
+            page = Canvas(output, pagesize=(width, height), invariant=1)
+            page.drawImage(ImageReader(image.convert('RGBA')), 0, 0, width, height, mask='auto')
+            page.save()
+            return output.getvalue()
+    except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as exc:
+        raise ValueError('This image could not be opened. Choose a readable PNG or JPEG.') from exc
+
+
+def stage_upload(root, payload, *, content_type='application/pdf'):
     if not 0 < len(payload) <= UPLOAD_LIMIT:
-        raise ValueError('Choose a PDF smaller than 50 MB.')
+        raise ValueError('Choose a certificate file under 50 MB.')
+    if content_type in {'image/png', 'image/jpeg'}:
+        payload = _image_pdf(payload)
+    if len(payload) > UPLOAD_LIMIT:
+        raise ValueError('This image is too large to save as a PDF. Choose a smaller image.')
     cods, references = _inspect(root, payload)
     cleanup_previews(root)
     token = uuid.uuid4().hex
@@ -61,6 +88,28 @@ def stage_upload(root, payload):
     return {'token':token, 'cod':cods[0] if len(cods) == 1 else '', 'changed':False,
             'ambiguous_cod':len(cods) > 1,
             'reference':references[0] if len(references) == 1 else ''}
+
+
+def stage_saved_upload(root, body):
+    digest = body.get('sha256')
+    if not isinstance(digest, str) or not re.fullmatch(r'[a-f0-9]{64}', digest):
+        raise ValueError('Refresh Saved certificates and choose the current file.')
+    path = safe_certificate_path(root, body.get('relative_path'), expected_sha=digest)
+    relative = path.relative_to((Path(root) / 'Certificates').resolve()).as_posix()
+    entry = next((item for item in scan_inventory(root, force=True)['entries']
+                  if item['path'] == f'Certificates/{relative}' and item.get('present')), None)
+    if not entry or not entry.get('linkable_external') or entry.get('sha256') != digest:
+        raise ValueError('This PDF changed or already belongs to a saved certificate. Refresh and choose the current file.')
+    if not path.is_file() or path.stat().st_size > UPLOAD_LIMIT:
+        raise ValueError('Choose an available certificate PDF under 50 MB.')
+    payload = path.read_bytes()
+    if digest_bytes(payload) != digest:
+        raise ValueError('This PDF changed. Refresh Saved certificates and try again.')
+    staged = stage_upload(root, payload)
+    cod = filename_cod(path.name)
+    if not staged['cod'] and not staged['ambiguous_cod'] and cod and _valid_cod(cod):
+        staged['filename_cod'] = cod
+    return staged
 
 
 def _replacement_paths(root, inventory, current, cod, source_kind, plant, key):
@@ -139,7 +188,7 @@ def save_upload(root, backup_dir, body):
         submitted = {'certificate_type':'standard', 'cod_no':submitted.get('cod_no'),
                      'cod_date':submitted.get('cod_date')}
     kind = submitted.get('certificate_type') if isinstance(submitted, dict) else None
-    if kind not in TEMPLATE_NAMES:
+    if not isinstance(kind, str) or kind not in TEMPLATE_NAMES:
         raise ValueError('Choose the certificate type.')
     details = clean_details(submitted)
     reviewed_cod = details['cod_no']
@@ -149,12 +198,20 @@ def save_upload(root, backup_dir, body):
         raise ValueError('Enter the certificate issue date. It cannot be in the future.')
     if details['inward_date'] and not parse_date(details['inward_date']):
         raise ValueError('Enter a valid received date.')
+    if details['inward_date']:
+        details['inward_date'] = parse_date(details['inward_date']).isoformat()
     if details['certificate_weight'] and (number(details['certificate_weight']) or 0) <= 0:
         raise ValueError('Enter a positive certificate weight in kg.')
     details['cod_date'] = issued_date.isoformat()
     revision = body.get('expected_revision')
-    if target is not None and (not isinstance(target, dict) or target.get('plant') not in {'plant1','plant2'}
-                               or not isinstance(target.get('sn'), str) or not target['sn'].strip()):
+    local_parent_id = target.get('record_id') if isinstance(target, dict) and not replacing else None
+    if local_parent_id is not None:
+        if (kind != 'destruction' or not isinstance(local_parent_id, str)
+                or not re.fullmatch(r'[a-f0-9]{32}', local_parent_id)):
+            raise ValueError('Choose a Recycling record to attach its Data Destruction certificate.')
+        target = None
+    elif target is not None and (not isinstance(target, dict) or target.get('plant') not in ('plant1', 'plant2')
+                                 or not isinstance(target.get('sn'), str) or not target['sn'].strip()):
         raise ValueError('Choose an Excel inward.')
     with run_lock(root), ExitStack() as stack:
         recover_issuances(root)
@@ -239,20 +296,33 @@ def save_upload(root, backup_dir, body):
             kind = template_id(details.get('certificate_type'))
             details.update(certificate_type=kind, cod_date=issued_date.isoformat())
 
-        if is_hdd and not replacing:
-            if status_value(source['issued']) == 'na':
-                raise ValueError('This inward is marked N/A. Choose Undo N/A before attaching an HDD certificate.')
-            details['destruction_source'] = link = {'plant':plant, 'case_id':source['case_id']}
-            linked = [record for record in register['records'] if record['details'].get('destruction_source') == link]
-            if len(linked) > 1 or source.get('hdd_cod_no'):
+        if (is_hdd or local_parent_id) and not replacing:
+            if local_parent_id:
+                parent = next((record for record in register['records'] if record['id'] == local_parent_id), None)
+                if not parent or parent['details']['certificate_type'] == 'destruction':
+                    raise ValueError('The linked certificate could not be found. Refresh and choose it again.')
+                parent_details = parent['details']
+                case_id = (parent.get('removed_inward') or {}).get('case_id') or parent_details.get('case_id') or local_parent_id
+                link = {'plant':None, 'case_id':case_id, 'record_id':local_parent_id}
+                details.update({key:parent_details.get(key, '') for key in EDITABLE_CERTIFICATE_FIELDS},
+                               case_id=case_id, items=[])
+            else:
+                if source.get('certificate_type') == 'destruction' and source.get('cod_no'):
+                    raise ValueError('This inward already has a Data Destruction certificate. Open its record to review it.')
+                link = {'plant':plant, 'case_id':source['case_id']}
+            details['destruction_source'] = link
+            linked = [record for record in register['records']
+                      if (candidate := record['details'].get('destruction_source'))
+                      and (candidate.get('record_id') == local_parent_id if local_parent_id else candidate == link)]
+            if len(linked) > 1 or (source and source.get('hdd_cod_no')):
                 raise ValueError('This inward already has a Data Destruction certificate. Open its record to review it.')
             existing = linked[0] if linked else None
             if existing and (existing['details'].get('cod_no') or status_value(existing.get('status')) == 'na'):
                 raise ValueError('Review the existing Data Destruction record before uploading a certificate.')
             if existing:
                 details.update(existing['details'], cod_date=issued_date.isoformat())
-                details['case_id'] = source['case_id']
-        if target or replacing:
+                details['case_id'] = link['case_id']
+        if target or local_parent_id or replacing:
             _apply_certificate_edits(details, body.get('certificate_edits', {}))
         if not details['supplier']:
             raise ValueError('Enter the company name.')

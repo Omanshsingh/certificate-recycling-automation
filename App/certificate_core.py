@@ -275,7 +275,14 @@ def _snapshot_batches(data):
 def _read_batches(path):
     from workbook_metadata import read_details, lookup_details
     saved_details = read_details(path)
-    workbook = load_workbook(path, data_only=False, read_only=False)
+    try:
+        workbook = load_workbook(path, data_only=False, read_only=False)
+    except IndexError as exc:
+        raise ValueError(
+            'The Excel register contains an invalid formatting or text reference. '
+            'Open the workbook in Excel, repair it if prompted, then save and refresh. '
+            'If Excel cannot repair it, restore a working copy.'
+        ) from exc
     try:
         sheet, header_row, header_columns = select_register(workbook)
         sheet_name = sheet.title

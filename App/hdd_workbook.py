@@ -16,10 +16,11 @@ from workbook_store import (_attributes, _date_style, _element, _sheet_member, _
 
 
 def stage_hdd_tracking(session, sn, cod, issued_date):
-    data = session.data
     from workbook_store import add_tracking_column
-    data = add_tracking_column(data)
-    batches = read_batches(BytesIO(data))
+    batches = read_batches(BytesIO(session.data))
+    data = add_tracking_column(session.data)
+    if data != session.data:
+        batches = read_batches(BytesIO(data))
     matches = [b for b in batches if text(b['case_id']).casefold() == text(sn).casefold()]
     if len(matches) != 1:
         raise ValueError('The linked inward is missing or its SN is repeated. Refresh Excel before creating the HDD certificate.')
@@ -28,7 +29,7 @@ def stage_hdd_tracking(session, sn, cod, issued_date):
     following = min([b['source_row'] for b in batches if b['source_row'] > batch['source_row']] or [1048576])
     if following == row or row in batch.get('summary_rows', []):
         from register_rows import shift_register_rows
-        data = shift_register_rows(data, row, 1)
+        data = shift_register_rows(data, row, 1, expand_shared=True)
     book = load_workbook(BytesIO(data), data_only=False)
     try:
         sheet, _, cols = select_register(book)

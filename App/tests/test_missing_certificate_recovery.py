@@ -99,6 +99,15 @@ class MissingCertificateRecoveryTests(unittest.TestCase):
             "scan_complete": True, "created": 0, "review": 0,
         })
 
+    def test_unmatched_external_pdf_stays_generated_and_can_be_filtered_as_unavailable(self):
+        self.source(status="Generated Externally")
+        self.check()
+        row = self.report_row()
+        self.assertEqual(row["issue_code"], "pdf_unavailable")
+        self.assertEqual(row["certificate_status"], "generated_manual")
+        self.assertTrue(row["system_alert"])
+        self.assertEqual(self.source_batch()["cod_no"], COD)
+
     def test_cached_legacy_statuses_are_canonicalized_and_persisted_on_workspace_read(self):
         self.bind_web_workspace()
         expectations = (("Created", "generated"), ("Sent", "completed"),

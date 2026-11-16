@@ -158,6 +158,8 @@ def remove_inward(root, body, *, commit=False):
         journal = json.loads(journal_path.read_text(encoding='utf-8')) if journal_path.is_file() else None
         if journal and (journal.get('identity') != identity or journal.get('path') != str(path)):
             raise ValueError('This removal request belongs to a different entry. Reopen the inward.')
+        if journal and journal.get('undo_started'):
+            raise ValueError('This removal was undone or is being restored. Review the inward again before removing it.')
         if commit and journal and journal.get('saved'):
             return {'removed': True, 'entry': journal['entry']}
         with WorkbookSession(path, root / 'Data' / 'Workbook Backups') as session:
@@ -195,3 +197,61 @@ def remove_inward(root, body, *, commit=False):
             except OSError:
                 pass  # The prepared hashes prove a successful write after a lost response.
             return {'removed': True, 'entry': entry}
+
+
+def undo_inward_removal(root, request_id, revision):
+    """Restore one removed inward from its automatic workbook backup."""
+    from issuance_safety import recover_issuances
+
+    root = Path(root).resolve()
+    if not isinstance(request_id, str) or not re.fullmatch(r'[a-f0-9]{32}', request_id):
+        raise ValueError('Choose a saved deletion to undo.')
+    journal_path = root / 'Data' / 'Inward Removals' / f'{request_id}.json'
+    backups = root / 'Data' / 'Workbook Backups'
+    with run_lock(root):
+        recover_issuances(root)
+        if not journal_path.is_file():
+            raise ValueError('The inward removal record was not found.')
+        journal = json.loads(journal_path.read_text(encoding='utf-8'))
+        if journal.get('undone'):
+            return {'undone':True}
+        path = Path(journal['path']).resolve()
+        plant = journal.get('entry', {}).get('plant')
+        settings = load_settings(root)
+        if plant not in {'plant1', 'plant2'} or path != Path(settings['workbook_paths'][int(plant[-1]) - 1]).expanduser().resolve():
+            raise ValueError('Reconnect the original workbook to its plant before restoring this inward.')
+        with WorkbookSession(path, backups) as session:
+            overrides = {str(path):session.data}
+            current = hashlib.sha256(session.data).hexdigest()
+            if journal.get('undo_started') and current == journal['before_sha256']:
+                journal['undone'] = True
+                save_json(journal_path, journal)
+                return {'undone':True}
+            require_revision(root, revision, overrides)
+            saved_backup = journal.get('backup_path')
+            candidates = [Path(saved_backup)] if saved_backup else backups.glob(f'{path.stem}_*{path.suffix}')
+            if current != journal['after_sha256']:
+                location = str(saved_backup or backups)
+                raise ValueError(f'{path.name} changed after the removal. The pre-deletion copy is at {location}. '
+                                 'Open that copy in Excel and bring the missing inward into the current workbook.')
+            for candidate in candidates:
+                if not candidate.resolve().is_relative_to(backups.resolve()) or not candidate.is_file():
+                    continue
+                before = candidate.read_bytes()
+                if hashlib.sha256(before).hexdigest() == journal['before_sha256']:
+                    break
+            else:
+                raise ValueError('The verified copy from before the removal is unavailable. Check your workbook backups.')
+            from identifier_rules import require_restored_identifiers
+            require_restored_identifiers(root, [dict(journal['entry'], source_kind='workbook')],
+                                         {str(path):before}, read_register(root)['records'])
+            journal['undo_started'] = True
+            save_json(journal_path, journal)
+            session.before_persist = lambda _: require_revision(root, revision, overrides)
+            session._persist(before, exact=True)
+            journal['undone'] = True
+            try:
+                save_json(journal_path, journal)
+            except OSError:
+                pass  # The before hash proves the undo already committed.
+        return {'undone':True}

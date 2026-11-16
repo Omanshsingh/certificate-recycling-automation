@@ -187,6 +187,37 @@ class ClientIntakeTests(unittest.TestCase):
         self.assertEqual(len(read_batches(self.paths[0])), 2)
         self.assertEqual(len(list(web_app.BACKUP_DIR.glob('*.xlsx'))), 1)
 
+    def test_deleted_client_retry_does_not_return_the_reused_serial(self):
+        from inward_removal import remove_inward
+
+        body = self.body(inward_date='2026-10-01', items=[{'item':'Laptop','weight':5}])
+        sn = web_app.add_client(body)['client']['sn']
+        web_app.add_client(dict(self.body(supplier='Next client', inward_date='2026-10-02',
+                                          form6='FORM-NEXT', items=[{'item':'Printer','weight':7}]),
+                                request_id='b' * 32))
+        row = next(batch for batch in read_batches(self.paths[0]) if batch['case_id'] == sn)
+        removal = {'plant':'plant1', 'sn':sn, 'sheet':row['source_sheet'], 'row':row['source_row'],
+                   'request_id':'c' * 32, 'expected_revision':workspace_revision(self.root)}
+        preview = remove_inward(self.root, removal)
+        remove_inward(self.root, dict(removal, review_token=preview['review_token'], checked=True), commit=True)
+        replacement = next(batch for batch in read_batches(self.paths[0]) if batch['case_id'] == sn)
+        self.assertEqual(replacement['supplier'], 'Next client')
+        before = self.paths[0].read_bytes()
+        with self.assertRaisesRegex(web_app.ClientAddRequestEnded, 'later removed'):
+            web_app.add_client(body)
+        self.assertEqual(self.paths[0].read_bytes(), before)
+
+    def test_quantity_only_draft_leaves_weight_cell_blank(self):
+        result = web_app.add_client(self.body(items=[{'item':'Laptop','quantity':'2'}]))
+        row = next(batch for batch in read_batches(self.paths[0])
+                   if batch['case_id'] == result['client']['sn'])
+        book = load_workbook(self.paths[0])
+        try:
+            sheet, _, cols = select_register(book)
+            self.assertIsNone(sheet.cell(row['source_row'], cols['weight'] + 1).value)
+        finally:
+            book.close()
+
     def test_prepared_journal_recovers_if_final_journal_write_failed(self):
         real_save = web_app.save_json
         def fail_saved(path, data):

@@ -689,7 +689,7 @@ def _validate_staged(root, manifest, stage):
             identifier = deletion.get('id')
             if (not isinstance(identifier,str) or not re.fullmatch(r'[a-f0-9]{32}',identifier)
                     or relative != f'Data/Entry Deletions/{identifier}.json'
-                    or deletion.get('state') not in {'complete','rolled_back'}):
+                    or deletion.get('state') not in {'complete', 'rolled_back', 'undone'}):
                 raise BackupError('Recover the interrupted entry deletion before backing up or restoring it.')
     for relative in entries:
         if not relative.startswith("Data/Issuance History/") or not relative.endswith(".json"):
