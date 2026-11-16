@@ -70,6 +70,7 @@ function harness(options = {}) {
   class FormData {
     constructor(form) { this.values = Object.fromEntries(Object.entries(form.values || {}).filter(([name]) => !form.elements?.namedItem(name)?.disabled)); }
     entries() { return Object.entries(this.values); }
+    [Symbol.iterator]() { return this.entries()[Symbol.iterator](); }
     get(key) { return this.values[key]; }
   }
   const storage = new Map(), requests = [], window = new Node('window'), timers = new Map();
@@ -118,6 +119,10 @@ test('Saved certificates filter by the same certificate types as Companies', () 
 test('Inward search narrows large lists and requires an exact plant and SN selection', () => {
   for (const id of ['upload-inward', 'external-inward']) {
     const h = harness();
+    if (id === 'upload-inward') {
+      uploadForm(h);
+      h.controls.get('#external-upload-target').value = 'workbook';
+    }
     const picker = vm.runInContext(id === 'upload-inward' ? 'uploadInwardPicker' : 'externalInwardPicker', h.context);
     const input = h.controls.get(`#${id}`);
     const list = h.controls.get(`#${id}-options`);
@@ -143,6 +148,135 @@ test('Inward search narrows large lists and requires an exact plant and SN selec
     input.dispatch('input');
     assert.equal(picker.selection(), null);
     assert.equal(h.controls.get(`#${id}-results`).textContent, 'No matching inwards.');
+  }
+});
+
+function uploadForm(h) {
+  const form = h.controls.get('#upload-certificate-form');
+  const names = ['cod_date', 'certificate_type', ...vm.runInContext('uploadDetailFields', h.context)];
+  const fields = Object.fromEntries(names.map(name => [name, new Node('input')]));
+  form.elements = {namedItem:name => fields[name]};
+  Object.defineProperty(form, 'values', {get:() => Object.fromEntries(Object.entries(fields).map(([name, field]) => [name, field.value]))});
+  return {form, fields};
+}
+
+test('Upload PDF replaces the exact issued certificate and keeps its COD', async () => {
+  const h = harness({fetch:async () => ({ok:false, status:400, json:async () => ({error:'Check the PDF.'})})});
+  const mode = h.controls.get('#external-upload-target');
+  const input = h.controls.get('#upload-inward');
+  const options = h.controls.get('#upload-inward-options');
+  const {form, fields} = uploadForm(h);
+  const {updateUploadTarget, saveUploadedCertificate} = vm.runInContext('({updateUploadTarget, saveUploadedCertificate})', h.context);
+  h.ui.app.workspaceRevision = 'reviewed-revision';
+  h.ui.app.state.rows = [
+    {supplier:'Client', plant:'plant1', sn:'12', certificate_status:'ready'},
+    {supplier:'Client', plant:'plant2', sn:'12', certificate_status:'completed',
+      certificate_type:'siemens', certificate_no:'0456', certificate_date:'2026-11-05',
+      pdf_relative_path:'Auto Generated/0456_Client.pdf', reference:'Excel reference', location:'Excel site',
+      last_certificate_details:{supplier:'Name on certificate', reference:'PDF reference', certificate_weight:'8.075'}},
+
+  ];
+  mode.value = 'replace';
+  updateUploadTarget(true);
+  input.dispatch('focus');
+  assert.equal(options.children.length, 1);
+  assert.match(text(options.children[0]), /Plant 2.*SN 12.*COD 0456/);
+  options.children[0].dispatch('click');
+  assert.equal(h.controls.get('#upload-cod').value, '0456');
+  assert.equal(fields.cod_date.value, '05/11/26');
+  assert.equal(fields.certificate_type.value, 'siemens');
+  assert.equal(fields.certificate_type.disabled, true);
+  assert.equal(h.controls.get('#upload-company-fields').hidden, false);
+  assert.equal(fields.supplier.value, 'Name on certificate');
+  assert.equal(fields.reference.value, 'PDF reference');
+  assert.equal(fields.certificate_weight.value, '8.075');
+  fields.reference.value = '';
+  fields.location.value = 'Revised site';
+  assert.equal(h.controls.get('#save-uploaded-certificate').textContent, 'Replace PDF');
+  const file = {};
+  h.controls.get('#external-upload-file').files = [file];
+  h.ui.app.uploadedFile = {token:'uploaded', file, cod:'0456'};
+  await saveUploadedCertificate({currentTarget:form, preventDefault() {}});
+  assert.deepEqual(h.requests[0].payload, {
+    token:'uploaded', details:{cod_date:'05/11/26'},
+    inward:null, replacement:{plant:'plant2', sn:'12'},
+    certificate_edits:{location:'Revised site', reference:''},
+    expected_revision:'reviewed-revision',
+  });
+  assert.equal(h.controls.get('#upload-certificate-error').textContent, 'Check the PDF.');
+});
+
+test('Upload PDF prefills the chosen inward and preserves edited fields when data refreshes', async () => {
+  const h = harness({fetch:async () => ({ok:false, status:400, json:async () => ({error:'Check the PDF.'})})});
+  const {form, fields} = uploadForm(h);
+  const mode = h.controls.get('#external-upload-target');
+  const input = h.controls.get('#upload-inward');
+  const options = h.controls.get('#upload-inward-options');
+  const {updateUploadTarget, saveUploadedCertificate} = vm.runInContext('({updateUploadTarget, saveUploadedCertificate})', h.context);
+  h.ui.app.workspaceRevision = 'reviewed-revision';
+  const inward = {supplier:'Client', plant:'plant1', sn:'12', certificate_status:'ready', location:'Pune',
+    reference:'REF-12', form6:'F6-12', inward_date:'2026-11-03', certificate_type:'sita', items:[{item:'Laptops', quantity:3, weight:4.5}]};
+  h.ui.app.state.rows = [inward, {supplier:'Second', plant:'plant2', sn:'12', certificate_status:'ready'}];
+  mode.value = 'workbook';
+  updateUploadTarget(true);
+  assert.equal(h.controls.get('#upload-company-fields').hidden, true);
+  input.dispatch('focus');
+  options.children[0].dispatch('click');
+  assert.equal(fields.supplier.value, 'Client');
+  assert.equal(fields.certificate_type.value, 'sita');
+  assert.equal(fields.cod_date.value, '');
+  assert.equal(fields.inward_date.value, '03/11/26');
+  assert.equal(fields.reference.value, 'REF-12');
+  assert.equal(fields.form6.value, 'F6-12');
+  assert.match(text(h.controls.get('#upload-materials-list')), /Laptops.*Qty 3.*4.5 kg/);
+  fields.reference.value = 'Changed reference';
+  fields.cod_date.value = '04/11/26';
+  h.ui.app.state.rows[0] = {...inward, location:'Pune - updated'};
+  updateUploadTarget();
+  assert.equal(fields.location.value, 'Pune - updated');
+  assert.equal(fields.reference.value, 'Changed reference');
+  assert.equal(fields.cod_date.value, '04/11/26');
+  const file = {};
+  h.controls.get('#external-upload-file').files = [file];
+  h.ui.app.uploadedFile = {token:'uploaded', file, cod:'0456', reference:'PDF reference'};
+  await saveUploadedCertificate({currentTarget:form, preventDefault() {}});
+  assert.deepEqual(h.requests.at(-1).payload, {
+    token:'uploaded', details:{certificate_type:'sita', cod_date:'04/11/26'},
+    inward:{plant:'plant1', sn:'12'}, replacement:null,
+    certificate_edits:{reference:'Changed reference'}, expected_revision:'reviewed-revision',
+  });
+  input.dispatch('focus');
+  options.children[1].dispatch('click');
+  assert.equal(fields.supplier.value, 'Second');
+  assert.equal(fields.reference.value, '');
+  assert.equal(fields.cod_date.value, '');
+  assert.equal(h.controls.get('#upload-materials').hidden, true);
+});
+
+test('Upload PDF displays automatic CODs and leaves assignment to the save request', async () => {
+  const h = harness({fetch:async () => ({ok:false, status:400, json:async () => ({error:'Check the PDF.'})})});
+  const html = fs.readFileSync(path.join(__dirname, '../web/index.html'), 'utf8');
+  const codField = html.match(/<textarea id="upload-cod"[^>]*>/)[0];
+  assert.match(codField, /\breadonly\b/);
+  assert.doesNotMatch(codField, /\bname=/);
+  const form = h.controls.get('#upload-certificate-form');
+  form.values = {certificate_type:'standard', cod_date:'05/11/26', supplier:'Client'};
+  form.elements = {namedItem:name => ({value:form.values[name]})};
+  h.controls.get('#external-upload-target').value = 'local';
+  h.ui.app.state.numbering = {next_cod:'0456'};
+  h.ui.app.workspaceRevision = 'reviewed-revision';
+  const file = {};
+  h.controls.get('#external-upload-file').files = [file];
+  const {updateUploadCod, saveUploadedCertificate} = vm.runInContext('({updateUploadCod, saveUploadedCertificate})', h.context);
+  for (const [printed, shown] of [['0423', '0423'], ['', '0456']]) {
+    h.ui.app.uploadedFile = {token:'uploaded', file, cod:printed};
+    updateUploadCod();
+    assert.equal(h.controls.get('#upload-cod').value, shown);
+    await saveUploadedCertificate({currentTarget:form, preventDefault() {}});
+    assert.deepEqual(h.requests.at(-1).payload, {
+      token:'uploaded', details:form.values, inward:null, replacement:null,
+      expected_revision:'reviewed-revision',
+    });
   }
 });
 
@@ -903,7 +1037,7 @@ test('Saved list contains only current PDFs, not deleted files or nested disclos
   assert.match(text(controls.get('#saved-file-facts')),/REF-24/);
   assert.equal(controls.get('#saved-file-modal').open,true);
 });
-test('Saved certificates share one list with clear folder sources and preserve legacy PDFs', () => {
+test('Saved certificates label PDF sources in the shared folder and recognize legacy paths', () => {
   const {ui,controls} = harness();
   const entries = [
     {path:'Certificates/Created in App/0101_Client_1.pdf'},
@@ -911,11 +1045,14 @@ test('Saved certificates share one list with clear folder sources and preserve l
     {path:'Certificates/Auto Generated/0103_Client_1.pdf'},
     {path:'Certificates/0104_Client_1.pdf'},
     {path:'Certificates/0105_Client_1.pdf',managed_owner:{source_kind:'manual'}},
+    {path:'Certificates/0106_Client_1.pdf',app_generated:true},
+    {path:'Certificates/0107_Client_2.pdf',external:true,managed_owner:{source_kind:'workbook'}},
   ].map(entry => ({...entry,present:true}));
   ui.app.state.certificate_inventory = {entries};
   ui.renderFolderInventory();
   const labels = all(controls.get('#folder-inventory-files'), node => node.className === 'saved-file-source').map(node => node.textContent);
-  assert.deepEqual(labels.sort(), ['Auto Generated','Auto Generated','Auto Generated','Existing PDF','Manually Added'].sort());
+  assert.deepEqual(labels.sort(), ['Auto Generated','Auto Generated','Auto Generated','Auto Generated',
+    'Existing PDF','Manually Added','Manually Added'].sort());
   ui.showSavedFile(entries[0]);
   assert.doesNotMatch(text(controls.get('#saved-file-facts')), /Created in App/);
   ui.showSavedFile(entries[1]);

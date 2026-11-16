@@ -1,28 +1,31 @@
 """Keep the operator's original PDF and record its certificate details."""
 from contextlib import ExitStack
 from datetime import date, datetime
-from io import BytesIO
 from pathlib import Path
 import json
 import re
 import uuid
 
-from certificate_core import number, parse_date, status_value
-from certificate_drafts import clean_details, read_register, register_path, write_register
-from certificate_inventory import (CERTIFICATE_FOLDERS, cod_conflicts, identity, is_external_path,
+from certificate_core import batch_content, number, parse_date, status_value
+from certificate_drafts import clean_details, current_record_pdf, read_register, register_path, write_register
+from certificate_inventory import (cod_conflicts, identity, issuance_paths,
                                    safe_certificate_path, scan_inventory, text_identifiers)
-from certificate_templates import TEMPLATE_NAMES
+from certificate_templates import TEMPLATE_NAMES, template_id
 from identifier_rules import workspace_batches
-from issuance_safety import IssuanceTransaction, digest_bytes, file_digest, latest_issuance, recover_issuances
+from inward_followup import FIELDS
+from issuance_safety import (IssuanceTransaction, audit_records, digest_bytes, file_digest, latest_issuance,
+                             recover_issuances)
 from pdf_attachments import checked_reader
 from preview_store import cleanup_previews
-from run_certificates import _safe_cod_name, certificate_filename, numbering_plan, workbook_cod_ownership_issue
+from run_certificates import (_safe_cod_name, certificate_filename, find_certificate, numbering_plan,
+                              workbook_cod_ownership_issue)
 from workbook_store import WorkbookSession
 from workflow_support import load_settings, operation_error_message, run_lock
 from workspace_review import require_revision
 
 
 UPLOAD_LIMIT = 50_000_000
+EDITABLE_CERTIFICATE_FIELDS = {'supplier', 'location', 'inward_date', 'reference', 'form6', 'certificate_weight'}
 
 
 def _valid_cod(cod):
@@ -60,6 +63,56 @@ def stage_upload(root, payload):
             'reference':references[0] if len(references) == 1 else ''}
 
 
+def _replacement_paths(root, inventory, current, cod, source_kind, plant, key):
+    # Retire only PDFs with verified ownership, plus the selected current PDF
+    # for older records created before issuance receipts were introduced.
+    current_path = current.relative_to(root).as_posix()
+    current_sha = file_digest(current)
+    owned = {path.casefold() for path in issuance_paths(inventory, cod, source_kind, plant, key)}
+    present = {entry['path']: entry['sha256'] for entry in inventory['entries']
+               if entry['present'] and entry['path'].casefold() in owned}
+    entry = next((row for row in inventory['entries'] if row['path'] == current_path and row['present']), None)
+    if (not entry or not current_sha or entry.get('sha256') != current_sha
+            or (entry.get('managed_owner') and current_path.casefold() not in owned)):
+        raise ValueError('The current PDF could not be verified for this certificate. Refresh and check Saved certificates.')
+    present[current_path] = current_sha
+    # A retired legacy PDF may still reserve this COD in the inventory.
+    retired = {(old['path'], old['sha256']) for receipt in audit_records(root)
+               if receipt.get('state') == 'complete' and receipt.get('source_kind') == source_kind
+               and receipt.get('plant') == plant and str(receipt.get('key')).casefold() == str(key).casefold()
+               and identity(receipt.get('cod')) == identity(cod)
+               for old in receipt.get('previous_pdfs', [])}
+    allowed = [entry['path'] for entry in inventory['entries'] if entry['path'] in present
+               or (not entry['present'] and (entry['path'].casefold() in owned
+                   or (entry['path'], entry.get('sha256')) in retired))]
+    paths = {safe_certificate_path(root, path.removeprefix('Certificates/'), expected_sha=sha): sha
+             for path, sha in present.items()}
+    return allowed, paths
+
+
+def _apply_certificate_edits(details, edits):
+    if not isinstance(edits, dict) or any(key not in EDITABLE_CERTIFICATE_FIELDS or not isinstance(value, str)
+                                         for key, value in edits.items()):
+        raise ValueError('Review the editable certificate details and try again.')
+    if not edits:
+        return
+    checked = clean_details(dict(edits, certificate_type=details['certificate_type']))
+    if checked['inward_date']:
+        received = parse_date(checked['inward_date'])
+        if not received:
+            raise ValueError('Enter a valid received date.')
+        checked['inward_date'] = received.isoformat()
+    if checked['certificate_weight'] and (number(checked['certificate_weight']) or 0) <= 0:
+        raise ValueError('Enter a positive certificate weight in kg.')
+    details.update({key: checked[key] for key in edits})
+    fields = dict(details.get('certificate_fields') or {})
+    if 'supplier' in edits:
+        fields.pop('company_display', None)
+    if 'location' in edits and details['certificate_type'] == 'siemens':
+        fields['site_location'] = details['location']
+    details['certificate_fields'] = fields
+
+
 def save_upload(root, backup_dir, body):
     root = Path(root).resolve()
     token = body.get('token')
@@ -68,7 +121,23 @@ def save_upload(root, backup_dir, body):
     stage = root / 'Data' / 'Previews' / f'{token}.pdf'
     if not stage.is_file():
         raise ValueError('The upload has expired. Choose the certificate PDF again.')
+    replacement = body.get('replacement')
+    replacing = replacement is not None
+    target = body.get('inward')
+    record_id = None
+    if replacing:
+        if not isinstance(replacement, dict) or target is not None:
+            raise ValueError('Choose an existing certificate to replace.')
+        if 'record_id' in replacement:
+            record_id = replacement['record_id']
+            if not isinstance(record_id, str) or not re.fullmatch(r'[a-f0-9]{32}', record_id):
+                raise ValueError('Choose an existing certificate to replace.')
+        else:
+            target = replacement
     submitted = body.get('details')
+    if replacing and isinstance(submitted, dict):
+        submitted = {'certificate_type':'standard', 'cod_no':submitted.get('cod_no'),
+                     'cod_date':submitted.get('cod_date')}
     kind = submitted.get('certificate_type') if isinstance(submitted, dict) else None
     if kind not in TEMPLATE_NAMES:
         raise ValueError('Choose the certificate type.')
@@ -84,7 +153,6 @@ def save_upload(root, backup_dir, body):
         raise ValueError('Enter a positive certificate weight in kg.')
     details['cod_date'] = issued_date.isoformat()
     revision = body.get('expected_revision')
-    target = body.get('inward')
     if target is not None and (not isinstance(target, dict) or target.get('plant') not in {'plant1','plant2'}
                                or not isinstance(target.get('sn'), str) or not target['sn'].strip()):
         raise ValueError('Choose an Excel inward.')
@@ -101,6 +169,16 @@ def save_upload(root, backup_dir, body):
         overrides = {}
         plant = None
         register = read_register(root)
+        existing = None
+        if record_id:
+            existing = next((record for record in register['records'] if record['id'] == record_id), None)
+            if existing is None:
+                raise ValueError('This certificate could not be found. Refresh and choose the current record.')
+            plant = existing['plant']
+            kind = existing['details']['certificate_type']
+            link = existing['details'].get('destruction_source')
+            if link and not link.get('record_id'):
+                target = {'plant':link['plant'], 'sn':link['case_id']}
         if target:
             plant = target['plant']
             path = load_settings(root)['workbook_paths'][int(plant[-1]) - 1]
@@ -115,17 +193,53 @@ def save_upload(root, backup_dir, body):
             if len(matches) != 1 or matches[0].get('duplicate_serial_number'):
                 raise ValueError('This inward is missing or its SN is repeated. Check Excel and refresh.')
             source = matches[0]
-            for field in ('case_id', 'supplier', 'location', 'reference', 'form6'):
-                details[field] = source.get(field, '')
-            details['inward_date'] = source['inward_date'].isoformat() if source['inward_date'] else ''
-        if not details['supplier']:
-            raise ValueError('Enter the company name.')
-
+            if not replacing:
+                fields = dict(source.get('certificate_fields') or {}) if kind == source.get('certificate_type') else {}
+                if submitted.get('certificate_fields'):
+                    fields.update(details['certificate_fields'])
+                weight = details['certificate_weight']
+                details.update(batch_content(source), **{key: source.get(key, '') for key in FIELDS})
+                received = source['inward_date']
+                details.update(certificate_type=kind, certificate_fields=fields,
+                               inward_date=received.isoformat() if received else '',
+                               certificate_weight=weight or source.get('certificate_weight') or '')
+                if kind == 'destruction':
+                    details['items'] = []
         is_hdd = bool(source and kind == 'destruction')
         workbook_record = bool(source and not is_hdd)
+        source_kind = 'workbook' if workbook_record else 'manual'
         existing_cod = source.get('cod_no') if workbook_record else ''
-        existing = None
-        if is_hdd:
+        inventory = None
+        previous_paths = {}
+        permitted_paths = []
+        if replacing:
+            previous = source if workbook_record else existing
+            if not previous or status_value(previous.get('issued' if workbook_record else 'status')) not in {
+                    'generated', 'generated_manual', 'completed'}:
+                raise ValueError('Choose an issued certificate with a current PDF.')
+            previous_details = source if workbook_record else existing['details']
+            existing_cod = previous_details['cod_no']
+            if not existing_cod:
+                raise ValueError('The current certificate needs a COD before its PDF can be replaced.')
+            if is_hdd and identity(source.get('hdd_cod_no')) != identity(existing_cod):
+                raise ValueError('The HDD certificate and Excel inward have different CODs. Check the linked entries.')
+            key = source['case_id'] if workbook_record else existing['id']
+            receipt = latest_issuance(root, source_kind, plant, key)
+            if receipt and identity(receipt.get('cod')) != identity(existing_cod):
+                raise ValueError('The current COD differs from the issuance history. Check the selected record.')
+            inventory = scan_inventory(root, force=True)
+            current = (find_certificate(root / 'Certificates', source, inventory=inventory, receipt=receipt)
+                       if workbook_record else current_record_pdf(root, existing, receipt=receipt))
+            if not current:
+                raise ValueError('The current PDF is missing or changed. Refresh and check Saved certificates.')
+            permitted_paths, previous_paths = _replacement_paths(
+                root, inventory, current, existing_cod, source_kind, plant, key)
+            saved_details = receipt.get('after') if receipt and workbook_record else None
+            details = dict(previous_details, **(saved_details or {}))
+            kind = template_id(details.get('certificate_type'))
+            details.update(certificate_type=kind, cod_date=issued_date.isoformat())
+
+        if is_hdd and not replacing:
             if status_value(source['issued']) == 'na':
                 raise ValueError('This inward is marked N/A. Choose Undo N/A before attaching an HDD certificate.')
             details['destruction_source'] = link = {'plant':plant, 'case_id':source['case_id']}
@@ -136,15 +250,23 @@ def save_upload(root, backup_dir, body):
             if existing and (existing['details'].get('cod_no') or status_value(existing.get('status')) == 'na'):
                 raise ValueError('Review the existing Data Destruction record before uploading a certificate.')
             if existing:
-                details['certificate_fields'] = existing['details'].get('certificate_fields', {})
-        if workbook_record:
+                details.update(existing['details'], cod_date=issued_date.isoformat())
+                details['case_id'] = source['case_id']
+        if target or replacing:
+            _apply_certificate_edits(details, body.get('certificate_edits', {}))
+        if not details['supplier']:
+            raise ValueError('Enter the company name.')
+        if workbook_record and not replacing:
             if (status_value(source['issued']) not in {'blank', 'alert', 'ready', 'generated_manual'}
                     or source.get('external_pdf') or source.get('pdf_recovery_pending')
                     or latest_issuance(root, 'workbook', plant, source['case_id'])):
-                raise ValueError('This inward already has a certificate or is marked N/A. Choose an inward available for attachment.')
-        inventory = None
+                raise ValueError('Choose an available inward or use Replace an existing certificate PDF.')
         cod = reviewed_cod
-        if automatic:
+        if replacing:
+            if reviewed_cod and identity(reviewed_cod) != identity(existing_cod):
+                raise ValueError(f'The replacement must keep COD {existing_cod}.')
+            cod = existing_cod
+        elif automatic:
             if len(printed) == 1:
                 cod = printed[0]
             elif len(printed) > 1:
@@ -157,6 +279,8 @@ def save_upload(root, backup_dir, body):
             if reviewed_cod and identity(reviewed_cod) != identity(cod):
                 raise ValueError(f'The files changed and the suggested COD is now {cod}. Refresh and review the upload before saving.')
         if not _valid_cod(cod):
+            if automatic:
+                raise ValueError('The app could not assign a valid COD. Check the inward’s COD and the numbering in Settings.')
             raise ValueError('Enter the certificate number exactly as it appears on the PDF.')
         _safe_cod_name(cod)
         if printed and {identity(value) for value in printed} != {identity(cod)}:
@@ -166,24 +290,28 @@ def save_upload(root, backup_dir, body):
         details['cod_no'] = cod
         conflict = workbook_cod_ownership_issue(
             {'source_id':plant if workbook_record else None, 'case_id':source['case_id'] if workbook_record else None,
-             'cod_no':cod}, batches, register['records'])
+             'cod_no':cod}, batches, [record for record in register['records'] if record is not existing])
         if conflict:
             raise ValueError(conflict)
-        if any(identity(row.get('hdd_cod_no')) == identity(cod) for row in batches):
+        if any(identity(row.get('hdd_cod_no')) == identity(cod) for row in batches
+               if not (replacing and is_hdd and row is source)):
             raise ValueError(f'COD {cod} is already assigned to a Data Destruction certificate.')
         if inventory is None:
             inventory = scan_inventory(root, force=True)
         duplicates = [entry for entry in inventory['entries'] if entry.get('present') and entry.get('sha256') == digest]
-        if any(entry.get('managed_owner') or not is_external_path(entry['path']) for entry in duplicates) or any(
+        if any(not entry.get('linkable_external') for entry in duplicates) or any(
                 isinstance(row.get('external_pdf'), dict) and row['external_pdf'].get('sha256') == digest for row in batches):
             raise ValueError('This PDF already belongs to a saved certificate. Open it in Saved certificates.')
         allowed = [entry['path'] for entry in duplicates]
-        if cod_conflicts(inventory, cod, allowed_paths=allowed):
+        if cod_conflicts(inventory, cod, allowed_paths=allowed + permitted_paths):
             raise ValueError(f'COD {cod} is already used by another PDF. Check the certificate number.')
         require_revision(root, revision, overrides)
-        relative = (allowed[0].removeprefix('Certificates/') if allowed else
-                    f"{CERTIFICATE_FOLDERS['external']}/{certificate_filename(details, cod=cod)}")
+        relative = allowed[0].removeprefix('Certificates/') if allowed else certificate_filename(details, cod=cod)
         destination = safe_certificate_path(root, relative)
+        if destination in previous_paths:
+            stem = destination.stem.removesuffix('_HDD') if kind == 'destruction' else destination.stem
+            suffix = '_HDD.pdf' if kind == 'destruction' else '.pdf'
+            destination = destination.with_name(f'{stem}_{uuid.uuid4().hex[:8]}{suffix}')
         destination.parent.mkdir(parents=True, exist_ok=True)
         if not allowed and destination.exists():
             raise ValueError('A PDF with that filename already exists. Refresh and check Saved certificates.')
@@ -207,10 +335,13 @@ def save_upload(root, backup_dir, body):
             companion = (custom_path, custom_path.read_bytes() if custom_path.is_file() else None,
                          json.dumps(register, indent=2, ensure_ascii=False, default=str).encode('utf-8'))
         transaction = IssuanceTransaction(root, destination, stage, source_path, source_before,
-            source_kind='workbook' if workbook_record else 'manual', plant=plant, key=identifier,
+            source_kind=source_kind, plant=plant, key=identifier,
             cod=cod, issued_date=issued_date, before=source if workbook_record else old_record,
-            after=details, companion_source=companion, external_upload=True, retain_existing=bool(allowed))
+            after=details, old_paths=previous_paths, companion_source=companion, external_upload=True,
+            retain_existing=bool(allowed))
         try:
+            if replacing and {root / item['path']: item['sha256'] for item in transaction.data['previous_pdfs']} != previous_paths:
+                raise ValueError('The current PDF changed during the upload. Refresh and review it again.')
             transaction.publish()
             if session:
                 session.before_persist = transaction.expect_source
@@ -239,5 +370,5 @@ def save_upload(root, backup_dir, body):
             stage.unlink(missing_ok=True)
         except OSError:
             pass
-    return {'saved':True, 'certificate_no':cod, 'relative_path':relative, 'recovery_note':note,
+    return {'saved':True, 'replaced':replacing, 'certificate_no':cod, 'relative_path':relative, 'recovery_note':note,
             'record_id':None if workbook_record else identifier}

@@ -17,7 +17,7 @@ from reportlab.pdfgen import canvas
 
 from certificate_core import read_batches
 import certificate_drafts as drafts
-from certificate_inventory import (CERTIFICATE_FOLDERS, cod_conflicts, ensure_certificate_folders,
+from certificate_inventory import (cod_conflicts, ensure_certificate_folders,
                                    inspect_pdf, issuance_paths, record_issuance, reference_warnings,
                                    safe_certificate_path, scan_inventory, text_identifiers, verify_publication)
 import run_certificates as runner
@@ -102,19 +102,18 @@ class TemporaryInventoryTest(unittest.TestCase):
 
 
 class CertificateFolderStructureTests(TemporaryInventoryTest):
-    def test_startup_creates_two_folders_for_three_source_kinds_and_scanner_tracks_all(self):
-        folders = ensure_certificate_folders(self.root)
-        self.assertEqual({kind: path.name for kind, path in folders.items()}, CERTIFICATE_FOLDERS)
-        self.assertTrue(all(path.is_dir() for path in folders.values()))
-        self.assertEqual({path.name for path in self.folder.iterdir()}, {'Auto Generated', 'Manually Added'})
-        self.assertEqual(folders['workbook'], folders['manual'])
-        for index, kind in enumerate(('workbook', 'manual', 'external'), 1):
-            external_pdf(folders[kind] / f'{index:04d}_Client_City_1.pdf', cod=f'{index:04d}')
-
-        inventory = scan_inventory(self.root)
-
-        self.assertEqual({entry['path'].split('/')[1] for entry in inventory['entries']},
-                         set(CERTIFICATE_FOLDERS.values()))
+    def test_pdfs_placed_in_the_shared_folder_are_available_as_external(self):
+        self.assertEqual(ensure_certificate_folders(self.root), self.folder)
+        pdf = external_pdf(self.folder / '0001_Client_City.pdf', cod='0001')
+        entry, = scan_inventory(self.root)['entries']
+        self.assertEqual(entry['path'], 'Certificates/' + pdf.name)
+        self.assertFalse(entry['external'])
+        self.assertTrue(entry['linkable_external'])
+        record_issuance(self.root, pdf, '0001', 'workbook', 'plant1', '1')
+        entry, = scan_inventory(self.root)['entries']
+        self.assertFalse(entry['external'])
+        self.assertTrue(entry['app_generated'])
+        self.assertFalse(entry['linkable_external'])
 
     def test_read_only_scan_does_not_create_destination_folders(self):
         inventory = scan_inventory(self.root)
@@ -548,7 +547,7 @@ class InventoryWorkflowTests(TemporaryInventoryTest):
         self.assertEqual((created, review), (1, 0))
         first = read_batches(self.paths[0])[0]
         self.assertEqual(first["issued"], "Generated")
-        replaced = self.folder / "Auto Generated" / certificate_filename(first, 1, first["cod_no"])
+        replaced = self.folder / certificate_filename(first, 1, first["cod_no"])
         self.assertTrue(issuance_paths(scan_inventory(self.root), first["cod_no"], "workbook", "plant1", "NEW-EXCEL"))
         external_pdf(replaced, cod=first["cod_no"], reference="EXT-EDIT")
         replacement = replaced.read_bytes()

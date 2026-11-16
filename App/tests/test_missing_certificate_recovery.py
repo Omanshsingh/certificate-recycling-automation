@@ -153,7 +153,7 @@ class MissingCertificateRecoveryTests(unittest.TestCase):
         batch = self.source_batch()
         self.assertEqual((batch["issued"], batch["cod_no"], parse_date(batch["cod_date"])),
                          ("Generated", "0041", RECORDED_DATE))
-        self.assertTrue((self.folder / "Auto Generated" / runner.certificate_filename(batch, 1, "0041")).is_file())
+        self.assertTrue((self.folder / runner.certificate_filename(batch, 1, "0041")).is_file())
 
     def test_explicit_regeneration_keeps_existing_cod_and_recorded_date_after_completed_recovery(self):
         self.source(status="Completed")

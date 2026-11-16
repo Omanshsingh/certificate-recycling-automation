@@ -1,4 +1,4 @@
-"""Move the former app folder without rewriting immutable issuance history."""
+"""Consolidate legacy certificate folders while keeping issued PDF links valid."""
 from datetime import datetime
 import hashlib
 import json
@@ -10,8 +10,16 @@ import uuid
 
 from workflow_support import run_lock, save_json
 
-LEGACY = 'Created in App'
-DESTINATION = 'Auto Generated'
+LEGACY_ORIGINS = {
+    'created in app': 'app', 'auto generated': 'app',
+    'manually added': 'external', 'externally created': 'external',
+    'generated externally': 'external', 'external certificates': 'external',
+}
+
+
+def legacy_certificate_origin(path):
+    parts = str(path).replace('\\', '/').casefold().removeprefix('certificates/').split('/')
+    return LEGACY_ORIGINS.get(parts[0]) if len(parts) > 1 else None
 
 
 def _ledger_path(root):
@@ -28,25 +36,35 @@ def _ledger(root):
     for move in value['moves']:
         if not isinstance(move, dict) or any(not isinstance(move.get(key), str) for key in ('old', 'new', 'sha256')):
             raise ValueError('The saved certificate folder move could not be read. Files were kept safe.')
-        for key, folder in (('old', LEGACY), ('new', DESTINATION)):
-            parts = move[key].replace('\\', '/').split('/')
-            if len(parts) < 3 or parts[:2] != ['Certificates', folder] or any(p in {'', '.', '..'} or ':' in p for p in parts):
-                raise ValueError('The saved certificate folder move has an invalid path. Files were kept safe.')
+        old, new = (move[key].replace('\\', '/').split('/') for key in ('old', 'new'))
+        if (not all(parts[0] == 'Certificates' and all(p not in {'', '.', '..'} and ':' not in p for p in parts)
+                    for parts in (old, new))
+                or len(old) < 3 or old[1].casefold() not in LEGACY_ORIGINS
+                or not (len(new) == 2 or (len(new) >= 3 and old[1] == 'Created in App' and new[1] == 'Auto Generated'))):
+            raise ValueError('The saved certificate folder move has an invalid path. Files were kept safe.')
     return value
+
+
+def migrated_certificate_origins(root):
+    return {(move['new'].casefold(), move['sha256']): legacy_certificate_origin(move['old'])
+            for move in _ledger(root)['moves']}
 
 
 def moved_relative_path(root, relative, expected_sha=None):
     """Resolve an old link only when an actual recorded move proves its target."""
     raw = str(relative).replace('\\', '/')
-    if not raw.startswith(f'{LEGACY}/'):
+    if not legacy_certificate_origin(raw):
         return raw
-    original = Path(root) / 'Certificates' / raw
-    if original.exists():
+    base = Path(root) / 'Certificates'
+    if (base / raw).exists():
         return raw  # A restored backup may still be in its original location.
-    key = 'Certificates/' + raw
-    for move in reversed(_ledger(root)['moves']):
-        if move['old'].casefold() == key.casefold() and (expected_sha is None or move['sha256'] == expected_sha):
-            return move['new'][len('Certificates/'):]
+    moves = {move['old'].casefold(): move['new'][len('Certificates/'):]
+             for move in _ledger(root)['moves'] if expected_sha is None or move['sha256'] == expected_sha}
+    while not (base / raw).exists():
+        target = moves.get(f'Certificates/{raw}'.casefold())
+        if target is None:
+            break
+        raw = target
     return raw
 
 
@@ -96,42 +114,61 @@ def _rewrite(value, replacements):
 
 def migrate_certificate_folder(root):
     root = Path(root).resolve()
-    legacy = root / 'Certificates' / LEGACY
-    if not legacy.exists() and not _ledger_path(root).exists():
+    base = root / 'Certificates'
+    if not base.is_dir():
         return
-    if not legacy.exists() and _ledger(root).get('state') == 'complete':
-        return
+    if base.resolve() != base:
+        raise ValueError('The Certificates folder points outside the workspace.')
+    if not any(path.name.casefold() in LEGACY_ORIGINS and path.is_dir() for path in base.iterdir()):
+        if _ledger(root).get('state') == 'complete':
+            return
     with run_lock(root):
         from issuance_safety import recover_issuances
         recover_issuances(root)
         ledger = _ledger(root)
-        if legacy.exists() and (legacy.is_symlink() or not legacy.resolve().is_relative_to(root / 'Certificates')):
-            raise ValueError('The old certificate folder points outside Certificates. Files were kept safe.')
-        items = sorted(legacy.rglob('*')) if legacy.is_dir() else []
-        files = [path for path in items if path.is_file()]
-        if any(path.is_symlink() or not path.resolve().is_relative_to(legacy.resolve()) for path in items):
-            raise ValueError('The old certificate folder contains an external link. Files were kept safe.')
+        files, directories = [], []
+        for folder in sorted(path for path in base.iterdir()
+                             if path.name.casefold() in LEGACY_ORIGINS and path.is_dir()):
+            if folder.resolve() != folder:
+                raise ValueError('An old certificate folder is a link. Files were kept safe.')
+            items = sorted(folder.rglob('*'))
+            if any(path.resolve() != path for path in items):
+                raise ValueError('An old certificate folder contains a link. Files were kept safe.')
+            files.extend(path for path in items if path.is_file())
+            directories.extend(path for path in items if path.is_dir())
+            directories.append(folder)
         unfinished = ledger.get('state') == 'moving'
         pending = ledger.get('pending', []) if unfinished else []
         if not isinstance(pending, list) or any(type(i) is not int or not 0 <= i < len(ledger['moves']) for i in pending):
             raise ValueError('The saved certificate folder move could not be read. Files were kept safe.')
-        planned_sources = {ledger['moves'][i]['old'] for i in pending}
-        additions, reserved = [], {str(root / move['new']).casefold() for move in ledger['moves']}
+        planned_sources = {ledger['moves'][i]['old'].casefold() for i in pending}
+        # Finish an older pending Created in App → Auto Generated move first.
+        # Its destination is flattened in the next pass under a new journal entry.
+        nested_targets = {ledger['moves'][i]['new'].casefold() for i in pending
+                          if len(Path(ledger['moves'][i]['new']).parts) > 2}
+        planned_sources.update(nested_targets)
+        inventory_path = root / 'Data' / 'Certificate Inventory.json'
+        active = [inventory_path, root / 'Data' / 'Custom Certificates.json',
+                  root / 'Data' / 'Reports' / 'Latest Results.json']
+        # Read the active metadata before planning any move.
+        original_bytes = {path: path.read_bytes() for path in active if path.is_file()}
+        documents = {path: json.loads(payload.decode('utf-8-sig')) for path, payload in original_bytes.items()}
+        reserved = {str(path).casefold() for path in base.iterdir()}
+        reserved.update(str(root / move['new']).casefold() for move in ledger['moves'])
+        reserved.update(str(root / entry['path']).casefold()
+                        for entry in documents.get(inventory_path, {}).get('entries', []))
+        additions = []
         for path in files:
             old = path.relative_to(root).as_posix()
-            if old in planned_sources:
+            if old.casefold() in planned_sources:
                 continue
-            target = root / 'Certificates' / DESTINATION / path.relative_to(legacy)
-            target = _available(target, reserved)
+            target = _available(base / path.name, reserved)
             reserved.add(str(target).casefold())
             additions.append({'old': old, 'new': target.relative_to(root).as_posix(), 'sha256': _digest(path)})
-        active = [root / 'Data' / name for name in ('Custom Certificates.json', 'Certificate Inventory.json', 'Reports/Latest Results.json')]
-        # Validate every active JSON file before moving any PDF.
-        original_bytes = {path: path.read_bytes() for path in active if path.is_file()}
-        documents = {path: json.loads(payload.decode('utf-8')) for path, payload in original_bytes.items()}
         if additions:
             backup = root / 'Data' / 'Certificate Folder Backups' / f'{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}'
-            for path in list(documents) + [root / move['old'] for move in additions]:
+            existing_ledger = [_ledger_path(root)] if _ledger_path(root).exists() else []
+            for path in list(documents) + existing_ledger + [root / move['old'] for move in additions]:
                 destination = backup / path.relative_to(root)
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(path, destination)
@@ -143,24 +180,28 @@ def migrate_certificate_folder(root):
         if additions or unfinished:
             for move in (ledger['moves'][i] for i in pending):
                 source, destination = root / move['old'], root / move['new']
-                if any(not path.resolve().is_relative_to(root / 'Certificates') for path in (source, destination)):
+                if any(path.resolve() != path or not path.is_relative_to(base) for path in (source, destination)):
                     raise ValueError('A certificate folder points outside Certificates. Files were kept safe.')
                 if source.exists():
                     if _digest(source) != move['sha256']:
                         raise ValueError('A certificate changed during its folder move. Files were kept safe; reopen the app to check it.')
                     destination.parent.mkdir(parents=True, exist_ok=True)
-                    if not destination.exists():
-                        # Windows rename fails if the target appears concurrently.
-                        os.rename(source, destination)
-                    elif _digest(destination) == move['sha256']:
+                    try:
+                        if os.name == 'nt':
+                            os.rename(source, destination)
+                        else:
+                            os.link(source, destination)
+                            source.unlink()
+                    except FileExistsError:
+                        if _digest(destination) != move['sha256']:
+                            raise ValueError('Another file appeared during the move. Both files were kept safe.')
                         source.unlink()  # The verified target and backup both exist.
-                    else:
-                        raise ValueError('Another PDF appeared during the folder move. Both files were kept safe.')
                 if not destination.is_file() or _digest(destination) != move['sha256']:
                     raise ValueError('A moved certificate could not be checked. Its backup was kept safe.')
             replacements = {}
-            for move in ledger['moves']:
-                old, new = move['old'], move['new']
+            targets = {move['old']: move['new'] for move in ledger['moves']}
+            for old, new in targets.items():
+                new = targets.get(new, new)
                 replacements[old] = new
                 replacements[old[len('Certificates/'):]] = new[len('Certificates/'):]
                 replacements[(root / old).as_posix()] = (root / new).as_posix()
@@ -174,9 +215,10 @@ def migrate_certificate_folder(root):
             ledger['state'] = 'complete'
             ledger['pending'] = []
             save_json(_ledger_path(root), ledger)
-        if legacy.is_dir():
-            for folder in sorted((p for p in legacy.rglob('*') if p.is_dir()), key=lambda p: len(p.parts), reverse=True):
-                if folder.is_symlink() or not folder.resolve().is_relative_to(legacy.resolve()):
-                    raise ValueError('The old certificate folder changed during the move. Files were kept safe.')
+        if not nested_targets:
+            for folder in sorted(directories, key=lambda path: len(path.parts), reverse=True):
+                if folder.resolve() != folder or not folder.is_relative_to(base):
+                    raise ValueError('An old certificate folder changed during the move. Files were kept safe.')
                 folder.rmdir()
-            legacy.rmdir()
+    if nested_targets:
+        migrate_certificate_folder(root)

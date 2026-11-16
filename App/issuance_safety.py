@@ -419,7 +419,7 @@ class IssuanceTransaction:
                         'then refresh to finish. If it still fails, check write access to the PDF and its folder.') from exc
         from certificate_inventory import record_issuance
         record_issuance(self.root, destination, self.data['cod'], self.data['source_kind'],
-                        self.data['plant'], self.data['key'])
+                        self.data['plant'], self.data['key'], external_upload=bool(self.data.get('external_upload')))
         self.data.update(state='complete', completed_at=datetime.now(timezone.utc).isoformat())
         self._save()
 

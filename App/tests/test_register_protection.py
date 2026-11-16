@@ -47,6 +47,7 @@ class RegisterProtectionTests(unittest.TestCase):
             self.assertEqual(self.editable_rows(session.data), [(4, 1048576)])
             book = load_workbook(BytesIO(session.data))
             self.assertTrue(book.active['C2'].protection.locked)
+            self.assertFalse(book.active.protection.formatCells)
             self.assertFalse(book.active.protection.formatRows)
             book.close()
             batch = read_batches(BytesIO(session.data))[0]
@@ -63,6 +64,28 @@ class RegisterProtectionTests(unittest.TestCase):
             session._persist(updated)
             self.assertEqual(self.editable_rows(session.data), [(4, 1048576)])
             self.assertEqual([row['issued'] for row in read_batches(BytesIO(session.data))][:2], ['Completed','Ready'])
+
+    def test_existing_managed_register_allows_cell_formatting_after_refresh(self):
+        make_workbook(self.path, [{'sn':'1', 'status':'Generated', 'cod':'0001'},
+                                  {'sn':'2', 'status':'Ready'}])
+        managed = protect_issued_inwards(self.path.read_bytes())
+        older = BytesIO()
+        with ZipFile(BytesIO(managed)) as source, ZipFile(older, 'w') as target:
+            for entry in source.infolist():
+                content = source.read(entry)
+                if entry.filename == 'xl/worksheets/sheet1.xml':
+                    content = content.replace(b' formatCells="0"', b'')
+                target.writestr(entry, content)
+        self.path.write_bytes(older.getvalue())
+        with WorkbookSession(self.path, self.folder / 'Backups') as session:
+            session.ensure_alert_formatting('Inward Register')
+            self.assertEqual(self.editable_rows(session.data), [(3, 1048576)])
+            book = load_workbook(BytesIO(session.data))
+            try:
+                self.assertFalse(book.active.protection.formatCells)
+                self.assertTrue(book.active['C2'].protection.locked)
+            finally:
+                book.close()
 
     def test_refresh_locks_external_issuance_without_replacing_owner_protection(self):
         make_workbook(self.path, [{'sn':'1', 'status':'Generated Externally', 'cod':'0001'}])

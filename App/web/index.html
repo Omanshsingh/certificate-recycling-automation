@@ -395,17 +395,20 @@
       <div class="modal-header"><div><h2 id="upload-certificate-title">Upload an external certificate</h2><p>Choose a certificate PDF and where to save its details.</p></div><button type="button" class="icon-button" data-close="upload-certificate-modal" aria-label="Close">×</button></div>
       <div class="form-grid">
         <label class="field"><span>Certificate PDF</span><input type="file" id="external-upload-file" accept=".pdf,application/pdf" required></label>
-        <label class="field"><span>Save to</span><select id="external-upload-target"><option value="workbook">Attach to an Excel inward</option><option value="local">Save as an app-only certificate</option></select></label>
+        <label class="field"><span>Save to</span><select id="external-upload-target"><option value="workbook">Attach to an Excel inward</option><option value="replace">Replace an existing certificate PDF</option><option value="local">Save as an app-only certificate</option></select></label>
         <div class="field inward-picker" id="upload-inward-field">
-          <label for="upload-inward">Excel inward</label>
+          <label id="upload-inward-label" for="upload-inward">Excel inward</label>
           <input id="upload-inward" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="upload-inward-options" autocomplete="off" placeholder="Search company, SN or plant" required>
           <div id="upload-inward-options" class="inward-options" role="listbox" aria-label="Matching Excel inwards" hidden></div>
           <small id="upload-inward-results" role="status" hidden></small>
         </div>
+        <p class="field" id="upload-replacement-note" hidden>The replacement keeps the existing COD and archives the previous PDF. The revised certificate is marked Generated Externally so it can be sent again.</p>
         <label class="field field-half"><span>Certificate type</span><select name="certificate_type" required><option value="">Choose a type</option><option value="standard">Recycling</option><option value="destruction">Data Destruction</option><option value="siemens">Medical</option><option value="sita">International</option></select></label>
-        <label class="field field-half"><span>Certificate number (COD)</span><textarea name="cod_no" rows="1" maxlength="80" aria-describedby="upload-cod-hint"></textarea><small id="upload-cod-hint" role="status">Choose a PDF to fill in its COD.</small></label>
+        <label class="field field-half"><span>Certificate number (COD)</span><textarea id="upload-cod" rows="1" readonly placeholder="Assigned automatically" aria-describedby="upload-cod-hint"></textarea><small id="upload-cod-hint" role="status"></small></label>
         <label class="field field-half"><span>Certificate issue date</span><input name="cod_date" data-date-input="true" required></label>
         <fieldset class="upload-company-fields field" id="upload-company-fields" hidden disabled>
+          <legend>Certificate details</legend>
+          <p class="field" id="upload-detail-scope" hidden>Edits here are saved with this certificate. To update the Excel inward, use Review &amp; edit in Companies.</p>
           <div class="form-grid">
             <label class="field"><span>Company name</span><textarea name="supplier" rows="1" maxlength="500" required></textarea></label>
             <label class="field field-half"><span>City / site</span><textarea name="location" rows="1" maxlength="500"></textarea></label>
@@ -413,6 +416,7 @@
             <label class="field field-half"><span>Reference number</span><textarea name="reference" rows="1" maxlength="100"></textarea></label>
             <label class="field field-half"><span>Form 6 number</span><textarea name="form6" rows="1" maxlength="100"></textarea></label>
             <label class="field field-half"><span>Certificate weight (kg)</span><input name="certificate_weight" inputmode="decimal"></label>
+            <details class="field" id="upload-materials" hidden><summary id="upload-materials-summary">Materials</summary><ul id="upload-materials-list"></ul></details>
           </div>
         </fieldset>
         <p class="details-error field" id="upload-certificate-error" role="alert" hidden></p>

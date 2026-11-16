@@ -17,9 +17,10 @@ from run_certificates import _highest_sequence, _safe_cod_name, certificate_file
 from certificate_inventory import (scan_inventory, cod_conflicts, verify_publication,
                                    issuance_paths, record_issuance, certificate_destination, safe_certificate_path,
                                    unresolved_cod_entries, cod_recovery_message)
+from certificate_folder_migration import legacy_certificate_origin, migrated_certificate_origins
 from workflow_support import load_settings, operation_error_message, run_lock, save_json
 from issuance_safety import (IssuanceTransaction, recover_issuances, latest_issuance,
-                             current_pdf_is_healthy, manual_receipts, LOOKUP_RECEIPT)
+                             current_pdf_is_healthy, file_digest, manual_receipts, LOOKUP_RECEIPT)
 from manual_ownership import record_plant, normalize_records
 
 
@@ -383,10 +384,26 @@ def _manual_status(value):
     return state
 
 
+def _issued_status(root, status, receipt, path, origins):
+    if status not in {'generated', 'generated_manual'}:
+        return status
+    if receipt:
+        return 'generated_manual' if receipt.get('external_upload') else 'generated'
+    if path:
+        relative = path.relative_to(Path(root).resolve()).as_posix()
+        origin = legacy_certificate_origin(relative)
+        if not origin and origins:
+            origin = origins.get((relative.casefold(), file_digest(path)))
+        if origin:
+            return 'generated_manual' if origin == 'external' else 'generated'
+    return status
+
+
 def manual_rows(root, as_of=None, records=None, *, history=None):
     as_of = as_of or date.today()
     records = read_register(root)['records'] if records is None else records
     receipts = manual_receipts(root, records, history=history)
+    origins = migrated_certificate_origins(root) if records else {}
     rows = []
     for record in records:
         details = record["details"]
@@ -404,9 +421,8 @@ def manual_rows(root, as_of=None, records=None, *, history=None):
             continue
         if missing:
             status = "ready"
-        elif status == 'generated_manual' and receipt and not receipt.get('external_upload'):
-            # Local register ownership is independent of who made the PDF.
-            status = 'generated'
+        else:
+            status = _issued_status(root, status, receipt, path, origins)
         received = parse_date(details.get('inward_date'))
         age = (as_of - received).days if received else None
         due = status not in {'completed', 'na'} and age is not None and age >= 25
@@ -527,7 +543,7 @@ def generate_draft(root, plant=None, details=None, record_id=None, confirmed=Fal
             linked_data = stage_hdd_tracking(linked_session, link['case_id'], cod, issued_date)
         filename = certificate_filename(batch, cod=cod)
         folder = Path(root) / "Certificates"
-        destination = certificate_destination(root, 'manual', filename)
+        destination = certificate_destination(root, filename)
         relative_path = destination.relative_to(folder).as_posix()
         temporary = Path(root) / "Data" / "Previews" / f".{uuid.uuid4().hex}.tmp.pdf"
         allowed_paths = issuance_paths(inventory, cod, 'manual', plant, record_id)

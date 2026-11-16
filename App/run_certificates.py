@@ -333,13 +333,13 @@ def find_certificate(output_folder, batch, *, inventory=None, receipt=LOOKUP_REC
         from certificate_inventory import safe_certificate_path
         link = batch['external_pdf']
         try:
-            current = safe_certificate_path(folder.parent, link['path'])
+            current = safe_certificate_path(folder.parent, link['path'], expected_sha=link['sha256'])
             if current_pdf_is_healthy(current, link['sha256']):
                 return current
         except (KeyError, TypeError, ValueError, OSError):
             pass
         return None
-    from certificate_inventory import is_external_path, safe_certificate_path
+    from certificate_inventory import safe_certificate_path
     expected_name = certificate_filename(batch, cod=cod).casefold()
     valid_matches = []
     for path in folder.rglob("*"):
@@ -368,7 +368,7 @@ def find_certificate(output_folder, batch, *, inventory=None, receipt=LOOKUP_REC
     inventory = inventory if inventory is not None else scan_inventory(folder.parent)
     matches = [entry for entry in inventory['entries']
                if entry.get('present') and not entry.get('managed_owner') and not entry.get('warnings')
-               and is_external_path(entry['path'])
+               and entry.get('external')
                and {cod_identity(value) for value in entry.get('current_cods', [])} == {cod_identity(cod)}]
     if len(matches) == 1:
         current = safe_certificate_path(folder.parent, matches[0]['path'].removeprefix('Certificates/'))
@@ -767,8 +767,7 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
                             cod = certificate_number(next_sequence, settings)
                             safe_cod = _safe_cod_name(cod)
                         issued_date = parse_date(batch.get("cod_date")) or as_of
-                        destination = certificate_destination(
-                            root, 'workbook', certificate_filename(batch, cod=cod))
+                        destination = certificate_destination(root, certificate_filename(batch, cod=cod))
                         batch['pdf_relative_path'] = destination.relative_to(output_folder).as_posix()
                         native_template = TEMPLATE_ROOT / f"{kind}.pdf"
                         batch["_data_root"] = str(root)

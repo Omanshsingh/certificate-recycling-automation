@@ -51,7 +51,7 @@ class DestructionTests(unittest.TestCase):
         result = generate_draft(self.root, 'plant2', self.details(), as_of=AS_OF)
         self.assertEqual(result['created'], 1)
         self.assertEqual(result['certificate_no'], '0303')
-        self.assertEqual(result['relative_path'], 'Auto Generated/0303_Example International Ltd_London, UK_HDD.pdf')
+        self.assertEqual(result['relative_path'], '0303_Example International Ltd_London, UK_HDD.pdf')
         path = self.root / 'Certificates' / result['relative_path']
         pdf = PdfReader(path)
         self.assertEqual(len(pdf.pages), 2)

@@ -16,7 +16,9 @@ Leave workbook headings, weight formulas and certificate tracking to the app.
 Save and close Excel, then refresh to pick up your edits.
 
 Issued certificate details stay protected in Excel, including their material and
-linked HDD rows. The four follow-up fields remain editable. Use **Review & edit**
+linked HDD rows. The four follow-up fields remain editable. Excel allows cell
+formatting such as bold, underline and fill on app-protected sheets. Automatic
+status and alert colors take precedence wherever their rules apply. Use **Review & edit**
 for certificate corrections and **Mark Completed** after sending. To update an
 inward marked **N/A**, use **Review & edit → Save to Excel**. The inward keeps its
 **N/A** status. In **Companies**, **Mark N/A** skips an unissued Excel inward.
@@ -33,16 +35,25 @@ The app still checks used numbers across the workbooks and certificate history.
 Leave the field blank to continue automatic numbering.
 
 Use **Upload PDF** beside **Refresh** for a certificate created outside the app.
-Choose an Excel inward or save the certificate in the app only. The form fills in
-the printed COD when it can read it. Otherwise it uses the inward's existing COD
-or suggests the next available number. If the PDF already has a number, enter
-the printed COD. Confirm the type and issue date. For app-only records, also
-enter the company details.
-The app keeps the original PDF in **Certificates → Manually Added** and records
-its status as **Generated Externally**. An uploaded Data Destruction certificate
-uses its own record and COD. PDFs already in **Manually Added** can still be
+Choose an Excel inward or save the certificate in the app only. The app uses the
+COD it reads from the PDF, the inward's existing COD, or the next available
+number in that order. It assigns the number when you save. Selecting a client
+fills in the saved company, site, received date, reference, Form 6 and any
+saved certificate weight. Check the saved certificate type and issue date, and
+enter the issue date if it is blank. Edits to the prefilled fields are saved
+with the certificate. Use **Review & edit** in Companies to correct the Excel
+inward. For a new app-only record, enter its company details.
+The app keeps the original PDF in **Certificates** and records its status as
+**Generated Externally**. An uploaded Data Destruction certificate uses its own
+record and COD. External PDFs already in **Certificates** can also be
 linked from **Saved certificates → Details**. Mark the record **Completed** after
 sending it. **Generated Externally** is recorded by the app when you attach a PDF.
+
+To revise an issued certificate with your own file, choose **Upload PDF → Save to
+→ Replace an existing certificate PDF**. Search by company, plant or COD,
+select the existing certificate, and review its saved details. **Replace PDF**
+keeps the COD, archives the previous PDF and marks the revision **Generated
+Externally**. Use **Review & edit** to make corrections with an app template.
 
 In **Review & edit**, uncheck **Recycling certificate needed** to mark only the
 Recycling certificate N/A. The equivalent checkbox uses the selected certificate
@@ -169,7 +180,7 @@ For an international client without an inward, choose **New certificate → Secu
 
 COD and HDD use **one shared number sequence**, for example COD 0204 followed by
 HDD 0205. Newly created HDD PDFs are saved alongside automatic certificates in
-`Certificates/Auto Generated`, named `{number}_Company_City_HDD.pdf`. This applies
+`Certificates`, named `{number}_Company_City_HDD.pdf`. This applies
 to standalone clients as well as inward-linked requests. Existing PDFs retain
 their paths until corrected or recreated. HDD numbers found in saved files also
 reserve that number in the shared sequence. Independently created HDD PDFs can
@@ -187,9 +198,9 @@ A banner shows outstanding data destruction requests, including PDFs awaiting se
 
 ## Manually created PDFs and used numbers
 
-Staff may create a certificate outside this app and put its PDF in `Certificates/Manually Added`. Use the `{COD}_Company name_City, Country.pdf` naming format, with the actual COD at the start. Underscores divide the sections; spaces remain inside names. The app checks this folder before each creation, even when that certificate has no Excel row. It reads CODs from filenames and labelled PDF text, and references from readable PDF text. Automatic CODs start above the highest observed COD; manually entered used CODs require confirmation to switch to a new automatic number. Confirmation never authorizes overwriting someone else's certificate.
+Staff may create a certificate outside this app and put its PDF in `Certificates`. Use the `{COD}_Company name_City, Country.pdf` naming format, with the actual COD at the start. Underscores divide the sections; spaces remain inside names. The app checks this folder before each creation, even when that certificate has no Excel row. It reads CODs from filenames and labelled PDF text, and references from readable PDF text. Automatic CODs start above the highest observed COD; manually entered used CODs require confirmation to switch to a new automatic number. Confirmation never authorizes overwriting someone else's certificate.
 
-The **Saved certificates** tab shows current folder files, including manually added PDFs, with search, plant filters and direct Open PDF links. There are **two folders** in `Certificates`: **Auto Generated** contains every PDF created by this app, whether from Excel, New certificate, or a data destruction request; **Manually Added** contains PDFs made outside the app. Startup safely moves files from the former third folder into Auto Generated and removes that empty folder. Existing links and issuance checks keep working through a recorded move; original issuance history remains unchanged. Copies with the same filename are kept under distinct names, and a move backup is stored in Data. Put outside-app PDFs in `Manually Added`; existing PDFs left directly in `Certificates` continue to be checked. Click **Details** for the original filename and references. **Past numbers** is separate, so removed files do not clutter the saved list. Filename/printed-COD mismatches reserve both numbers and need review. Scanned, encrypted, oversized or unreadable PDFs may only have a usable filename COD; their references need manual verification. This is not OCR and does not automatically import unverified PDF details into Excel.
+The **Saved certificates** tab shows current folder files, including manually added PDFs, with search, plant filters and direct Open PDF links. The app saves generated and uploaded PDFs directly in `Certificates`. The **Source** field in Saved certificates identifies how a PDF was added. On startup the app merges older certificate folders into `Certificates` and records the moves so existing PDF links and issuance history continue to work. Copies with the same filename get distinct names. The app keeps a copy of the original files and metadata in `Data/Certificate Folder Backups`. Click **Details** for the original filename and references. **Past numbers** is separate, so removed files do not clutter the saved list. Filename/printed-COD mismatches reserve both numbers and need review. Scanned, encrypted, oversized or unreadable PDFs may only have a usable filename COD; their references need manual verification. This is not OCR and does not automatically import unverified PDF details into Excel.
 
 References are entered manually and required before creating Recycling, Sita or Siemens certificates. HDD / data destruction certificates do not use references. The same reference may be reused on other certificates without an alert. References are never automatically generated or incremented. They may be left blank when adding an inward or saving a draft, and entered later when creating the certificate.
 

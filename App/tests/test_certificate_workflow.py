@@ -115,7 +115,7 @@ class AutomationTestBase(unittest.TestCase):
         return json.loads((self.base / "Data" / "Reports" / "Latest Results.json").read_text(encoding="utf-8"))
 
     def workbook_pdf(self, batch, plant_number):
-        return self.base / "Certificates" / "Auto Generated" / certificate_filename(batch, plant_number)
+        return self.base / "Certificates" / certificate_filename(batch, plant_number)
 
 class CertificateWorkflowTests(AutomationTestBase):
     def test_certificate_filename_separates_sections_but_preserves_spaces_in_names(self):
@@ -395,8 +395,8 @@ class CertificateWorkflowTests(AutomationTestBase):
             certificate_filename(saved_plant2['P2-1'], 2),
         ])
         self.assertEqual(output, expected)
-        generated = self.base / "Certificates" / "Auto Generated"
-        self.assertEqual(sorted(path.name for path in generated.glob("*.pdf")), sorted([
+        self.assertEqual(sorted(path.name for path in folder.glob("*.pdf")
+                                if path.name not in {existing_filename, completed_filename}), sorted([
             certificate_filename(saved_plant1['P1-1'], 1),
             certificate_filename(saved_plant1['P1-2'], 1),
             certificate_filename(saved_plant2['P2-1'], 2),
@@ -436,7 +436,7 @@ class CertificateWorkflowTests(AutomationTestBase):
         make_workbook(self.plant1, [{"sn": "EDIT-1", "age": 8, "cod": "USER-COD-1", "cod_date": date(2026, 9, 20)}])
         make_workbook(self.plant2, [{"sn": "OTHER-1", "age": 8, "status": "N/A"}])
         self.assertEqual(self.execute(check_only=True)[0], 0)
-        self.assertFalse((self.base / "Certificates" / "Auto Generated" / "USER-COD-1.pdf").exists())
+        self.assertFalse((self.base / "Certificates" / "USER-COD-1.pdf").exists())
 
         self.assertEqual(self.execute()[0], 1)
         first = self.workbook_pdf(read_batches(self.plant1)[0], 1)

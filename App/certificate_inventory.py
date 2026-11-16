@@ -10,44 +10,30 @@ import re
 import hashlib
 
 from pypdf import PdfReader
+from certificate_folder_migration import legacy_certificate_origin, migrated_certificate_origins
 from workflow_support import save_json, load_settings
 
 MAX_PDF_BYTES = 50 * 1024 * 1024
 MAX_PAGES = 8
 INSPECTION_VERSION = 6
-CERTIFICATE_FOLDERS = {
-    'workbook': 'Auto Generated',
-    'manual': 'Auto Generated',
-    'external': 'Manually Added',
-}
-EXTERNAL_FOLDERS = {'manually added', 'externally created', 'generated externally', 'external certificates'}
-
-
-def is_external_path(path):
-    parts = str(path).replace('\\', '/').casefold().removeprefix('certificates/').split('/')
-    return len(parts) > 1 and parts[0] in EXTERNAL_FOLDERS
-
-
 def ensure_certificate_folders(root):
-    """Keep two output folders and migrate the former app-only folder safely."""
+    """Prepare the shared output folder and consolidate older layouts."""
     base = Path(root) / 'Certificates'
     base.mkdir(parents=True, exist_ok=True)
-    folders = {kind: base / name for kind, name in CERTIFICATE_FOLDERS.items()}
-    for folder in folders.values():
-        folder.mkdir(parents=True, exist_ok=True)
     from certificate_folder_migration import migrate_certificate_folder
     migrate_certificate_folder(root)
-    return folders
+    return base
 
 
-def certificate_destination(root, source_kind, filename):
-    """Choose an output folder for an app-issued PDF; external PDFs are never issued here."""
-    if source_kind not in {'workbook', 'manual'}:
-        raise ValueError('Choose the workbook or in-app certificate folder.')
+def certificate_destination(root, filename):
+    """Choose the shared output path for a new or revised certificate."""
     name = str(filename or '')
     if not name or Path(name).name != name or any(char in name for char in '/\\:') or not name.lower().endswith('.pdf'):
         raise ValueError('Invalid certificate filename.')
-    return Path(root) / 'Certificates' / CERTIFICATE_FOLDERS[source_kind] / name
+    path = safe_certificate_path(root, name)
+    if path.name.casefold() != name.casefold():
+        raise ValueError('A certificate filename points to another file.')
+    return path
 
 
 def safe_certificate_path(root, relative_path, *, expected_sha=None):
@@ -75,7 +61,7 @@ def identity(value):
 
 
 def filename_cod(path):
-    stem = Path(path).stem
+    stem = re.sub(r' \(\d+\)(?=_hdd$|$)', '', Path(path).stem, flags=re.I)
     legacy = re.match(r'^(?:cod|certificate|hdd)[ _-]*(\d+)(?=_|$)', stem, re.I)
     if legacy:
         return legacy[1]
@@ -251,6 +237,9 @@ def scan_inventory(root, persist=False, *, force=False):
     from issuance_safety import audit_records
     history = audit_records(root)
     issued = _issued_certificate_facts(root, history=history)
+    origins = {record['pdf_sha256']: 'external' if record.get('external_upload') else 'app'
+               for record in history if record.get('state') in {'complete', 'source_committed'} and record.get('pdf_sha256')}
+    migrated = migrated_certificate_origins(root)
     owners_by_digest = {record.get('pdf_sha256'):{'source_kind':record.get('source_kind'),
                         'plant':record.get('plant'), 'key':str(record.get('key')), 'cod':str(record.get('cod'))}
                         for record in history if record.get('state') == 'complete'
@@ -323,7 +312,15 @@ def scan_inventory(root, persist=False, *, force=False):
                     entry['managed_owner'] = old['managed_owner']
             if digest in owners_by_digest:
                 entry['managed_owner'] = owners_by_digest[digest]
-            entry['external'] = is_external_path(relative)
+            origin = (origins.get(digest) or migrated.get((relative.casefold(), digest))
+                      or legacy_certificate_origin(relative))
+            if not origin and entry.get('managed_owner'):
+                origin = 'external' if entry.get('external') else 'app'
+            # A loose PDF has unknown origin. Offer explicit linking, but do
+            # not use it as automatic evidence for an issued Excel row.
+            entry.update(external=origin == 'external', app_generated=origin == 'app',
+                         linkable_external=not entry.get('managed_owner')
+                         and (origin == 'external' or (not origin and path.parent == folder)))
             entries[relative.casefold()] = entry
     result = {'version': 1, 'entries': sorted(entries.values(), key=lambda entry: entry['path'].casefold())}
     if persist and result != previous and (result['entries'] or ledger_path.exists()):
@@ -392,11 +389,12 @@ def issuance_paths(inventory, cod, source_kind, plant, key):
             and identity(entry['managed_owner'].get('cod')) == identity(cod)]
 
 
-def record_issuance(root, path, cod, source_kind, plant, key):
+def record_issuance(root, path, cod, source_kind, plant, key, *, external_upload=False):
     inventory = scan_inventory(root, persist=True)
     relative = Path(path).relative_to(Path(root)).as_posix()
     entry = next(entry for entry in inventory['entries'] if entry['path'].casefold() == relative.casefold())
     entry['managed_owner'] = {'source_kind': source_kind, 'plant': plant, 'key': str(key), 'cod': str(cod)}
+    entry.update(external=external_upload, app_generated=not external_upload, linkable_external=False)
     inventory.pop('warnings', None)
     save_json(Path(root) / 'Data' / 'Certificate Inventory.json', inventory)
     return inventory

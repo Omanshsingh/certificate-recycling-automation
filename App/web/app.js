@@ -16,7 +16,7 @@ Object.assign(fieldLabels, followupFields);
 function isManual(row) { return row.source_kind === 'manual'; }
 
 function excelTarget(entry) {
-  if (entry.external) {
+  if (entry.external || entry.linkable_external) {
     const linked = savedFileRecord(entry);
     if (linked && !isManual(linked)) return {plant:linked.plant, sn:String(linked.sn), sheet:linked.sheet, row:linked.row};
   }
@@ -1073,8 +1073,10 @@ function renderPastNumbers() {
 function savedFileSource(entry) {
   const path = String(entry.relative_path || entry.path || '').replaceAll('\\', '/').replace(/^Certificates\//, '');
   const folder = path.split('/')[0];
-  if (entry.external || ['manually added','externally created','generated externally','external certificates'].includes(folder.toLowerCase())) return 'Manually Added';
-  if (['Auto Generated', 'Created in App'].includes(folder)) return 'Auto Generated';
+  const linked = entry.linkable_external ? savedFileRecord(entry) : null;
+  if (entry.external || (entry.sha256 && linked?.external_pdf?.sha256 === entry.sha256)
+      || ['manually added','externally created','generated externally','external certificates'].includes(folder.toLowerCase())) return 'Manually Added';
+  if (entry.app_generated || ['Auto Generated', 'Created in App'].includes(folder)) return 'Auto Generated';
   if (['manual', 'workbook'].includes(entry.managed_owner?.source_kind)) return 'Auto Generated';
   return 'Existing PDF';
 }
@@ -1084,9 +1086,11 @@ function inwardPicker(id, onSelection = () => {}) {
   const list = $(`#${id}-options`);
   const status = $(`#${id}-results`);
   let rows = [], matches = [], selected = null, active = -1;
-  const key = row => `${row.plant}:${row.sn}`;
+  let emptyMessage = 'No available Excel inwards.';
+  const key = row => row.record_id || `${row.plant}:${row.sn}`;
   const company = row => row.supplier || 'Company name missing';
-  const identity = row => `${labelPlant(row.plant)} · SN ${row.sn}`;
+  const identity = row => [labelPlant(row.plant), row.plant && `SN ${row.sn}`,
+    row.certificate_no && `COD ${row.certificate_no}`].filter(Boolean).join(' · ');
   const label = row => `${company(row)} · ${identity(row)}`;
   const normalize = value => String(value).toLocaleLowerCase()
     .replace(/[^\p{L}\p{N}]+/gu, ' ').trim().replace(/\bplant\s+([12])\b/g, 'plant$1');
@@ -1121,7 +1125,7 @@ function inwardPicker(id, onSelection = () => {}) {
     list.hidden = !nodes.length;
     input.setAttribute('aria-expanded', String(Boolean(nodes.length)));
     status.hidden = false;
-    status.textContent = !rows.length ? 'No available Excel inwards.'
+    status.textContent = !rows.length ? emptyMessage
       : !found.length ? 'No matching inwards.'
       : found.length > nodes.length ? `Showing ${nodes.length} of ${found.length} matches. Keep typing to narrow the list.`
       : `${found.length} matching inward${found.length === 1 ? '' : 's'}.`;
@@ -1170,7 +1174,8 @@ function inwardPicker(id, onSelection = () => {}) {
   });
 
   return {
-    update(candidates, {reset = false, disabled = false} = {}) {
+    update(candidates, {reset = false, disabled = false, empty = 'No available Excel inwards.'} = {}) {
+      emptyMessage = empty;
       rows = candidates.map(row => ({row, search:normalize(label(row)), serial:normalize(row.sn)}));
       selected = !reset && !disabled && selected ? candidates.find(row => key(row) === key(selected)) || null : null;
       input.disabled = disabled;
@@ -1178,52 +1183,131 @@ function inwardPicker(id, onSelection = () => {}) {
       input.setCustomValidity('');
       close();
     },
+    row() {
+      return selected && !input.disabled ? selected : null;
+    },
     selection() {
-      return selected && !input.disabled ? {plant:selected.plant, sn:String(selected.sn)} : null;
+      const row = this.row();
+      if (!row) return null;
+      return row.record_id ? {record_id:row.record_id} : {plant:row.plant, sn:String(row.sn)};
     },
   };
 }
 
-const uploadInwardPicker = inwardPicker('upload-inward', updateUploadCod);
+const uploadInwardPicker = inwardPicker('upload-inward', updateUploadSelection);
 const externalInwardPicker = inwardPicker('external-inward');
+const uploadDetailFields = ['supplier', 'location', 'inward_date', 'reference', 'form6', 'certificate_weight'];
+let uploadDetailDraft = null;
 
 function updateUploadTarget(reset = false) {
-  const local = $('#external-upload-target').value === 'local';
-  const company = $('#upload-company-fields');
-  company.disabled = company.hidden = !local;
+  const mode = $('#external-upload-target').value;
+  const local = mode === 'local';
+  const replace = mode === 'replace';
+  if (reset) uploadDetailDraft = null;
   $('#upload-inward-field').hidden = local;
+  $('#upload-inward-label').textContent = replace ? 'Existing certificate' : 'Excel inward';
+  $('#upload-inward').placeholder = replace ? 'Search company, COD or plant' : 'Search company, SN or plant';
+  $('#upload-replacement-note').hidden = !replace;
+  $('#save-uploaded-certificate').textContent = replace ? 'Replace PDF' : 'Save certificate';
   const form = $('#upload-certificate-form');
-  const hdd = form.elements.namedItem('certificate_type').value === 'destruction';
-  const eligible = app.state.rows.filter(row => hasInward(row) && !recordIdentityIssue(row) && !row.workbook_read_only
-    && (hdd ? !row.hdd_cod_no && stateOf(row) !== 'na'
-      : !row.external_pdf && !row.pdf_missing && ['blank','alert','ready','generated_manual'].includes(stateOf(row))));
-  uploadInwardPicker.update(eligible, {reset, disabled:local});
+  const type = form.elements.namedItem('certificate_type');
+  if (type.disabled && !replace) {
+    type.value = '';
+    form.elements.namedItem('cod_date').value = '';
+  }
+  type.disabled = replace;
+  const hdd = type.value === 'destruction';
+  const eligible = app.state.rows.filter(row => {
+    if (recordIdentityIssue(row) || row.workbook_read_only) return false;
+    if (replace) {
+      if (!row.certificate_no || !row.pdf_relative_path || row.pdf_missing
+          || !['generated','generated_manual','completed'].includes(stateOf(row))) return false;
+      if (hasInward(row)) return true;
+      if (!isManual(row) || !row.record_id) return false;
+      const link = row.destruction_source;
+      return !link?.plant || app.state.rows.some(inward => hasInward(inward) && inward.plant === link.plant
+        && String(inward.sn) === String(link.case_id) && !inward.workbook_read_only && !recordIdentityIssue(inward));
+    }
+    return hasInward(row) && (hdd ? !row.hdd_cod_no && stateOf(row) !== 'na'
+      : !row.external_pdf && !row.pdf_missing && ['blank','alert','ready','generated_manual'].includes(stateOf(row)));
+  });
+  uploadInwardPicker.update(eligible, {reset, disabled:local,
+    empty:replace ? 'No issued certificates with a current PDF.' : 'No available Excel inwards.'});
+  updateUploadSelection();
+}
+
+function updateUploadSelection() {
+  const mode = $('#external-upload-target').value;
+  const form = $('#upload-certificate-form');
+  const type = form.elements.namedItem('certificate_type');
+  const row = uploadInwardPicker.row();
+  const local = mode === 'local';
+  const replace = mode === 'replace';
+  const company = $('#upload-company-fields');
+  company.disabled = company.hidden = !local && !row;
+  $('#upload-detail-scope').hidden = local || !row || (replace && isManual(row) && !row.destruction_source?.plant);
+  const rowKey = JSON.stringify([mode, uploadInwardPicker.selection()]);
+  if (replace || (row && rowKey !== uploadDetailDraft?.rowKey && type.value !== 'destruction')) {
+    type.value = row ? templateId(row) : '';
+  }
+  const hdd = type.value === 'destruction';
+  const pending = row && mode === 'workbook' && hdd && app.state.rows.find(item =>
+    item.destruction_source?.plant === row.plant && String(item.destruction_source.case_id) === String(row.sn)
+    && item.destruction_requested !== false);
+  const saved = pending ? { ...pending, ...pending.raw_details }
+    : replace && row ? { ...row, ...row.raw_details, ...row.last_certificate_details } : row;
+  const key = JSON.stringify([rowKey, mode === 'workbook' && hdd]);
+  const prior = uploadDetailDraft?.key === key ? uploadDetailDraft.defaults : null;
+  const defaults = {};
+  for (const name of [...uploadDetailFields, 'cod_date']) {
+    const field = form.elements.namedItem(name);
+    const value = name === 'cod_date'
+      ? (hdd && !replace ? pending?.certificate_date : row?.certificate_date)
+      : saved?.[name];
+    defaults[name] = escapeText(name.endsWith('_date') && value ? dateLabel(value) : value);
+    if (!prior || field.value === prior[name]) {
+      field.value = defaults[name];
+      field.setCustomValidity('');
+    }
+  }
+  uploadDetailDraft = { key, rowKey, defaults };
+  if (local) fillUploadReference();
+  const items = hdd ? [] : saved?.items?.length ? saved.items : row?.items || [];
+  $('#upload-materials').hidden = !items.length;
+  if (!prior) $('#upload-materials').open = false;
+  $('#upload-materials-summary').textContent = `Materials (${items.length})`;
+  $('#upload-materials-list').replaceChildren(...items.map(item => {
+    const quantity = item.quantity === null || item.quantity === undefined ? '' : readableNumber(item.quantity);
+    const weight = item.weight === null || item.weight === undefined || item.weight === '' ? '' : `${readableNumber(item.weight)} kg`;
+    return element('li', '', [item.item || 'Description missing', quantity && `Qty ${quantity}`, weight].filter(Boolean).join(' · '));
+  }));
   updateUploadCod();
 }
 
 function updateUploadCod() {
   const hint = $('#upload-cod-hint');
+  const input = $('#upload-cod');
   const upload = app.uploadedFile;
-  if (!upload) {
-    hint.textContent = 'Choose a PDF to fill in its COD.';
+  const replace = $('#external-upload-target').value === 'replace';
+  const row = uploadInwardPicker.row();
+  if (replace) {
+    const cod = row?.certificate_no || '';
+    input.value = cod;
+    hint.textContent = cod ? 'The replacement PDF must use this COD.' : 'Choose the existing certificate first.';
     return;
   }
   const form = $('#upload-certificate-form');
-  const input = form.elements.namedItem('cod_no');
-  const inward = uploadInwardPicker.selection();
-  const existing = inward && form.elements.namedItem('certificate_type').value !== 'destruction'
-    ? app.state.rows.find(row => hasInward(row) && row.plant === inward.plant && String(row.sn) === inward.sn)?.certificate_no
-    : '';
-  const suggested = upload.ambiguous_cod ? '' : upload.cod || existing || app.state.numbering?.next_cod || '';
-  if (!input.value.trim() || input.value === upload.suggestedCod) {
-    input.value = suggested;
-    upload.suggestedCod = suggested;
+  const existing = row && form.elements.namedItem('certificate_type').value !== 'destruction' ? row.certificate_no : '';
+  if (!upload) {
+    input.value = existing || '';
+    hint.textContent = existing ? 'Using the inward’s existing COD.' : 'Choose a PDF to check its COD.';
+    return;
   }
-  hint.textContent = upload.ambiguous_cod ? 'More than one COD was found on the PDF. Check the file before saving.'
-    : upload.cod ? 'Filled from the PDF.'
-    : existing ? 'Using the inward’s COD. Check that it matches the PDF.'
-    : suggested ? `Next available COD is ${suggested}. Use the printed number if your PDF already has one.`
-    : 'Enter a printed number, or leave blank to assign the next available COD when saving.';
+  input.value = upload.ambiguous_cod ? '' : upload.cod || existing || app.state.numbering?.next_cod || '';
+  hint.textContent = upload.ambiguous_cod ? 'The first page has multiple CODs. Choose a PDF with one certificate number.'
+    : upload.cod ? 'Read from the PDF.'
+    : existing ? 'Using the inward’s existing COD.'
+    : 'The app assigns the next available COD when you save.';
 }
 
 function openUploadCertificate() {
@@ -1239,15 +1323,21 @@ function openUploadCertificate() {
   $('#upload-certificate-modal').showModal();
 }
 
+function fillUploadReference() {
+  const reference = $('#upload-certificate-form').elements.namedItem('reference');
+  if (!reference.value.trim() && app.uploadedFile?.reference) {
+    reference.value = app.uploadedFile.reference;
+    app.uploadedFile.suggestedReference = reference.value;
+  }
+}
+
 async function inspectUploadedCertificate() {
   const file = $('#external-upload-file').files[0];
   const previous = app.uploadedFile;
   app.uploadedFile = null;
   const form = $('#upload-certificate-form');
-  for (const [name, value] of [['cod_no', previous?.suggestedCod], ['reference', previous?.reference]]) {
-    const input = form.elements.namedItem(name);
-    if (value && input.value === value) input.value = '';
-  }
+  const reference = form.elements.namedItem('reference');
+  if (previous?.suggestedReference && reference.value === previous.suggestedReference) reference.value = '';
   const error = $('#upload-certificate-error');
   const submit = $('#save-uploaded-certificate');
   error.hidden = true;
@@ -1261,8 +1351,7 @@ async function inspectUploadedCertificate() {
     if ($('#external-upload-file').files[0] !== file || !$('#upload-certificate-modal').open) return;
     if (!response.ok || !upload.token) throw new Error(upload.error || 'The PDF could not be uploaded.');
     app.uploadedFile = {file, ...upload};
-    const reference = form.elements.namedItem('reference');
-    if (!reference.value.trim() && upload.reference) reference.value = upload.reference;
+    if ($('#external-upload-target').value === 'local') fillUploadReference();
     updateUploadCod();
   } catch (exception) {
     if ($('#external-upload-file').files[0] === file) {
@@ -1281,8 +1370,17 @@ async function saveUploadedCertificate(event) {
   const upload = app.uploadedFile;
   if (!upload || upload.file !== $('#external-upload-file').files[0]) return;
   const details = Object.fromEntries([...new FormData(form)].map(([key, value]) => [key, String(value).trim()]));
-  const inward = uploadInwardPicker.selection();
-  if ($('#external-upload-target').value === 'workbook' && !inward) return;
+  const selected = uploadInwardPicker.selection();
+  const mode = $('#external-upload-target').value;
+  const replace = mode === 'replace';
+  if (mode !== 'local' && !selected) return;
+  const certificateEdits = {};
+  if (selected) {
+    for (const name of uploadDetailFields) {
+      if (name in details && details[name] !== uploadDetailDraft?.defaults[name]) certificateEdits[name] = details[name];
+      delete details[name];
+    }
+  }
   const error = $('#upload-certificate-error');
   error.hidden = true;
   app.uploadingCertificate = true;
@@ -1290,16 +1388,21 @@ async function saveUploadedCertificate(event) {
   $('#save-uploaded-certificate').textContent = 'Saving…';
   try {
     const saved = await api('/api/certificates/save-upload', {
-      token:upload.token, details, inward, automatic_cod:!details.cod_no || details.cod_no === upload.suggestedCod,
+      token:upload.token, details,
+      inward:mode === 'workbook' ? selected : null,
+      replacement:replace ? selected : null,
+      ...(Object.keys(certificateEdits).length ? {certificate_edits:certificateEdits} : {}),
     });
     setState(saved.state);
     $('#upload-certificate-modal').close();
     setWorkspaceView('files');
     $('#saved-file-search').value = saved.certificate_no;
     $('#saved-template-filter').value = 'all';
+    $('#saved-plant-filter').value = 'all';
     app.savedFilesPage = 1;
     renderFolderInventory();
-    toast(saved.state?.setup_warning || `External certificate ${saved.certificate_no} saved.`, Boolean(saved.state?.setup_warning));
+    const action = saved.replaced ? 'PDF replaced' : 'PDF saved';
+    toast(saved.state?.setup_warning || `Certificate ${saved.certificate_no}: ${action}.`, Boolean(saved.state?.setup_warning));
   } catch (exception) {
     if (exception.workspaceRecovered) updateUploadTarget();
     if (/upload has expired/i.test(exception.message)) $('#external-upload-file').value = '';
@@ -1308,7 +1411,7 @@ async function saveUploadedCertificate(event) {
   } finally {
     app.uploadingCertificate = false;
     form.inert = false;
-    $('#save-uploaded-certificate').textContent = 'Save certificate';
+    $('#save-uploaded-certificate').textContent = replace ? 'Replace PDF' : 'Save certificate';
   }
 }
 
@@ -1341,7 +1444,8 @@ function showSavedFile(entry) {
       && ['blank','alert','ready','generated_manual'].includes(stateOf(row))
       && (!row.has_issued_certificate || stateOf(row) === 'generated_manual')
       && (!row.certificate_no || numbers.includes(String(row.certificate_no).trim().toUpperCase().replace(/^0+(?=\d+$)/, ''))));
-    linkForm.hidden = !(entry.external && entry.sha256 && !identifiedByApp && numbers.length && candidates.length
+    linkForm.hidden = !((entry.linkable_external ?? entry.external) && entry.sha256
+      && !identifiedByApp && numbers.length && candidates.length
       && savedFileTypeId(entry) !== 'destruction');
     externalInwardPicker.update(candidates, {reset:true, disabled:linkForm.hidden});
     $('#external-issued-date').value = '';
@@ -1356,7 +1460,7 @@ function showSavedFile(entry) {
   $('#saved-file-excel').hidden = !target;
   $('#saved-file-excel').dataset.plant = target?.plant || '';
   $('#saved-file-excel').dataset.sn = target?.sn || '';
-  if (!url) facts.append(element('p', '', 'Open the PDF folder to view this file in its subfolder.'));
+  if (!url) facts.append(element('p', '', 'Open the PDF folder to find this file.'));
   if (!$('#saved-file-modal').open) $('#saved-file-modal').showModal();
 }
 
@@ -1372,7 +1476,7 @@ function renderFolderInventory() {
     ? `Saved certificates (${present.length}) · ${warnings.length} file warning${warnings.length === 1 ? '' : 's'}`
     : `Saved certificates (${present.length})`;
   $('#folder-inventory-note').textContent = present.length
-    ? 'Auto Generated contains PDFs made in this app. Manually Added contains PDFs made elsewhere.' : 'No saved PDFs yet. Generated certificates will appear here.';
+    ? 'All certificate PDFs are saved in the Certificates folder.' : 'No saved PDFs yet. Generated certificates will appear here.';
   const notes = $('#folder-inventory-warnings');
   notes.replaceChildren();
   if (warnings.length) {
@@ -4681,7 +4785,7 @@ function wire() {
     const issuedDate = normalizeDate($('#external-issued-date').value);
     const status = $('#external-link-status');
     const button = $('#link-external');
-    if (!entry?.external || !selection || !issuedDate) return;
+    if (!(entry?.linkable_external ?? entry?.external) || !selection || !issuedDate) return;
     button.disabled = true;
     try {
       const result = await api('/api/certificates/link-external', {
@@ -4797,7 +4901,7 @@ function wire() {
   $('#upload-certificate').addEventListener('click', openUploadCertificate);
   $('#external-upload-file').addEventListener('change', inspectUploadedCertificate);
   $('#upload-certificate-form').addEventListener('submit', saveUploadedCertificate);
-  $('#external-upload-target').addEventListener('change', () => updateUploadTarget());
+  $('#external-upload-target').addEventListener('change', () => updateUploadTarget(true));
   $('#upload-certificate-form').addEventListener('change', event => {
     if (event.target.name === 'certificate_type') updateUploadTarget();
   });

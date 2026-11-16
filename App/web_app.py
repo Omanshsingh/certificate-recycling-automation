@@ -1522,12 +1522,10 @@ def _selected_inward(session, sn):
 
 
 def link_external_certificate(body):
-    from certificate_inventory import is_external_path
-
     plant, sn = selected_key(body.get('plant'), body.get('sn'))
     revision = body.get('expected_revision')
     digest = body.get('sha256')
-    path = safe_certificate_path(ROOT, body.get('relative_path'))
+    path = safe_certificate_path(ROOT, body.get('relative_path'), expected_sha=digest)
     relative = path.relative_to((ROOT / 'Certificates').resolve()).as_posix()
     issued_date = parse_date(body.get('certificate_date'))
     if not issued_date or issued_date > date.today():
@@ -1540,7 +1538,7 @@ def link_external_certificate(body):
         inventory = scan_inventory(ROOT)
         entry = next((item for item in inventory['entries']
                       if item.get('present') and item['path'] == f'Certificates/{relative}'), None)
-        if (not is_external_path(relative) or not entry or entry.get('managed_owner')
+        if (not entry or not entry.get('linkable_external')
                 or not valid_pdf(path) or not digest or entry.get('sha256') != digest):
             raise ValueError('Choose a current external PDF from Saved certificates.')
         saved_type = certificate_type_choices().get(digest)
@@ -1592,7 +1590,8 @@ def save_uploaded_certificate(body):
     from external_certificate_upload import save_upload
     result = save_upload(ROOT, BACKUP_DIR, body)
     WORKBOOK_CHECK_STAMPS.pop(str(ROOT), None)
-    result['state'] = post_commit_state(refresh, saved_message='External certificate saved')
+    message = 'Certificate PDF replaced' if result['replaced'] else 'External certificate saved'
+    result['state'] = post_commit_state(refresh, saved_message=message)
     if result['recovery_note']:
         result['state'].update(refresh_pending=True, recovery_note=result['recovery_note'])
     return result
@@ -2355,7 +2354,11 @@ class Handler(BaseHTTPRequestHandler):
                 with run_lock(ROOT):
                     require_revision(ROOT, body.get('expected_revision'))
                     result = restore_backup(ROOT, body.get('backup_id'), confirmed=body.get('confirmed') is True, locked=True)
-                state = post_commit_state(refresh, saved_message='Backup restored successfully')
+                def refresh_restored_workspace():
+                    ensure_certificate_folders(ROOT)
+                    return refresh()
+
+                state = post_commit_state(refresh_restored_workspace, saved_message='Backup restored successfully')
                 response = {'restored': result, 'state': state,
                             'message': 'Backup restored. The previous data was preserved in a recovery snapshot.'}
                 try:

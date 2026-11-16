@@ -107,7 +107,7 @@ def protect_issued_inwards(data):
                 prefix = _element(xml, 'sheetData').search(xml).group('p')
                 protection = (f'<{prefix}sheetProtection sheet="1" algorithmName="SHA-512" '
                               f'hashValue="{_HASH}" saltValue="{_SALT64}" spinCount="{_SPINS}" '
-                              'objects="1" scenarios="1" autoFilter="0" formatRows="0"/>')
+                              'objects="1" scenarios="1" autoFilter="0" formatCells="0" formatRows="0"/>')
                 editable = []
                 start = header + 1
                 for first, last in [*locked, (1048577, 1048577)]:
