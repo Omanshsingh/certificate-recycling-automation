@@ -1213,7 +1213,7 @@ function inwardPicker(id, onSelection = () => {}) {
   const key = row => row.record_id || `${row.plant}:${row.sn}`;
   const company = row => savedCertificateDetails(row).supplier || 'Company name missing';
   const identity = row => [labelPlant(row.plant), row.plant && `SN ${row.sn}`, templateNames[templateId(row)],
-    row.certificate_no && `COD ${row.certificate_no}`].filter(Boolean).join(' · ');
+    row.certificate_no && `COD ${row.certificate_no}`, uploadCanReplace(row) && 'Existing PDF · can replace'].filter(Boolean).join(' · ');
   const label = row => `${company(row)} · ${identity(row)}`;
   const normalize = value => String(value).toLocaleLowerCase()
     .replace(/[^\p{L}\p{N}]+/gu, ' ').trim().replace(/\bplant\s+([12])\b/g, 'plant$1');
@@ -1330,47 +1330,48 @@ function uploadDestructionRequest(row) {
     : {plant:row.plant, case_id:row.sn});
 }
 
+function uploadCanReplace(row) {
+  if (!row?.certificate_no || !row.pdf_relative_path || row.pdf_missing
+      || !['generated','generated_manual','completed'].includes(stateOf(row))) return false;
+  if (hasInward(row)) return true;
+  if (!isManual(row) || !row.record_id) return false;
+  const link = row.destruction_source;
+  return !link?.plant || app.state.rows.some(inward => hasInward(inward) && inward.plant === link.plant
+    && String(inward.sn) === String(link.case_id) && !inward.workbook_read_only && !recordIdentityIssue(inward));
+}
+
+function uploadIsReplacement(row = uploadInwardPicker.row()) {
+  const type = $('#upload-certificate-form').elements.namedItem('certificate_type').value;
+  return $('#external-upload-target').value === 'workbook' && uploadCanReplace(row)
+    && type === templateId(row);
+}
+
 function updateUploadTarget(reset = false) {
   const mode = $('#external-upload-target').value;
   const local = mode === 'local';
-  const replace = mode === 'replace';
   if (reset) uploadDetailDraft = null;
   $('#upload-inward-field').hidden = local;
-  $('#upload-inward-label').textContent = replace ? 'Existing certificate' : 'Client';
-  $('#upload-inward').placeholder = replace ? 'Search company, COD or plant' : 'Search company, SN or plant';
-  $('#upload-replacement-note').hidden = !replace;
-  $('#save-uploaded-certificate').textContent = replace ? 'Replace PDF' : 'Save certificate';
+  $('#upload-inward-label').textContent = 'Client';
+  $('#upload-inward').placeholder = 'Search company, certificate number, SN or plant';
   const form = $('#upload-certificate-form');
   const type = form.elements.namedItem('certificate_type');
-  if (type.disabled && !replace) {
-    type.value = '';
-    app.uploadTypeExplicit = false;
-    form.elements.namedItem('cod_date').value = '';
-  }
-  type.disabled = replace;
+  type.disabled = false;
   const hdd = type.value === 'destruction';
   const eligible = app.state.rows.filter(row => {
     if (recordIdentityIssue(row) || row.workbook_read_only) return false;
-    if (replace) {
-      if (!row.certificate_no || !row.pdf_relative_path || row.pdf_missing
-          || !['generated','generated_manual','completed'].includes(stateOf(row))) return false;
-      if (hasInward(row)) return true;
-      if (!isManual(row) || !row.record_id) return false;
-      const link = row.destruction_source;
-      return !link?.plant || app.state.rows.some(inward => hasInward(inward) && inward.plant === link.plant
-        && String(inward.sn) === String(link.case_id) && !inward.workbook_read_only && !recordIdentityIssue(inward));
-    }
+    const canReplace = uploadCanReplace(row) && (!type.value || type.value === templateId(row));
     if (hdd) {
+      if (canReplace) return true;
       if (!hasInward(row) && !(isManual(row) && row.record_id && templateId(row) !== 'destruction')) return false;
       const linked = uploadDestructionRequest(row);
       return !row.hdd_cod_no && !(templateId(row) === 'destruction' && row.certificate_no)
         && (!linked || (!linked.certificate_no && stateOf(linked) !== 'na'));
     }
-    return hasInward(row) && !row.external_pdf && !row.pdf_relative_path && !row.pdf_missing
-      && ['blank','alert','ready','generated_manual'].includes(stateOf(row));
+    return canReplace || (hasInward(row) && !row.external_pdf && !row.pdf_relative_path && !row.pdf_missing
+      && ['blank','alert','ready','generated_manual'].includes(stateOf(row)));
   });
   uploadInwardPicker.update(eligible, {reset, disabled:local,
-    empty:replace ? 'No issued certificates with a current PDF.' : hdd
+    empty:hdd
       ? 'No matching clients without a Data Destruction certificate.'
       : 'No available Excel inwards. To add an HDD certificate, choose Data Destruction above.'});
   updateUploadSelection();
@@ -1382,26 +1383,30 @@ function updateUploadSelection() {
   const type = form.elements.namedItem('certificate_type');
   const row = uploadInwardPicker.row();
   const local = mode === 'local';
-  const replace = mode === 'replace';
   const company = $('#upload-company-fields');
   company.disabled = company.hidden = !local && !row;
   $('#upload-detail-scope').hidden = company.hidden;
   const rowKey = JSON.stringify([mode, uploadInwardPicker.selection()]);
-  if (replace || (row && rowKey !== uploadDetailDraft?.rowKey && !app.uploadTypeExplicit && type.value !== 'destruction')) {
-    type.value = row ? templateId(row) : '';
+  if (row && rowKey !== uploadDetailDraft?.rowKey && !app.uploadTypeExplicit) {
+    type.value = templateId(row);
   }
+  const replacing = uploadIsReplacement(row);
+  type.disabled = replacing;
+  $('#upload-replacement-note').hidden = !replacing;
+  $('#upload-replacement-note').textContent = 'This client already has this certificate. The new PDF will replace it, keep the existing COD and archive the previous PDF.';
+  $('#save-uploaded-certificate').textContent = replacing ? 'Replace PDF' : 'Save certificate';
   const hdd = type.value === 'destruction';
-  const pending = row && mode === 'workbook' && hdd && uploadDestructionRequest(row);
+  const pending = row && mode === 'workbook' && hdd && !replacing && uploadDestructionRequest(row);
   const saved = pending ? { ...pending, ...pending.raw_details }
-    : row && (replace || isManual(row)) ? { ...row, ...row.raw_details, ...row.last_certificate_details }
+    : row && (replacing || isManual(row)) ? { ...row, ...row.raw_details, ...row.last_certificate_details }
     : row && hdd ? savedCertificateDetails(row) : row;
-  const key = JSON.stringify([rowKey, mode === 'workbook' && hdd]);
+  const key = JSON.stringify([rowKey, mode === 'workbook' && hdd, replacing]);
   const prior = uploadDetailDraft?.key === key ? uploadDetailDraft.defaults : null;
   const defaults = {};
   for (const name of [...uploadDetailFields, 'cod_date']) {
     const field = form.elements.namedItem(name);
     const value = name === 'cod_date'
-      ? (hdd && !replace ? pending?.certificate_date : row?.certificate_date)
+      ? (hdd && !replacing ? pending?.certificate_date : row?.certificate_date)
       : saved?.[name];
     defaults[name] = escapeText(name.endsWith('_date') && value ? dateLabel(value) : value);
     if (!prior || field.value === prior[name]) {
@@ -1427,8 +1432,8 @@ function updateUploadCod() {
   const hint = $('#upload-cod-hint');
   const input = $('#upload-cod');
   const upload = app.uploadedFile;
-  const replace = $('#external-upload-target').value === 'replace';
   const row = uploadInwardPicker.row();
+  const replace = uploadIsReplacement(row);
   if (replace) {
     const cod = row?.certificate_no || '';
     input.value = cod;
@@ -1475,7 +1480,7 @@ function openUploadCertificate({entry = null, replacement = null} = {}) {
     app.uploadTypeExplicit = true;
   }
   const hasClient = app.state.rows.some(row => hasInward(row) || (kind === 'destruction' && isManual(row)));
-  $('#external-upload-target').value = replacement ? 'replace' : hasClient ? 'workbook' : 'local';
+  $('#external-upload-target').value = replacement || hasClient ? 'workbook' : 'local';
   updateUploadTarget(true);
   if (replacement) uploadInwardPicker.select(replacement);
   if (entry) $('#saved-file-modal').close();
@@ -1554,7 +1559,7 @@ async function saveUploadedCertificate(event) {
   const details = Object.fromEntries([...new FormData(form)].map(([key, value]) => [key, String(value).trim()]));
   const selected = uploadInwardPicker.selection();
   const mode = $('#external-upload-target').value;
-  const replace = mode === 'replace';
+  const replace = uploadIsReplacement();
   const cod = $('#upload-cod');
   if (!replace && !cod.readOnly && cod.value.trim()) details.cod_no = cod.value.trim();
   if (mode !== 'local' && !selected) return;
@@ -1573,7 +1578,7 @@ async function saveUploadedCertificate(event) {
   try {
     const saved = await api('/api/certificates/save-upload', {
       token:upload.token, details,
-      inward:mode === 'workbook' ? selected : null,
+      inward:mode === 'workbook' && !replace ? selected : null,
       replacement:replace ? selected : null,
       ...(Object.keys(certificateEdits).length ? {certificate_edits:certificateEdits} : {}),
     });

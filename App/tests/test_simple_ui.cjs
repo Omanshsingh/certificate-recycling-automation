@@ -211,7 +211,7 @@ function uploadForm(h) {
   return {form, fields};
 }
 
-test('Upload PDF replaces the exact issued certificate and keeps its COD', async () => {
+test('Attach to a client replaces the matching issued certificate and keeps its COD', async () => {
   const h = harness({fetch:async () => ({ok:false, status:400, json:async () => ({error:'Check the PDF.'})})});
   const mode = h.controls.get('#external-upload-target');
   const input = h.controls.get('#upload-inward');
@@ -227,9 +227,11 @@ test('Upload PDF replaces the exact issued certificate and keeps its COD', async
       last_certificate_details:{supplier:'Name on certificate', reference:'PDF reference', certificate_weight:'8.075'}},
 
   ];
-  mode.value = 'replace';
+  mode.value = 'workbook';
   updateUploadTarget(true);
+  assert.equal(h.controls.get('#upload-inward-label').textContent, 'Client');
   input.dispatch('focus');
+  input.value = '0456'; input.dispatch('input');
   assert.equal(options.children.length, 1);
   assert.match(text(options.children[0]), /Plant 2.*SN 12.*COD 0456/);
   options.children[0].dispatch('click');

@@ -330,7 +330,7 @@ def save_upload(root, backup_dir, body):
             if (status_value(source['issued']) not in {'blank', 'alert', 'ready', 'generated_manual'}
                     or source.get('external_pdf') or source.get('pdf_recovery_pending')
                     or latest_issuance(root, 'workbook', plant, source['case_id'])):
-                raise ValueError('Choose an available inward or use Replace an existing certificate PDF.')
+                raise ValueError('This client already has a certificate. Select its current certificate in the client list to replace the PDF.')
         cod = reviewed_cod
         if replacing:
             if reviewed_cod and identity(reviewed_cod) != identity(existing_cod):
