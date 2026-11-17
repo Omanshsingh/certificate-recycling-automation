@@ -134,8 +134,8 @@ def _prepare(root, body, sessions):
         plant = next(f'plant{index}' for index, value in enumerate(settings['workbook_paths'], 1)
                      if value and str(Path(value).expanduser().resolve()) == path)
         after, _ = resequence_removed_inwards(after, before, root=root, plant=plant)
-        from register_protection import protect_issued_inwards
-        sources[path] = before, protect_issued_inwards(order_register_for_save(after, sessions[path]))
+        from register_protection import remove_issued_inward_protection
+        sources[path] = before, remove_issued_inward_protection(order_register_for_save(after, sessions[path]))
     kept_hdd = []
     for record in linked:
         if record['id'] in manual_ids:

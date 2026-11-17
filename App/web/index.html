@@ -160,9 +160,19 @@
     <div class="modal-footer"><span></span><button type="button" class="button button-quiet" data-close="past-numbers-modal">Close</button></div>
   </dialog>
 
+  <dialog class="modal issued-change-review-modal" id="issued-change-review-modal" aria-labelledby="issued-change-title">
+    <div class="modal-header"><div><h2 id="issued-change-title">Excel details changed</h2><p>Changed values are highlighted below.</p></div><button type="button" class="icon-button" data-close="issued-change-review-modal" aria-label="Close">×</button></div>
+    <div class="issued-change-content">
+      <p class="issued-change-note">The issued PDF and status stay the same.</p>
+      <div id="issued-change-preview" class="issued-change-preview"></div>
+      <p id="issued-change-error" class="issued-change-error" role="alert" hidden></p>
+    </div>
+    <div class="modal-footer"><button type="button" class="button button-quiet" data-close="issued-change-review-modal">Cancel</button><div><button type="button" class="button button-quiet" id="issued-change-restore">Restore issued values</button><button type="button" class="button button-primary" id="issued-change-keep">Keep Excel values</button></div></div>
+  </dialog>
+
   <dialog class="modal certificate-modal" id="details-modal" aria-labelledby="details-title">
     <form id="details-form" method="dialog" novalidate>
-      <div class="modal-header"><div><div class="eyebrow">CERTIFICATE DETAILS</div><h2 id="details-title">Create a certificate</h2><p id="details-description">Choose a template, enter the details, and preview your certificate.</p></div><button type="button" class="icon-button" data-close="details-modal" aria-label="Close">×</button></div>
+      <div class="modal-header"><div><div class="eyebrow">CERTIFICATE DETAILS</div><h2 id="details-title">Create a certificate</h2><p id="details-description">Choose a template, enter the details, and preview your certificate.</p></div><div class="modal-header-actions"><button type="button" class="issued-details-alert" id="edit-issued-certificate" aria-label="Excel details changed. Review the differences." title="Preview the changes and choose what to do" hidden>⚠ Excel changed · Review</button><button type="button" class="icon-button" data-close="details-modal" aria-label="Close">×</button></div></div>
       <p class="details-error" id="details-error" role="alert" hidden></p>
       <div class="editor-workspace">
       <section class="editor-fields" id="editor-fields" aria-label="Edit certificate details">
@@ -172,14 +182,16 @@
         <label class="field"><span>Certificate type</span><select name="certificate_type"><option value="standard">Recycling</option><option value="destruction">Data Destruction</option><option value="siemens">Medical</option><option value="sita">International</option></select></label>
         <p class="certificate-selection-status" id="certificate-selection-status" role="status" aria-live="polite"></p>
       <section class="destruction-choice" id="destruction-needed-card" aria-label="Data Destruction request" hidden>
-        <label class="destruction-choice-label" id="destruction-request-toggle" for="destruction-needed"><input id="destruction-needed" name="data_destruction_needed" type="checkbox"><span><strong id="destruction-needed-label">Data Destruction needed</strong></span></label>
+        <label class="destruction-choice-label" id="destruction-request-toggle" for="destruction-needed"><input id="destruction-needed" name="data_destruction_needed" type="checkbox"><span><strong id="destruction-needed-label">Add Data Destruction certificate</strong></span></label>
         <strong id="destruction-issued-label" hidden>Data Destruction certificate</strong>
-        <div class="destruction-choice-footer"><p id="destruction-choice-status" role="status" aria-live="polite"></p><button type="button" class="button button-quiet" id="open-companion-certificate" hidden>Open Data Destruction (HDD)</button></div>
+        <div class="destruction-choice-footer"><p id="destruction-choice-status" role="status" aria-live="polite"></p></div>
       </section>
       <section class="destruction-choice" id="primary-certificate-needed-card" hidden>
-        <label class="destruction-choice-label"><input id="primary-certificate-needed" type="checkbox" checked><span><strong id="primary-certificate-needed-label">Recycling certificate needed</strong></span></label>
+        <label class="destruction-choice-label" id="primary-certificate-needed-toggle"><input id="primary-certificate-needed" type="checkbox"><span><strong id="primary-certificate-needed-label">Add Recycling certificate</strong></span></label>
+        <strong id="primary-certificate-existing-label" hidden>Recycling certificate already available</strong>
         <div class="destruction-choice-footer"><p id="primary-certificate-needed-status" role="status" aria-live="polite"></p></div>
       </section>
+      <div class="destruction-choice-footer" id="companion-certificate-footer" hidden><button type="button" class="button button-quiet" id="open-companion-certificate">Open Data Destruction (HDD)</button></div>
       </div>
       <div class="form-grid" id="single-start-cod-section" hidden>
         <label class="field"><span>Starting COD number</span><input name="starting_cod" id="single-start-cod" type="text" inputmode="numeric" pattern="[0-9]{1,12}" maxlength="12" placeholder="e.g. 0302" autocomplete="off" aria-describedby="single-start-cod-hint"><small id="single-start-cod-hint">No previous COD found. Enter the number to start from.</small></label>
@@ -228,7 +240,7 @@
         </div>
       </section>
       <p class="form-hint" id="edit-items-hint" hidden></p>
-      <section class="annexure-section" aria-label="Certificate annexure"><div><p>Attach a PDF list (optional)</p><p id="annexure-name" hidden></p></div><div class="annexure-actions"><button type="button" class="button button-quiet" id="pick-annexure">Choose PDF list</button><button type="button" class="button button-quiet" id="remove-annexure" hidden>Remove list</button></div></section>
+      <section class="annexure-section" aria-label="Additional certificate pages"><div><p>Add pages (optional)</p><p id="annexure-name" hidden></p></div><div class="annexure-actions"><button type="button" class="button button-quiet" id="pick-annexure">Add pages</button><button type="button" class="button button-quiet" id="remove-annexure" hidden>Remove pages</button></div></section>
       <p class="form-hint" id="template-status" role="status" hidden></p>
       <p class="autosave-note" id="working-draft-status" role="status" hidden></p><details class="form-disclosure" id="draft-options" hidden><summary>Save for later</summary><p>Find the saved draft in Companies.</p><div class="draft-actions"><button type="button" class="button button-quiet" id="keep-working-draft" hidden>Keep these edits</button><button type="button" class="button button-quiet" id="save-draft" hidden>Save draft</button></div></details>
       </section>
@@ -309,7 +321,7 @@
   </dialog>
 
   <dialog class="modal entry-deletion-modal" id="entry-deletion-modal" aria-labelledby="entry-deletion-title">
-    <div class="modal-header"><div><h2 id="entry-deletion-title">Delete mistaken entries</h2><p>Search and choose the entries entered by mistake. Completed entries are included. Review before deleting.</p></div><button type="button" class="icon-button" data-close="entry-deletion-modal" aria-label="Cancel deletion">×</button></div>
+    <div class="modal-header"><div><h2 id="entry-deletion-title">Delete mistaken entries</h2><p>Select the entries, review the summary, then confirm.</p></div><button type="button" class="icon-button" data-close="entry-deletion-modal" aria-label="Cancel deletion">×</button></div>
     <div class="bulk-content">
       <div id="entry-delete-selection">
         <div class="bulk-search"><label class="search-box"><span class="search-icon" aria-hidden="true">⌕</span><input type="search" id="entry-delete-search" aria-label="Find entries to delete" placeholder="Search company, SN, COD, reference, Form 6 or city" autocomplete="off"></label><button type="button" class="text-button" id="entry-delete-clear" hidden>Clear search</button></div>
@@ -317,12 +329,12 @@
         <div id="entry-delete-choices" class="bulk-choices" aria-label="Choose mistaken entries"></div>
         <p id="entry-delete-empty" hidden>No entries found. Try another company, SN or COD.</p>
         <label class="remove-inward-check"><input type="checkbox" id="entry-delete-hdd"><span>Also delete linked HDD requests that have not been generated.</span></label>
-        <p class="dialog-note">If unchecked, linked HDD records are kept as standalone records. Only checked entries will be deleted.</p>
+        <p class="dialog-note">Unselected linked HDD records are kept.</p>
       </div>
-      <div id="entry-delete-review" hidden><h3>Review what will be deleted</h3><div id="entry-delete-review-list"></div><p id="entry-delete-kept-hdd"></p><p class="dialog-note">Only entries with no generated certificate can be deleted. Their inward rows and materials are removed, remaining rows and serial numbers close up, and a recovery copy is kept.</p><label class="remove-inward-check"><input type="checkbox" id="entry-delete-checked"><span>I checked these entries and PDFs and want to delete them.</span></label></div>
+      <div id="entry-delete-review" hidden><h3 id="entry-delete-review-title">Review selected entries</h3><div id="entry-delete-review-list"></div><p id="entry-delete-kept-hdd" hidden></p><p class="dialog-note">The listed records and any PDFs will be removed. You can undo this deletion afterward.</p><label class="remove-inward-check"><input type="checkbox" id="entry-delete-checked"><span>I reviewed this list and want to delete these records.</span></label></div>
       <p id="entry-delete-error" class="form-error" role="alert" hidden></p>
     </div>
-    <div class="modal-footer"><span id="entry-delete-selected" role="status" aria-live="polite">0 selected</span><div><button type="button" class="button button-quiet" data-close="entry-deletion-modal" id="entry-delete-cancel">Cancel</button><button type="button" class="button button-quiet" id="entry-delete-back" hidden>Change selection</button><button type="button" class="button button-primary" id="entry-delete-preview" disabled>Review selected entries</button><button type="button" class="button button-danger" id="entry-delete-confirm" hidden disabled>Delete reviewed entries</button></div></div>
+    <div class="modal-footer"><span id="entry-delete-selected" role="status" aria-live="polite">0 selected</span><div><button type="button" class="button button-quiet" data-close="entry-deletion-modal" id="entry-delete-cancel">Cancel</button><button type="button" class="button button-primary" id="entry-delete-preview" disabled>Review selected entries</button><button type="button" class="button button-danger" id="entry-delete-confirm" hidden disabled>Delete reviewed entries</button></div></div>
   </dialog>
 
   <dialog class="modal" id="action-confirmation-modal" aria-labelledby="action-confirmation-title" aria-describedby="action-confirmation-message">
@@ -396,7 +408,7 @@
         <p class="field" id="upload-saved-filename" hidden></p>
         <label class="field"><span>Save to</span><select id="external-upload-target"><option value="workbook">Attach to a client</option><option value="local">Save as an app-only certificate</option></select></label>
         <label class="field field-half"><span>Certificate type</span><select name="certificate_type" required><option value="">Choose a type</option><option value="standard">Recycling</option><option value="destruction">Data Destruction (HDD)</option><option value="siemens">Medical</option><option value="sita">International</option></select></label>
-        <label class="field field-half"><span>Certificate number (COD)</span><textarea id="upload-cod" rows="1" readonly maxlength="80" placeholder="Assigned automatically" aria-describedby="upload-cod-hint"></textarea><small id="upload-cod-hint" role="status"></small></label>
+        <label class="field field-half"><span>COD printed on certificate</span><textarea id="upload-cod" rows="1" readonly maxlength="80" placeholder="Read from PDF" aria-describedby="upload-cod-hint"></textarea><small id="upload-cod-hint" role="status"></small></label>
         <div class="field inward-picker" id="upload-inward-field">
           <label id="upload-inward-label" for="upload-inward">Client</label>
           <input id="upload-inward" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="upload-inward-options" autocomplete="off" placeholder="Search company, SN or plant" required>
@@ -407,7 +419,7 @@
         <label class="field field-half"><span>Certificate issue date</span><input name="cod_date" data-date-input="true" required></label>
         <fieldset class="upload-company-fields field" id="upload-company-fields" hidden disabled>
           <legend>Certificate details</legend>
-          <p class="field" id="upload-detail-scope" hidden>These details appear when you open this certificate from Companies.</p>
+          <p class="field" id="upload-detail-scope" hidden>Client details are shown from the inward. To change them, use Review &amp; edit.</p>
           <div class="form-grid">
             <label class="field"><span>Company name</span><textarea name="supplier" rows="1" maxlength="500" required></textarea></label>
             <label class="field field-half"><span>City / site</span><textarea name="location" rows="1" maxlength="500"></textarea></label>

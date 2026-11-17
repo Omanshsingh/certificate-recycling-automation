@@ -19,7 +19,7 @@ from certificate_core import (batch_content, inward_details_complete, material_i
                               supplier_is_always_not_applicable)
 from workbook_store import (_attributes, _date_style, _element, _range_fragment,
                             _set_cell, _sheet_member, _ensure_status_validation,
-                            formatted_client_template, sync_generated_styles,
+                            formatted_client_template, sync_generated_styles, CLIENT_TEXT_FIELDS,
                             add_tracking_column, left_align_client_rows,
                             order_register_for_save, next_register_row,
                             register_content_width, checked_register_column, checked_excel_text)
@@ -248,13 +248,8 @@ def stage_new_client(session, raw):
                        [template] + [continuation] * (count - 2) + [template_end])
         destinations = list(range(first, last + 1))
         # Only copied rows use the new entry alignment. Existing rows stay intact.
-        left_align_client_rows(sheet, source_rows, sheet.max_column)
-        if 'comments' in cols:
-            for source_row in source_rows:
-                comment_cell = sheet.cell(source_row, cols['comments'] + 1)
-                alignment = copy(comment_cell.alignment)
-                alignment.wrap_text = True
-                comment_cell.alignment = alignment
+        wrap_columns = {cols[key] + 1 for key in CLIENT_TEXT_FIELDS if key in cols}
+        left_align_client_rows(sheet, source_rows, sheet.max_column, wrap_columns=wrap_columns)
         with ZipFile(BytesIO(source_data)) as archive:
             member = _sheet_member(archive, sheet.title)
             xml = archive.read(member).decode('utf-8')
@@ -432,7 +427,7 @@ def stage_new_client(session, raw):
             changes[member] = xml.encode('utf-8')
             ET.fromstring(xml)
             updated = write_details(_package(archive, changes), sheet.title, case_id, metadata)
-            updated = order_register_for_save(updated, session)
+            updated = order_register_for_save(updated, session, fit_inward=(sheet.title, case_id))
             checked = read_batches(BytesIO(updated))
             matches = [batch for batch in checked if batch['source_sheet'] == sheet.title and batch['case_id'] == case_id]
             if len(checked) != len(original) + 1 or len(matches) != 1:

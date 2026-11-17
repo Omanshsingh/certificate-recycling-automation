@@ -57,6 +57,25 @@ def _safe_cod_name(value: str) -> str:
     return safe
 
 
+def _linked_hdd_pending(batch, manual_records):
+    plant = batch.get('source_id')
+    case_id = str(batch.get('case_id') or '').strip().casefold()
+    linked = [record for record in manual_records
+              if (link := record.get('details', {}).get('destruction_source'))
+              and link.get('plant') == plant
+              and str(link.get('case_id', '')).strip().casefold() == case_id]
+    if not linked:
+        return bool(batch.get('hdd_cod_no'))
+    for record in linked:
+        status = status_value(record.get('status'))
+        issued = status in {'generated', 'generated_manual', 'completed'}
+        if not record.get('destruction_requested', True) and not issued:
+            continue
+        if status not in {'completed', 'na'}:
+            return True
+    return False
+
+
 def _safe_name_part(value, fallback):
     """Keep the requested human-readable PDF name safe on Windows."""
     raw = re.sub(r"\s+", "_", str(value or "").strip())
@@ -602,6 +621,26 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
                         report.add(batch, 'needs_review', ' '.join(batch['blocking_issues']),
                                    warnings=batch['blocking_issues'], system_alert=True)
                         continue
+                    if check_only and state == 'completed' and _linked_hdd_pending(batch, manual_records):
+                        # Excel has one outward status cell for the inward. If
+                        # its Recycling certificate was completed while a
+                        # requested HDD certificate remains open, expose the
+                        # true per-certificate state and safely repair Excel
+                        # when this refresh owns a writable session.
+                        batch['recycling_completed'] = True
+                        receipt = history.get((batch['source_id'], batch['case_id'].strip().casefold()))
+                        target_status = ('Generated Externally'
+                                         if batch.get('external_pdf') or (receipt or {}).get('external_upload')
+                                         else 'Generated')
+                        session = sessions[int(batch['source_id'][-1]) - 1]
+                        if (session is not None and not read_only_preflight
+                                and not batch.get('_workbook_read_only')
+                                and not isinstance(session, WorkbookSnapshot)):
+                            session.set_issued_status(batch['case_id'], batch['source_sheet'],
+                                batch['source_row'], batch['cod_no'], batch['issued'], target_status,
+                                metadata={'_recycling_completed': True})
+                            batch['issued'] = target_status
+                        state = 'generated_manual' if target_status == 'Generated Externally' else 'generated'
                     if (batch.get('_workbook_read_only') or read_only_preflight) and state in {'blank', 'ready', 'alert'}:
                         # Effective status only: the saved Excel cell remains
                         # untouched until a write can safely acquire its lock.
@@ -651,7 +690,9 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
                                 sessions[int(batch["source_id"][-1]) - 1].set_issued_status(
                                     batch["case_id"], batch["source_sheet"], batch["source_row"],
                                     batch["cod_no"], batch["issued"], "Ready",
+                                    metadata={'_recycling_completed': False},
                                 )
+                            batch['recycling_completed'] = False
                             batch["issued"] = "Ready"
                             batch["_effective_certificate_status"] = state = "ready"
                             batch["_missing_pdf"] = True

@@ -31,7 +31,7 @@ from openpyxl.utils.datetime import to_excel
 from openpyxl.styles.stylesheet import write_stylesheet
 from openpyxl.xml.functions import tostring
 
-from register_protection import externally_protected, protect_issued_inwards
+from register_protection import externally_protected, remove_issued_inward_protection
 from certificate_core import (batch_content, columns, inward_details_complete, material_items, number,
                               parse_date, read_batches, register_header, select_register, status_value,
                               source_value_issues, supplier_is_always_not_applicable, text)
@@ -91,9 +91,14 @@ def formatted_client_template(sheet, header_row, cols, multi_line=False):
     return max(candidates, key=score)
 
 
-def copy_client_row_styles(sheet, source_row, target_rows, width=None):
+CLIENT_TEXT_FIELDS = ('supplier', 'location', 'item', 'comments', 'transporter_details',
+                      'docket_vehicle_no', 'weight_slip_scale')
+
+
+def copy_client_row_styles(sheet, source_row, target_rows, width=None, *, wrap_columns=()):
     """Copy cell formatting and row height, left-aligning a newly appended block."""
     width = width or sheet.max_column
+    wrap_columns = set(wrap_columns)
     source_height = sheet.row_dimensions[source_row].height
     for target_row in target_rows:
         for column in range(1, width + 1):
@@ -103,20 +108,25 @@ def copy_client_row_styles(sheet, source_row, target_rows, width=None):
             alignment = copy(source.alignment)
             alignment.horizontal = 'left'
             alignment.vertical = 'top'
+            if column in wrap_columns:
+                alignment.wrap_text = True
             target.alignment = alignment
         if source_height is not None:
             sheet.row_dimensions[target_row].height = source_height
 
 
-def left_align_client_rows(sheet, rows, width=None):
+def left_align_client_rows(sheet, rows, width=None, *, wrap_columns=()):
     """Left-align copied rows while preserving wrapping and vertical alignment."""
     width = width or sheet.max_column
+    wrap_columns = set(wrap_columns)
     for row in set(rows):
         for column in range(1, width + 1):
             cell = sheet.cell(row, column)
             alignment = copy(cell.alignment)
             alignment.horizontal = 'left'
             alignment.vertical = 'top'
+            if column in wrap_columns:
+                alignment.wrap_text = True
             cell.alignment = alignment
 
 
@@ -357,7 +367,7 @@ class UnsupportedReorderError(ValueError):
     """The register is usable, but an Excel feature cannot safely move here."""
 
 
-def order_register_for_save(data, session):
+def order_register_for_save(data, session, *, fit_inward=None):
     """Keep a verified record save usable when only automatic sorting is unsafe."""
     from register_column_order import normalize_register_columns, UnsupportedColumnOrderError
     try:
@@ -370,7 +380,7 @@ def order_register_for_save(data, session):
         data = compact_register_gaps(data)
     except UnsupportedReorderError as exc:
         session.order_warning = str(exc)
-    data = normalize_register_presentation(data)
+    data = normalize_register_presentation(data, fit_inward=fit_inward)
     try:
         return sort_register_by_inward_date(data)
     except UnsupportedReorderError as exc:
@@ -442,6 +452,11 @@ def sort_register_by_inward_date(data, *, source_rows=None):
             member = _sheet_member(archive, sheet.title)
             xml = archive.read(member).decode('utf-8')
             if moved:
+                from register_rows import expanded_shared_formulas
+                try:
+                    shared_values = expanded_shared_formulas(xml, sheet)
+                except ValueError as exc:
+                    unsafe('a shared formula group could not be expanded safely')
                 if any(name.casefold() == 'xl/vbaproject.bin' for name in archive.namelist()):
                     unsafe('the workbook contains VBA macros whose row references cannot be verified')
                 if externally_protected(sheet):
@@ -468,7 +483,7 @@ def sort_register_by_inward_date(data, *, source_rows=None):
                         if cell.data_type == 'f':
                             if cell.row not in covered:
                                 unsafe('a formula outside the inward blocks may depend on the register')
-                            move_formula(cell.value, *covered[cell.row])
+                            move_formula(shared_values.get(cell.coordinate, cell.value), *covered[cell.row])
                 for area in sheet.merged_cells.ranges:
                     overlaps = area.max_row >= blocks[0][0] and area.min_row <= blocks[-1][1]
                     if overlaps and (area.min_row not in row_map or area.max_row not in row_map
@@ -504,8 +519,16 @@ def sort_register_by_inward_date(data, *, source_rows=None):
                         if moved:
                             def relocate_formula(formula_match):
                                 formula_xml = formula_match.group()
-                                if _attributes(formula_xml):
-                                    unsafe('a shared or array formula needs Excel to move it')
+                                formula_attrs = _attributes(formula_xml)
+                                if formula_attrs:
+                                    if formula_attrs.get('t') != 'shared':
+                                        unsafe('an array or special formula needs Excel to move it')
+                                    value = shared_values.get(coordinate)
+                                    if not value:
+                                        unsafe('a shared formula group could not be expanded safely')
+                                    expanded = move_formula(value, *covered[old])[1:]
+                                    prefix = formula_match.group('p')
+                                    return f'<{prefix}f>{escape(expanded)}</{prefix}f>'
                                 start, end = formula_xml.index('>') + 1, formula_xml.rfind('</')
                                 value = move_formula(unescape(formula_xml[start:end]), *covered[old])[1:]
                                 return formula_xml[:start] + escape(value) + formula_xml[end:]
@@ -1641,8 +1664,8 @@ class WorkbookSession:
                 row_limit=row_limit, first_row=first_row,
             )
             if updated_styles == styles_xml and updated_sheet == original_sheet_xml:
-                protected = protect_issued_inwards(self.data)
-                return self._persist(protected, exact=True) if protected != self.data else self.backup_path
+                unprotected = remove_issued_inward_protection(self.data)
+                return self._persist(unprotected, exact=True) if unprotected != self.data else self.backup_path
             ET.fromstring(updated_styles)
             ET.fromstring(updated_sheet)
             changed = {"xl/styles.xml": updated_styles.encode("utf-8"),
@@ -1828,6 +1851,7 @@ class WorkbookSession:
 
         metadata = {key:value for key,value in (persisted_overrides or {}).items() if key not in cols}
         metadata['_pdf_recovery_pending'] = False
+        metadata['_recycling_completed'] = False
         if current.get('external_pdf'):
             metadata['_external_pdf'] = None
         updated = write_details(updated, current['source_sheet'], current['case_id'], metadata)
@@ -1853,7 +1877,7 @@ class WorkbookSession:
         return self._persist(updated)
 
     def set_issued_status(self, case_id, source_sheet, source_row, expected_certificate_no,
-                          expected_status, new_status, *, external=None):
+                          expected_status, new_status, *, external=None, metadata=None):
         """Update status, with optional tracking details for a linked external PDF."""
         if self.context is None:
             raise PermissionError("The workbook became unavailable during its update. Close it in Excel and try again.")
@@ -1937,16 +1961,17 @@ class WorkbookSession:
         updated = buffer.getvalue()
         expected_cod = current['cod_no']
         expected_date = parse_date(current['cod_date'])
+        metadata_updates = dict(metadata or {})
+        metadata_updates.setdefault('_recycling_completed', False)
         if external:
             expected_cod, expected_date = external['cod'], external['date']
-            metadata = {'_external_pdf': external['link'], '_pdf_recovery_pending': False}
+            metadata_updates.update(_external_pdf=external['link'], _pdf_recovery_pending=False)
             if external_type and 'certificate_type' not in cols:
-                metadata['certificate_type'] = external_type
-            updated = write_details(updated, current['source_sheet'], current['case_id'],
-                                    metadata)
+                metadata_updates['certificate_type'] = external_type
         if target == 'ready' and status_value(current['issued']) in {'generated', 'generated_manual', 'completed'}:
-            updated = write_details(updated, current['source_sheet'], current['case_id'],
-                                    {'_pdf_recovery_pending': True})
+            metadata_updates['_pdf_recovery_pending'] = True
+        if metadata_updates:
+            updated = write_details(updated, current['source_sheet'], current['case_id'], metadata_updates)
         verified = next(batch for batch in read_batches(BytesIO(updated))
                         if batch["case_id"] == current['case_id']
                         and batch["source_sheet"] == source_sheet
@@ -1963,7 +1988,7 @@ class WorkbookSession:
         if not exact:
             from register_presentation import normalize_register_presentation
             updated = normalize_register_presentation(updated, wrap_only=True)
-            updated = protect_issued_inwards(updated)
+            updated = remove_issued_inward_protection(updated)
         if self.before_persist:
             self.before_persist(updated)
         if not self.backup_path:
@@ -2199,15 +2224,49 @@ def stage_certificate_details(session, details, validate_cells=True, *, inward_s
                 next_row = max(register_content_end(sheet, header_row) + 1, target_row + 1)
                 material_rows.extend(range(next_row, next_row + len(material_override) - len(material_rows)))
 
+        shrink_material_rows = []
+        shrink_retained_end = None
+        if validate_cells and material_override is not None and original_batch:
+            material_columns = {cols[key] + 1 for key in ('item', 'quantity', 'per_piece_weight', 'weight') if key in cols}
+            following_rows = [batch['source_row'] for batch in sheet_batches if batch['source_row'] > target_row]
+            block_end = min(following_rows) - 1 if following_rows else register_content_end(sheet, header_row)
+            original_material_rows = [row_number for row_number in range(target_row, block_end + 1)
+                if row_number not in summary_rows and any(
+                    sheet.cell(row_number, column).value is not None for column in material_columns)]
+            if (len(original_material_rows) == len(original_batch.get('items', []))
+                    and len(material_override) < len(original_material_rows)
+                    and material_rows[:len(original_material_rows)] == original_material_rows):
+                surplus_rows = original_material_rows[len(material_override):]
+                retained_end = original_material_rows[len(material_override) - 1]
+                occupied_other_cells = any(
+                    cell.value is not None or cell.comment or cell.hyperlink
+                    for row_number in surplus_rows for cell in sheet[row_number]
+                    if cell.column not in material_columns)
+                affected_merges = [area for area in sheet.merged_cells.ranges
+                    if any(area.min_row <= row_number <= area.max_row for row_number in surplus_rows)]
+                safe_merges = all(area.min_col == area.max_col and area.min_col not in material_columns
+                    and area.min_row == target_row and area.max_row == original_material_rows[-1]
+                    for area in affected_merges)
+                if not occupied_other_cells and safe_merges:
+                    for area in affected_merges:
+                        sheet.unmerge_cells(str(area))
+                        if retained_end > target_row:
+                            sheet.merge_cells(start_row=area.min_row, start_column=area.min_col,
+                                              end_row=retained_end, end_column=area.max_col)
+                    shrink_material_rows = surplus_rows
+                    shrink_retained_end = retained_end
+
         if is_new_record:
             template_row = formatted_client_template(sheet, header_row, cols, len(material_rows) > 1)
             continuation_row = (template_row + 1 if any(
                 area.min_row == template_row and area.max_row > template_row
                 for area in sheet.merged_cells.ranges) else template_row)
             style_rows = material_rows or [target_row]
+            wrap_columns = {cols[key] + 1 for key in CLIENT_TEXT_FIELDS if key in cols}
             for index, row_number in enumerate(style_rows):
                 source_row = template_row if index == 0 else continuation_row
-                copy_client_row_styles(sheet, source_row, [row_number], sheet.max_column)
+                copy_client_row_styles(sheet, source_row, [row_number], sheet.max_column,
+                                       wrap_columns=wrap_columns)
             if len(style_rows) > 1 and validate_cells:
                 material_columns = {cols[key] + 1 for key in
                                     ('item', 'quantity', 'per_piece_weight', 'weight') if key in cols}
@@ -2333,6 +2392,12 @@ def stage_certificate_details(session, details, validate_cells=True, *, inward_s
                             raise ValueError(f'{cell.coordinate} is protected; its total was not changed.')
                         cell.value = sum(material['weight'] or 0 for position, material in zip(material_rows, material_override)
                                          if position < row_number)
+                    elif shrink_material_rows and shrink_retained_end is not None:
+                        weight_column = get_column_letter(cols['weight'] + 1)
+                        formula = re.sub(r'\s|\$', '', text(cell.value)).upper()
+                        original_end = max(shrink_material_rows + [shrink_retained_end])
+                        if formula == f'=SUM({weight_column}{target_row}:{weight_column}{original_end})':
+                            cell.value = f'=SUM({weight_column}{target_row}:{weight_column}{shrink_retained_end})'
         if validate_cells:
             from openpyxl.worksheet.table import TableColumn
             final_width = register_content_width(sheet, header_row)
@@ -2359,7 +2424,28 @@ def stage_certificate_details(session, details, validate_cells=True, *, inward_s
     if validate_cells:
         updated = write_details(updated, sheet.title, case_id,
                                 {key:value for key,value in details.items() if key not in cols})
-        updated = order_register_for_save(updated, session)
+        shrink_warning = None
+        if shrink_material_rows:
+            from register_rows import shift_register_rows
+            candidate = updated
+            groups = []
+            for row_number in sorted(shrink_material_rows):
+                if groups and groups[-1][1] + 1 == row_number:
+                    groups[-1][1] = row_number
+                else:
+                    groups.append([row_number, row_number])
+            try:
+                for first, last in reversed(groups):
+                    candidate = shift_register_rows(candidate, first, last - first + 1, delete=True,
+                                                    expand_shared=True)
+                updated = candidate
+            except ValueError:
+                shrink_warning = ('The material change was saved, but Excel kept an extra blank row because its layout '
+                                  'could not be safely compacted automatically. Review the workbook before reusing that row.')
+        updated = order_register_for_save(
+            updated, session, fit_inward=(sheet.title, case_id) if is_new_record else None)
+        if shrink_warning:
+            session.order_warning = ' '.join(filter(None, (session.order_warning, shrink_warning)))
 
     parsed = read_batches(BytesIO(updated))
     matches = [batch for batch in parsed if batch["case_id"] == case_id]

@@ -18,7 +18,7 @@ from issuance_safety import (IssuanceTransaction, audit_records, digest_bytes, f
                              recover_issuances)
 from pdf_attachments import checked_reader
 from preview_store import cleanup_previews
-from run_certificates import (_safe_cod_name, certificate_filename, find_certificate, numbering_plan,
+from run_certificates import (_safe_cod_name, certificate_filename, find_certificate,
                               workbook_cod_ownership_issue)
 from workbook_store import WorkbookSession
 from workflow_support import load_settings, operation_error_message, run_lock
@@ -139,31 +139,10 @@ def _replacement_paths(root, inventory, current, cod, source_kind, plant, key):
     return allowed, paths
 
 
-def _apply_certificate_edits(details, edits):
-    if not isinstance(edits, dict) or any(key not in EDITABLE_CERTIFICATE_FIELDS or not isinstance(value, str)
-                                         for key, value in edits.items()):
-        raise ValueError('Review the editable certificate details and try again.')
-    if not edits:
-        return
-    checked = clean_details(dict(edits, certificate_type=details['certificate_type']))
-    if checked['inward_date']:
-        received = parse_date(checked['inward_date'])
-        if not received:
-            raise ValueError('Enter a valid received date.')
-        checked['inward_date'] = received.isoformat()
-    if checked['certificate_weight'] and (number(checked['certificate_weight']) or 0) <= 0:
-        raise ValueError('Enter a positive certificate weight in kg.')
-    details.update({key: checked[key] for key in edits})
-    fields = dict(details.get('certificate_fields') or {})
-    if 'supplier' in edits:
-        fields.pop('company_display', None)
-    if 'location' in edits and details['certificate_type'] == 'siemens':
-        fields['site_location'] = details['location']
-    details['certificate_fields'] = fields
-
-
 def save_upload(root, backup_dir, body):
     root = Path(root).resolve()
+    if body.get('certificate_edits'):
+        raise ValueError('Client details are read-only during upload. Use Review & edit to change them.')
     token = body.get('token')
     if not isinstance(token, str) or not re.fullmatch(r'[a-f0-9]{32}', token):
         raise ValueError('Choose the certificate PDF again.')
@@ -192,7 +171,6 @@ def save_upload(root, backup_dir, body):
         raise ValueError('Choose the certificate type.')
     details = clean_details(submitted)
     reviewed_cod = details['cod_no']
-    automatic = body.get('automatic_cod') is True or not reviewed_cod
     issued_date = parse_date(details['cod_date'])
     if not issued_date or issued_date > date.today():
         raise ValueError('Enter the certificate issue date. It cannot be in the future.')
@@ -322,8 +300,6 @@ def save_upload(root, backup_dir, body):
             if existing:
                 details.update(existing['details'], cod_date=issued_date.isoformat())
                 details['case_id'] = link['case_id']
-        if target or local_parent_id or replacing:
-            _apply_certificate_edits(details, body.get('certificate_edits', {}))
         if not details['supplier']:
             raise ValueError('Enter the company name.')
         if workbook_record and not replacing:
@@ -331,30 +307,28 @@ def save_upload(root, backup_dir, body):
                     or source.get('external_pdf') or source.get('pdf_recovery_pending')
                     or latest_issuance(root, 'workbook', plant, source['case_id'])):
                 raise ValueError('This client already has a certificate. Select its current certificate in the client list to replace the PDF.')
-        cod = reviewed_cod
         if replacing:
             if reviewed_cod and identity(reviewed_cod) != identity(existing_cod):
                 raise ValueError(f'The replacement must keep COD {existing_cod}.')
+            printed_numbers = {identity(value) for value in printed}
+            if printed_numbers and identity(existing_cod) not in printed_numbers:
+                raise ValueError(
+                    f'The replacement PDF must match the number printed for existing COD {existing_cod}. '
+                    'Choose the correct PDF and try again.'
+                )
             cod = existing_cod
-        elif automatic:
-            if len(printed) == 1:
-                cod = printed[0]
-            elif len(printed) > 1:
-                raise ValueError('More than one certificate number was found on the first page. Check the PDF before saving.')
-            elif existing_cod:
-                cod = existing_cod
-            else:
-                inventory = scan_inventory(root, force=True)
-                cod = numbering_plan(batches, load_settings(root), root / 'Certificates', inventory=inventory)['next_cod']
-            if reviewed_cod and identity(reviewed_cod) != identity(cod):
-                raise ValueError(f'The files changed and the suggested COD is now {cod}. Refresh and review the upload before saving.')
+        else:
+            printed_numbers = {identity(value) for value in printed}
+            cod = reviewed_cod or existing_cod or (printed[0] if len(printed) == 1 else '')
+            if not cod:
+                if len(printed) > 1:
+                    raise ValueError('The PDF text has more than one possible COD. Enter the number printed beside "Certificate No.".')
+                raise ValueError('The app could not read a COD. Enter the number printed on this certificate.')
+            if printed_numbers and identity(cod) not in printed_numbers:
+                raise ValueError('The COD must match a number printed on the PDF. Check the file and try again.')
         if not _valid_cod(cod):
-            if automatic:
-                raise ValueError('The app could not assign a valid COD. Check the inward’s COD and the numbering in Settings.')
             raise ValueError('Enter the certificate number exactly as it appears on the PDF.')
         _safe_cod_name(cod)
-        if printed and {identity(value) for value in printed} != {identity(cod)}:
-            raise ValueError('The certificate number must match the number printed on the PDF. Check the file and try again.')
         if existing_cod and identity(existing_cod) != identity(cod):
             raise ValueError(f'This inward has COD {existing_cod}. Choose the corresponding PDF.')
         details['cod_no'] = cod

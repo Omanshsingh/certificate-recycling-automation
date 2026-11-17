@@ -123,6 +123,18 @@ class ClientIntakeTests(unittest.TestCase):
             for name in source.namelist():
                 if name not in {member,'xl/styles.xml','xl/workbook.xml'}:
                     self.assertEqual(source.read(name), after.read(name), name)
+        book = load_workbook(self.paths[0])
+        try:
+            sheet, _, cols = select_register(book)
+            for key in ('supplier', 'location', 'item', 'comments', 'transporter_details',
+                        'docket_vehicle_no', 'weight_slip_scale'):
+                if key not in cols:
+                    continue
+                column = cols[key] + 1
+                self.assertTrue(sheet.cell(batch['source_row'], column).alignment.wrap_text, key)
+                self.assertTrue(sheet.cell(batch['source_row'] + 1, column).alignment.wrap_text, key)
+        finally:
+            book.close()
 
     def test_new_material_blocks_show_cod_lines_even_when_source_layout_was_merged(self):
         book = load_workbook(self.paths[0]); sheet, _, cols = select_register(book)

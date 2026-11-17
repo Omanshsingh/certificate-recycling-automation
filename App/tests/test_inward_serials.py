@@ -6,6 +6,8 @@ import shutil
 import tempfile
 import unittest
 from unittest.mock import patch
+from xml.etree import ElementTree as ET
+from zipfile import ZipFile
 
 from openpyxl import load_workbook
 
@@ -51,6 +53,27 @@ class InwardSerialTests(unittest.TestCase):
                 patch.object(web_app, 'refresh', side_effect=AssertionError('Adding an entry must use the checked state')):
             result = web_app.add_client(body)
         return result, body
+
+    def add_shared_weight_formula(self):
+        book = load_workbook(self.paths[0])
+        book.active['H2'] = '=F2*G2'
+        book.active['H3'] = '=F3*G3'
+        book.save(self.paths[0])
+        book.close()
+        output = BytesIO()
+        with ZipFile(self.paths[0]) as source, ZipFile(output, 'w') as target:
+            for member in source.infolist():
+                payload = source.read(member.filename)
+                if member.filename == 'xl/worksheets/sheet1.xml':
+                    xml = ET.fromstring(payload)
+                    first = xml.find('.//{*}c[@r="H2"]/{*}f')
+                    first.attrib.update(t='shared', si='0', ref='H2:H3')
+                    second = xml.find('.//{*}c[@r="H3"]/{*}f')
+                    second.attrib.update(t='shared', si='0')
+                    second.text = None
+                    payload = ET.tostring(xml)
+                target.writestr(member, payload)
+        self.paths[0].write_bytes(output.getvalue())
 
     def test_saving_a_late_inward_date_moves_the_entry_and_updates_its_sn(self):
         result, original_request = self.add(None)
@@ -114,6 +137,26 @@ class InwardSerialTests(unittest.TestCase):
         self.assertEqual([row['supplier'] for row in fixed], [row['supplier'] for row in rows])
         self.assertEqual(self.paths[0].read_bytes(), original)
 
+    def test_backdated_add_with_shared_formula_sorts_and_resequences(self):
+        self.add_shared_weight_formula()
+        original = read_batches(self.paths[0])
+        result, _ = self.add(2, 'c')
+
+        self.assertEqual(result['client']['sn'], '5')
+        self.assertFalse(result['order_warning'])
+        saved = read_batches(self.paths[0])
+        self.assertEqual([row['case_id'] for row in saved], ['4', '5', '6', '7'])
+        self.assertEqual([row['supplier'] for row in saved],
+                         [original[0]['supplier'], 'Backdated c', original[1]['supplier'], original[2]['supplier']])
+        with ZipFile(self.paths[0]) as archive:
+            xml = ET.fromstring(archive.read('xl/worksheets/sheet1.xml'))
+            formulas = [formula for formula in xml.findall('.//{*}f') if formula.attrib.get('t') == 'shared']
+            self.assertEqual(formulas, [])
+        book = load_workbook(self.paths[0], data_only=False)
+        self.assertEqual(book.active['H2'].value, '=F2*G2')
+        self.assertEqual(book.active['H4'].value, '=F4*G4')
+        book.close()
+
     def test_backdated_insert_shifts_later_numbers_and_keeps_certificates_and_hdd_links(self):
         created, _, _ = run(self.paths, self.root, progress=None, allow_warnings=True)
         self.assertEqual(created, 3)
@@ -145,9 +188,12 @@ class InwardSerialTests(unittest.TestCase):
         self.assertTrue(all(path.read_bytes() == data for path, data in history.items()))
         expected = workspace_revision(self.root)
         with patch.object(web_app, 'WORKSPACE_STATE_CACHE', (expected, result['state'])):
-            web_app.complete_workbook_record({'plant':'plant1','sn':'6','expected_revision':expected})
+            completion_state = web_app.complete_workbook_record({'plant':'plant1','sn':'6','expected_revision':expected})
         after = {row['case_id']:row for row in read_batches(self.paths[0])}
-        self.assertEqual(after['6']['issued'], 'Completed')
+        self.assertEqual(after['6']['issued'], 'Generated')
+        self.assertTrue(next(row for row in completion_state['rows']
+                             if row.get('plant') == 'plant1' and row.get('sn') == '6')
+                        ['recycling_completed_pending_hdd'])
         self.assertEqual(after['5']['issued'], 'Ready')
         receipt = latest_issuance(self.root, 'workbook', 'plant1', '6')
         correction = web_app.create_certificate({'plant':'plant1','source_sn':'6','source_plant':'plant1',

@@ -234,6 +234,27 @@ class ReviewAndEditTests(unittest.TestCase):
         self.assertEqual(change('undo_na')['status'], 'Ready')
         self.assertEqual(read_register(self.root)['records'][0]['status'], 'ready')
 
+    def test_app_only_undo_na_returns_alert_when_material_details_are_incomplete(self):
+        from certificate_drafts import save_draft
+
+        details = dict(self.reviewed()['details'], case_id='LOCAL-ALERT',
+                       form6='LOCAL-FORM6', reference='LOCAL-REF')
+        details['items'] = [{'item':'Laptop', 'quantity':'1', 'per_piece_weight':'', 'weight':''}]
+        record_id = save_draft(self.root, None, details)
+
+        def change(action):
+            return web_app.update_inward_status({
+                'record_id':record_id, 'action':action,
+                'expected_revision':workspace_revision(self.root),
+            })
+
+        self.assertEqual(change('mark_na')['status'], 'N/A')
+        undone = change('undo_na')
+        self.assertEqual(undone['status'], 'Alert')
+        self.assertEqual(read_register(self.root)['records'][0]['status'], 'alert')
+        local_row = next(row for row in undone['state']['rows'] if row.get('record_id') == record_id)
+        self.assertEqual(local_row['certificate_status'], 'alert')
+
     def test_uploaded_pdf_attaches_to_excel_or_creates_an_app_only_record(self):
         from external_certificate_upload import save_upload, stage_upload
         from tests.test_certificate_inventory import external_pdf
@@ -272,7 +293,7 @@ class ReviewAndEditTests(unittest.TestCase):
                 self.assertEqual(self.paths[0].read_bytes(), linked_before)
         self.assertEqual(self.paths[1].read_bytes(), other_before)
 
-    def test_upload_saves_certificate_detail_edits_without_changing_the_excel_inward(self):
+    def test_upload_keeps_client_details_read_only_and_requires_review_edit_for_changes(self):
         from external_certificate_upload import stage_upload
         from tests.test_certificate_inventory import external_pdf
 
@@ -281,27 +302,40 @@ class ReviewAndEditTests(unittest.TestCase):
         case = {'plant':'plant1', 'sn':'1001'}
         kind_date = {'certificate_type':'standard', 'cod_date':'2026-10-14'}
 
-        def upload(reference, **body):
-            pdf = external_pdf(self.root / 'upload.pdf', cod='0421', reference=reference).read_bytes()
-            return web_app.save_uploaded_certificate(dict(body, token=stage_upload(self.root, pdf)['token'],
-                                                          details=kind_date, expected_revision=workspace_revision(self.root)))
-
-        with self.assertRaisesRegex(ValueError, 'editable certificate details'):
-            upload('Invalid edit', inward=case, certificate_edits={'case_id':'other inward'})
+        pdf = external_pdf(self.root / 'upload.pdf', cod='0421', reference='External certificate').read_bytes()
+        staged = stage_upload(self.root, pdf)
+        with self.assertRaisesRegex(ValueError, 'read-only during upload'):
+            web_app.save_uploaded_certificate({
+                'token':staged['token'], 'inward':case, 'details':kind_date,
+                'certificate_edits':{'case_id':'other inward'},
+                'expected_revision':workspace_revision(self.root),
+            })
         self.assertEqual(self.source()['cod_no'], '')
-        changes = {'supplier':'Updated certificate name', 'location':'Navi Mumbai', 'inward_date':'09/10/26',
-                   'reference':'Certificate reference', 'certificate_weight':'12.125'}
-        first = upload('First revision', inward=case, certificate_edits=changes)
-        row = web_app.target_row(first['state'], ('plant1', '1001'))
-        expected = dict(changes, inward_date='2026-10-09', form6=original['form6'])
-        for field, value in expected.items():
-            self.assertEqual(row['last_certificate_details'][field], value)
-        self.assertEqual(len(row['last_certificate_details']['items']), len(original['items']))
 
-        second = upload('Second revision', replacement=case, certificate_edits={'reference':''})
+        first = web_app.save_uploaded_certificate({
+            'token':staged['token'], 'inward':case, 'details':kind_date,
+            'expected_revision':workspace_revision(self.root),
+        })
+        row = web_app.target_row(first['state'], ('plant1', '1001'))
+        self.assertEqual(row['last_certificate_details']['supplier'], original['supplier'])
+        self.assertEqual(row['last_certificate_details']['location'], original['location'])
+        self.assertEqual(row['last_certificate_details']['reference'], original['reference'])
+        uploaded_source = self.source()
+        self.assertEqual((uploaded_source['cod_no'], uploaded_source['issued']),
+                         ('0421', 'Generated Externally'))
+        self.assertEqual(uploaded_source['supplier'], original['supplier'])
+        self.assertEqual(uploaded_source['location'], original['location'])
+
+        replacement_pdf = external_pdf(self.root / 'replacement.pdf', cod=first['certificate_no'],
+                                       reference='Replacement PDF').read_bytes()
+        replacement = stage_upload(self.root, replacement_pdf)
+        second = web_app.save_uploaded_certificate({
+            'token':replacement['token'], 'replacement':case, 'details':kind_date,
+            'expected_revision':workspace_revision(self.root),
+        })
         row = web_app.target_row(second['state'], ('plant1', '1001'))
-        for field, value in dict(expected, reference='').items():
-            self.assertEqual(row['last_certificate_details'][field], value)
+        self.assertEqual(row['last_certificate_details']['supplier'], original['supplier'])
+        self.assertEqual(row['last_certificate_details']['reference'], original['reference'])
         self.assertEqual(second['certificate_no'], first['certificate_no'])
         current = self.source()
         for field in ('supplier', 'location', 'inward_date', 'reference', 'form6', 'items', 'certificate_weight'):
@@ -422,7 +456,7 @@ class ReviewAndEditTests(unittest.TestCase):
                 'expected_revision':workspace_revision(self.root),
                 'details':{'certificate_type':'standard', 'cod_no':'0425', 'cod_date':'2026-10-14'}}
         before = self.paths[0].read_bytes()
-        with self.assertRaisesRegex(ValueError, 'match the number printed'):
+        with self.assertRaisesRegex(ValueError, 'match a number printed'):
             save_upload(self.root, web_app.BACKUP_DIR, body)
         body['details']['cod_no'] = '0424'
         with patch.object(web_app.WorkbookSession, '_persist', side_effect=OSError('Excel is busy')):
@@ -570,6 +604,177 @@ class ReviewAndEditTests(unittest.TestCase):
         self.assertEqual(self.source()['issued'], 'Generated')
         self.assertIn('request could not be updated', result['state']['setup_warning'])
         self.assertEqual(len(list((self.root / 'Certificates').rglob('*.pdf'))), 1)
+
+    def issue_two_material_certificate(self):
+        from openpyxl import load_workbook
+        book = load_workbook(self.paths[0])
+        sheet = book.active
+        sheet['E3'] = 'Monitors'
+        sheet['F3'] = 1
+        sheet['G3'] = 4
+        sheet['H3'] = 4
+        book.save(self.paths[0]); book.close()
+        issued_details = web_app.editor_details(self.source())
+        self.assertEqual(len(issued_details['items']), 2)
+        self.assertEqual(self.create(self.reviewed())['created'], 1)
+        return latest_issuance(self.root, 'workbook', 'plant1', '1001')
+
+    def edit_workbook_after_issue(self):
+        from datetime import date
+        from openpyxl import load_workbook
+        book = load_workbook(self.paths[0]); sheet = book.active
+        sheet['B2'] = date(2026, 8, 18)
+        sheet['C2'] = 'Edited company name'
+        sheet['D2'] = 'Edited site'
+        sheet['E2'] = 'Edited material'
+        sheet['F2'] = 4
+        sheet['G2'] = 2
+        sheet['H2'] = 8
+        sheet['I2'] = 'F6-EDITED'
+        sheet['J2'] = 'REF-EDITED'
+        for column in 'EFGH': sheet[f'{column}3'] = None
+        book.save(self.paths[0]); book.close()
+
+    def issued_change_payload(self, action, *, revision=None):
+        return {'action':action, 'plant':'plant1', 'sn':'1001',
+                'expected_revision':revision or workspace_revision(self.root)}
+
+    def test_change_comparison_normalizes_dates_and_numbers_but_shows_zero_and_all_material_changes(self):
+        from issued_detail_changes import compare_details
+        current = {'inward_date':'01/09/26', 'supplier':'  Acme   Ltd ',
+                   'items':[{'item':'Asset', 'quantity':'2.0', 'per_piece_weight':'0', 'weight':'0'}]}
+        issued = {'inward_date':'2026-09-01', 'supplier':'Acme Ltd',
+                  'items':[{'item':'Asset', 'quantity':2, 'per_piece_weight':1, 'weight':2}]}
+        changes = compare_details(current, issued)
+        self.assertEqual([change['field'] for change in changes], ['Materials and weights'])
+        self.assertIn('0 kg each', changes[0]['current'])
+        self.assertIn('Qty 2', changes[0]['current'])
+        self.assertEqual(compare_details({'inward_date':'1/9/26'}, {'inward_date':'2026-09-01'}), [])
+
+    def test_keep_marks_only_the_reviewed_values_and_does_not_touch_excel_status_or_pdf(self):
+        from certificate_core import read_batches
+        from issued_detail_changes import is_intentionally_kept
+        from openpyxl import load_workbook
+        from web_app import current_pdf_rows
+
+        receipt = self.issue_two_material_certificate()
+        web_app.complete_workbook_record({'plant':'plant1', 'sn':'1001',
+            'expected_revision':workspace_revision(self.root)})
+        self.edit_workbook_after_issue()
+        workbook_before = self.paths[0].read_bytes()
+        pdf_path = self.root / receipt['pdf_path']
+        pdf_before = pdf_path.read_bytes()
+        source = read_batches(self.paths[0])[0]
+        payload = self.issued_change_payload('keep')
+        result = web_app.resolve_issued_excel_changes(payload)
+
+        self.assertTrue(result['saved'])
+        self.assertEqual(result['action'], 'keep')
+        self.assertEqual(self.paths[0].read_bytes(), workbook_before)
+        self.assertEqual(pdf_path.read_bytes(), pdf_before)
+        saved = read_batches(self.paths[0])[0]
+        self.assertEqual((saved['issued'], saved['cod_no']), ('Completed', source['cod_no']))
+        self.assertTrue(is_intentionally_kept(self.root, receipt, web_app.editor_details(saved)))
+        row = dict(saved, plant='plant1', source_kind='workbook', sn='1001', certificate_status='Completed')
+        self.assertFalse(current_pdf_rows([row])[0]['excel_details_changed_since_issue'])
+
+        book = load_workbook(self.paths[0]); book.active['C2'] = 'Changed once more'; book.save(self.paths[0]); book.close()
+        changed_again = read_batches(self.paths[0])[0]
+        row = dict(changed_again, plant='plant1', source_kind='workbook', sn='1001', certificate_status='Completed')
+        self.assertTrue(current_pdf_rows([row])[0]['excel_details_changed_since_issue'])
+
+    def test_restore_puts_all_issued_values_back_and_preserves_completed_status_and_pdf(self):
+        from certificate_core import read_batches
+        from web_app import current_pdf_rows
+
+        receipt = self.issue_two_material_certificate()
+        web_app.complete_workbook_record({'plant':'plant1', 'sn':'1001',
+            'expected_revision':workspace_revision(self.root)})
+        self.edit_workbook_after_issue()
+        issued = web_app.editor_details(receipt['after'])
+        changed = web_app.editor_details(self.source())
+        self.assertGreaterEqual(len(web_app.compare_details(changed, issued)), 6)
+        pdf_path = self.root / receipt['pdf_path']
+        pdf_before = pdf_path.read_bytes()
+
+        result = web_app.resolve_issued_excel_changes(self.issued_change_payload('restore'))
+        restored = read_batches(self.paths[0])[0]
+        self.assertEqual(web_app.compare_details(restored, issued), [])
+        self.assertEqual(restored['issued'], 'Completed')
+        self.assertEqual(restored['cod_no'], receipt['cod'])
+        self.assertEqual(restored['cod_date'].isoformat(), issued['cod_date'])
+        self.assertEqual(len(restored['items']), 2)
+        self.assertEqual(pdf_path.read_bytes(), pdf_before)
+        self.assertEqual(result['action'], 'restore')
+        row = dict(restored, plant='plant1', source_kind='workbook', sn='1001', certificate_status='Completed')
+        self.assertFalse(current_pdf_rows([row])[0]['excel_details_changed_since_issue'])
+
+    def test_restore_preserves_pending_hdd_lifecycle_metadata(self):
+        from certificate_core import read_batches
+        from workbook_metadata import write_details
+
+        receipt = self.issue_two_material_certificate()
+        self.paths[0].write_bytes(write_details(self.paths[0].read_bytes(), 'Inward Register', '1001', {
+            '_recycling_completed':True, '_hdd_cod_no':'0777', '_hdd_cod_date':'2026-10-12'}))
+        self.edit_workbook_after_issue()
+        self.assertTrue(self.source()['recycling_completed'])
+
+        web_app.resolve_issued_excel_changes(self.issued_change_payload('restore'))
+        restored = read_batches(self.paths[0])[0]
+        self.assertEqual(restored['issued'], 'Generated')
+        self.assertTrue(restored['recycling_completed'])
+        self.assertEqual(restored['hdd_cod_no'], '0777')
+        self.assertEqual(restored['hdd_cod_date'], '2026-10-12')
+        self.assertEqual(web_app.compare_details(restored, web_app.editor_details(receipt['after'])), [])
+
+    def test_stale_review_and_duplicate_serial_fail_without_writing(self):
+        from openpyxl import load_workbook
+
+        self.issue_two_material_certificate()
+        stale_revision = workspace_revision(self.root)
+        self.edit_workbook_after_issue()
+        current_bytes = self.paths[0].read_bytes()
+        with self.assertRaisesRegex(ValueError, 'files changed'):
+            web_app.resolve_issued_excel_changes(self.issued_change_payload('restore', revision=stale_revision))
+        self.assertEqual(self.paths[0].read_bytes(), current_bytes)
+
+        book = load_workbook(self.paths[0]); book.active['A4'] = '1001'; book.save(self.paths[0]); book.close()
+        duplicate_bytes = self.paths[0].read_bytes()
+        with self.assertRaisesRegex(ValueError, 'missing or repeated'):
+            web_app.resolve_issued_excel_changes(self.issued_change_payload('keep'))
+        self.assertEqual(self.paths[0].read_bytes(), duplicate_bytes)
+
+    def test_restore_refuses_formula_source_cells_without_partial_write(self):
+        from openpyxl import load_workbook
+
+        receipt = self.issue_two_material_certificate()
+        book = load_workbook(self.paths[0]); book.active['C2'] = '=1+1'; book.save(self.paths[0]); book.close()
+        workbook_before = self.paths[0].read_bytes()
+        pdf_before = (self.root / receipt['pdf_path']).read_bytes()
+        with self.assertRaisesRegex(ValueError, 'formula'):
+            web_app.resolve_issued_excel_changes(self.issued_change_payload('restore'))
+        self.assertEqual(self.paths[0].read_bytes(), workbook_before)
+        self.assertEqual((self.root / receipt['pdf_path']).read_bytes(), pdf_before)
+        self.assertFalse((self.root / 'Data' / 'Issued Excel Change Reviews.json').exists())
+
+    def test_damaged_keep_notice_file_fails_open_and_can_be_replaced(self):
+        from certificate_core import read_batches
+        from issued_detail_changes import REVIEW_FILE
+        from web_app import current_pdf_rows
+
+        self.issue_two_material_certificate()
+        self.edit_workbook_after_issue()
+        review_path = self.root / REVIEW_FILE
+        review_path.parent.mkdir(parents=True, exist_ok=True)
+        review_path.write_text('{damaged json', encoding='utf-8')
+        source = read_batches(self.paths[0])[0]
+        row = dict(source, plant='plant1', source_kind='workbook', sn='1001', certificate_status='Generated')
+        self.assertTrue(current_pdf_rows([row])[0]['excel_details_changed_since_issue'])
+
+        web_app.resolve_issued_excel_changes(self.issued_change_payload('keep'))
+        saved = json.loads(review_path.read_text(encoding='utf-8'))
+        self.assertEqual(saved['version'], 1)
+        self.assertTrue(saved['reviews'])
 
 
 if __name__ == '__main__':

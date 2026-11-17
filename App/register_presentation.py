@@ -15,9 +15,9 @@ from openpyxl.utils.cell import column_index_from_string, get_column_letter
 from openpyxl.utils.datetime import to_excel
 
 from register_protection import externally_protected
-from certificate_core import parse_date, select_register
+from certificate_core import parse_date, read_batches, select_register
 from workbook_store import (_attributes, _date_style, _element, _ensure_status_validation,
-                            _patch_cell_styles, _set_cell, _sheet_member, register_content_width)
+                            _patch_cell_styles, _set_cell, _sheet_member)
 
 DATE_FORMAT = 'dd/mm/yy'
 MAX_ROW_HEIGHT = 409
@@ -42,16 +42,14 @@ def _set_attribute(fragment, key, value):
 
 
 def _wrapped_style(definition, prefix, *, top_left=False):
+    if not top_left:
+        return definition
     if definition.rstrip().endswith('/>'):
         definition = definition.rstrip()[:-2] + f'></{prefix}xf>'
     alignment = _element(definition, 'alignment').search(definition)
     value = alignment.group() if alignment else f'<{prefix}alignment/>'
-    if top_left:
-        value = _set_attribute(value, 'horizontal', 'left')
-        value = _set_attribute(value, 'vertical', 'top')
-    value = _set_attribute(value, 'wrapText', 1)
-    if _attributes(value).get('shrinkToFit') in ('true', '1'):
-        value = _set_attribute(value, 'shrinkToFit', 0)
+    value = _set_attribute(value, 'horizontal', 'left')
+    value = _set_attribute(value, 'vertical', 'top')
     if alignment:
         definition = definition[:alignment.start()] + value + definition[alignment.end():]
     else:
@@ -100,7 +98,9 @@ def _wrapped_lines(value, width, measure):
     return lines
 
 
-def _fit_wrapped_rows(xml, sheet, text_cells, normal_font):
+def _fit_wrapped_rows(xml, sheet, text_cells, normal_font, fit_rows):
+    if not fit_rows or not text_cells:
+        return xml
     default_height = sheet.sheet_format.defaultRowHeight or 15
     measure_digit = _font_measure(normal_font.name or 'Calibri', normal_font.sz or 11)
     digit_width = max(1, round(max(measure_digit(digit) for digit in '0123456789')))
@@ -116,7 +116,8 @@ def _fit_wrapped_rows(xml, sheet, text_cells, normal_font):
     heights = {}
     requirements = []
     for cell, value in text_cells:
-        if cell.alignment.text_rotation:
+        if (cell.row not in fit_rows or not cell.alignment.wrap_text
+                or cell.alignment.text_rotation):
             continue
         area = merges.get((cell.row, cell.column))
         last_col = area.max_col if area else cell.column
@@ -187,12 +188,22 @@ def _fit_wrapped_rows(xml, sheet, text_cells, normal_font):
     return xml[:section.start()] + ''.join(pieces) + xml[section.end():]
 
 
-def normalize_register_presentation(data, *, wrap_only=False, include_validation=False):
+def normalize_register_presentation(data, *, wrap_only=False, include_validation=False, fit_inward=None):
     book = load_workbook(BytesIO(data), data_only=False)
     try:
         sheet, header, cols = select_register(book)
         if externally_protected(sheet):
             return data
+        fit_rows = set()
+        if isinstance(fit_inward, (tuple, list)) and len(fit_inward) == 2:
+            fit_sheet, fit_case_id = fit_inward
+            matches = [batch for batch in read_batches(BytesIO(data))
+                       if batch.get('source_sheet') == fit_sheet
+                       and str(batch.get('case_id', '')).casefold() == str(fit_case_id).casefold()]
+            if len(matches) == 1:
+                first = int(matches[0]['source_row'])
+                count = max(1, len(matches[0].get('items') or []))
+                fit_rows = set(range(first, first + count))
         with ZipFile(BytesIO(data)) as archive:
             member = _sheet_member(archive, sheet.title)
             xml = archive.read(member).decode('utf-8')
@@ -231,7 +242,7 @@ def normalize_register_presentation(data, *, wrap_only=False, include_validation
                         # Parse the cached text, including numeric character references.
                         inner = cached.group().partition('>')[2].rpartition('<')[0]
                         value = ET.fromstring(f'<v>{inner}</v>').text
-                if isinstance(value, str) and value:
+                if isinstance(value, str) and value and cell.row in fit_rows:
                     text_cells.append((cell, value))
                 style_key = (int(attrs.get('s', 0)), is_date)
                 if style_key in style_ids:
@@ -246,8 +257,7 @@ def normalize_register_presentation(data, *, wrap_only=False, include_validation
                     definitions.append(definition)
                 ids[cell.coordinate] = style_ids[style_key] = known[definition]
             xml = _patch_cell_styles(xml, ids)
-            xml = _fit_wrapped_rows(xml, sheet, text_cells, book._fonts[0])
-            xml = _wrap_blank_columns(xml, sheet, header, definitions, known, prefix)
+            xml = _fit_wrapped_rows(xml, sheet, text_cells, book._fonts[0], fit_rows)
             if include_validation and 'issued' in cols:
                 status = get_column_letter(cols['issued'] + 1)
                 xml = _ensure_status_validation(xml, status, max(10000, sheet.max_row + 2000), header + 1)
@@ -266,53 +276,3 @@ def normalize_register_presentation(data, *, wrap_only=False, include_validation
             return output.getvalue()
     finally:
         book.close()
-
-
-def _wrap_blank_columns(xml, sheet, header, definitions, known, style_prefix):
-    """Use a wrapped column default for future direct entry into blank cells."""
-    width = register_content_width(sheet, header)
-    section = _element(xml, 'cols').search(xml)
-    prefix = _element(xml, 'sheetData').search(xml).group('p')
-    columns = {}
-    if section:
-        for match in _element(section.group(), 'col').finditer(section.group()):
-            fragment = match.group()
-            attrs = _attributes(fragment)
-            columns[int(attrs['min'])] = (int(attrs['max']), fragment)
-    additions = []
-    index = 1
-    for first, (last, fragment) in sorted(columns.items()):
-        if index < first and index <= width:
-            additions.append((index, min(first - 1, width), None))
-        additions.append((first, last, fragment))
-        index = max(index, last + 1)
-    if index <= width:
-        additions.append((index, width, None))
-    output = []
-    for first, last, fragment in additions:
-        if first > width:
-            output.append(fragment)
-            continue
-        if fragment and last > width:
-            output_fragment = _set_attribute(fragment, 'max', width)
-        else:
-            output_fragment = fragment
-        if not output_fragment:
-            output_fragment = f'<{prefix}col min="{first}" max="{min(last, width)}"/>'
-        original = definitions[int(_attributes(output_fragment).get('style', 0))]
-        definition = _wrapped_style(original, style_prefix)
-        if definition not in known:
-            known[definition] = len(definitions)
-            definitions.append(definition)
-        output.append(_set_attribute(output_fragment, 'style', known[definition]))
-        if fragment and last > width:
-            output.append(_set_attribute(fragment, 'min', width + 1))
-    if section and not section.group().rstrip().endswith('/>'):
-        original = section.group()
-        block = original[:original.index('>') + 1] + ''.join(output) + original[original.rfind('</'):]
-    else:
-        block = f'<{prefix}cols>{"".join(output)}</{prefix}cols>'
-    if section:
-        return xml[:section.start()] + block + xml[section.end():]
-    pos = _element(xml, 'sheetData').search(xml).start()
-    return xml[:pos] + block + xml[pos:]

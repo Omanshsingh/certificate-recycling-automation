@@ -157,8 +157,11 @@ class Report:
         age = (self.as_of - inward_date).days if inward_date else None
         state = batch.get("_effective_certificate_status", batch.get("issued", ""))
         reminder = dict(batch, inward_date=inward_date, _effective_certificate_status=state)
-        due = certificate_reminder_due(reminder, self.as_of, days=25)
+        due = (False if batch.get('recycling_completed') else
+               certificate_reminder_due(reminder, self.as_of, days=25))
         status = status_value(state)
+        if batch.get('recycling_completed') and status in {'generated', 'generated_manual'}:
+            detail = 'Recycling has been sent; the requested Data Destruction certificate is still pending.'
         date_warning = {
             "missing": "Missing inward date; check the date in Excel.",
             "invalid": "Invalid inward date; check the date in Excel.",
@@ -204,6 +207,8 @@ class Report:
             "hdd_cod_no": batch.get('hdd_cod_no', ''),
             "certificate_date": parse_date(batch.get("cod_date")).isoformat() if parse_date(batch.get("cod_date")) else "",
             "certificate_status": status,
+            "recycling_completed_pending_hdd": bool(batch.get('recycling_completed'))
+                and status_value(state) in {'generated', 'generated_manual'},
             'pdf_filename': batch.get('pdf_filename', ''),
             'pdf_relative_path': batch.get('pdf_relative_path', ''),
             "inward_date": inward_date.isoformat() if inward_date else "",

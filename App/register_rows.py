@@ -7,11 +7,49 @@ from zipfile import ZipFile
 
 from openpyxl import load_workbook
 from openpyxl.formula.tokenizer import Tokenizer
-from openpyxl.utils.cell import range_boundaries, get_column_letter
+from openpyxl.utils.cell import range_boundaries, get_column_letter, coordinate_to_tuple
 
 from register_protection import externally_protected
 from certificate_core import select_register
 from workbook_store import _attributes, _element, _sheet_member
+
+
+def expanded_shared_formulas(xml, sheet):
+    """Return openpyxl-expanded formulas for complete Excel shared-formula groups."""
+    groups, ranges = {}, {}
+    for cell_match in _element(xml, 'c').finditer(xml):
+        cell_xml = cell_match.group()
+        coordinate = _attributes(cell_xml).get('r')
+        formula_match = _element(cell_xml, 'f').search(cell_xml)
+        if not coordinate or not formula_match:
+            continue
+        attrs = _attributes(formula_match.group())
+        if attrs.get('t') != 'shared':
+            continue
+        index = attrs.get('si')
+        if index is None:
+            raise ValueError('An Excel shared formula has no group number. Check it in Excel before moving rows.')
+        groups.setdefault(index, []).append(coordinate)
+        if attrs.get('ref'):
+            ranges.setdefault(index, []).append(attrs['ref'])
+
+    expanded = {}
+    for index, members in groups.items():
+        refs = ranges.get(index, [])
+        if len(refs) != 1:
+            raise ValueError('An Excel shared formula group is incomplete. Check it in Excel before moving rows.')
+        left, top, right, bottom = range_boundaries(refs[0])
+        expected = (right - left + 1) * (bottom - top + 1)
+        positions = [coordinate_to_tuple(cell) for cell in members]
+        if (len(set(members)) != expected or any(not (top <= row <= bottom and left <= column <= right)
+                                                for row, column in positions)):
+            raise ValueError('An Excel shared formula group is incomplete. Check it in Excel before moving rows.')
+        for coordinate in members:
+            value = sheet[coordinate].value
+            if not isinstance(value, str) or not value.startswith('='):
+                raise ValueError(f'Excel could not expand the shared formula at {coordinate}. Check it before moving rows.')
+            expanded[coordinate] = value
+    return expanded
 
 
 def compact_register_gaps(data, *, source_rows=None):
@@ -46,7 +84,7 @@ def compact_register_gaps(data, *, source_rows=None):
         updated = data
         try:
             for first, last in reversed(groups):
-                updated = shift_register_rows(updated, first, last - first + 1, delete=True)
+                updated = shift_register_rows(updated, first, last - first + 1, delete=True, expand_shared=True)
         except ValueError as exc:
             raise UnsupportedReorderError(f'Empty row cleanup needs review in Excel: {exc}') from exc
         def facts(rows):
@@ -90,7 +128,7 @@ def ensure_material_capacity(data, sn, required):
         scalar_cols = set(range(1, sheet.max_column + 1)) - {cols[k] + 1 for k in ('item', 'quantity', 'per_piece_weight', 'weight') if k in cols}
         if batch.get('hdd_cod_no'):
             scalar_cols -= {cols[k] + 1 for k in ('cod_no', 'cod_date') if k in cols}
-        shifted = shift_register_rows(data, insert_at, count)
+        shifted = shift_register_rows(data, insert_at, count, expand_shared=True)
         with ZipFile(BytesIO(shifted)) as archive:
             member = _sheet_member(archive, sheet.title)
             xml = archive.read(member).decode('utf-8')
@@ -127,8 +165,8 @@ def ensure_material_capacity(data, sn, required):
         book.close()
 
 
-def shift_register_rows(data, first, count, *, delete=False, expand_shared=False):
-    """Insert blank rows or remove a complete block and shift everything below it."""
+def shift_register_rows(data, first, count, *, delete=False, expand_shared=True):
+    """Insert or remove rows, expanding complete shared formulas without losing calculations."""
     last = first + count - 1
     book = load_workbook(BytesIO(data), data_only=False)
     try:
@@ -186,6 +224,7 @@ def shift_register_rows(data, first, count, *, delete=False, expand_shared=False
                 raise ValueError('This workbook has macros. Move its rows in Excel instead.')
             member = _sheet_member(archive, sheet.title)
             xml = archive.read(member).decode('utf-8')
+            shared_values = expanded_shared_formulas(xml, sheet) if expand_shared else {}
             if any((attrs := _attributes(match.group())) and not (expand_shared and attrs.get('t') == 'shared')
                    for match in _element(xml, 'f').finditer(xml)):
                 raise ValueError('This workbook has shared calculations or other special formulas. Move its rows in Excel instead.')
@@ -215,13 +254,14 @@ def shift_register_rows(data, first, count, *, delete=False, expand_shared=False
                     coordinate = _attributes(cell_xml)['r']
 
                     def patch_cell_formula(formula_match):
-                        if _attributes(formula_match.group()).get('t') != 'shared':
+                        formula_xml = formula_match.group()
+                        formula_attrs = _attributes(formula_xml)
+                        if formula_attrs.get('t') != 'shared':
                             return patch_formula(formula_match)
-                        # openpyxl expands each shared formula at its original
-                        # cell. Write the moved formulas independently so the
-                        # group can safely span the inserted/deleted rows.
-                        value = sheet[coordinate].value
-                        if not isinstance(value, str) or not value.startswith('=') or len(value) == 1:
+                        # Split a complete shared group into independent,
+                        # row-adjusted formulas so Excel retains its calculations.
+                        value = shared_values.get(coordinate)
+                        if not value:
                             raise ValueError(f'Excel could not expand the shared formula at {coordinate}. Check it before moving rows.')
                         prefix = formula_match.group('p')
                         return f'<{prefix}f>{escape(formula(value))}</{prefix}f>'

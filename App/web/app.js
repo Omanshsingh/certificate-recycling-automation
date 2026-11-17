@@ -1,9 +1,9 @@
 const $ = (selector, parent = document) => parent.querySelector(selector);
 const app = { state: { rows: [] }, settings: {}, filtered: [], templates: [], templatesLoaded: false,
-  editor: null, materialRows: [], page: 1, savedFilesPage: 1, workspaceView: 'records', previewRevision: 0, detailsBusy: false, pendingConfirmation: null, toastTimer: null, savedFileEntry: null };
+  editor: null, materialRows: [], page: 1, savedFilesPage: 1, workspaceView: 'records', previewRevision: 0, detailsBusy: false, destructionChoicePending: false, pendingConfirmation: null, toastTimer: null, savedFileEntry: null };
 const templateNames = { standard: 'Recycling', sita: 'International', siemens: 'Medical', destruction: 'Data Destruction' };
 const commonTemplateKeys = new Set(['supplier', 'location', 'inward_date', 'certificate_weight', 'form6', 'reference', 'cod_no', 'cod_date']);
-const revisionEndpoints = new Set(['/api/create', '/api/generate', '/api/manual/save', '/api/manual/generate', '/api/manual/complete', '/api/complete', '/api/backup/restore', '/api/clients/add', '/api/clients/update', '/api/clients/followup', '/api/clients/remove-preview', '/api/clients/remove', '/api/destruction/request']);
+const revisionEndpoints = new Set(['/api/create', '/api/generate', '/api/manual/save', '/api/manual/generate', '/api/manual/complete', '/api/complete', '/api/backup/restore', '/api/clients/add', '/api/clients/update', '/api/clients/followup', '/api/clients/resolve-issued-changes', '/api/clients/remove-preview', '/api/clients/remove', '/api/destruction/request']);
 const followupFields = {comments:'Comments', transporter_details:'Transporter / vehicle details', docket_vehicle_no:'Docket no. / vehicle no.', weight_slip_scale:'Weight slip / scale weight'};
 revisionEndpoints.add('/api/entries/delete-preview'); revisionEndpoints.add('/api/entries/delete');
 revisionEndpoints.add('/api/entries/undo-delete');
@@ -87,6 +87,194 @@ function validDate(year, month, day) {
   const date = new Date(year, month - 1, day);
   if (date.getFullYear() !== year || date.getMonth() + 1 !== month || date.getDate() !== day) return '';
   return `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+}
+
+function issuedExcelDetailsChanged(current, issued) {
+  if (!current || !issued) return false;
+  const comparable = (value, key = '') => {
+    const raw = String(value ?? '').trim().replace(/\s+/g, ' ');
+    if (!raw) return '';
+    if (key === 'inward_date') return normalizeDate(raw) || raw;
+    const numeric = raw.replace(/,/g, '');
+    if (/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$/.test(numeric)) return String(Number(numeric));
+    return raw;
+  };
+  const fields = ['supplier', 'location', 'inward_date', 'form6', 'reference',
+    'comments', 'transporter_details', 'docket_vehicle_no', 'weight_slip_scale'];
+  if (fields.some(key => comparable(current[key], key) !== comparable(issued[key], key))) return true;
+  const materials = value => (Array.isArray(value) ? value : [])
+    .filter(item => item && typeof item === 'object' && Object.values(item).some(field => String(field ?? '').trim()))
+    .map(item => ['item', 'quantity', 'per_piece_weight', 'weight'].map(key => comparable(item[key], key)));
+  return JSON.stringify(materials(current.items)) !== JSON.stringify(materials(issued.items));
+}
+
+function beginIssuedCertificateCorrection() {
+  if (!app.editor || app.detailsBusy || app.generationBusy) return;
+  setEditorMode(true);
+  $('#details-form').elements.namedItem('supplier').focus();
+}
+
+function appendIssuedValueDiff(lineNode, issuedLine, currentLine, side) {
+  const before = String(issuedLine ?? '');
+  const after = String(currentLine ?? '');
+  if (issuedLine === undefined || currentLine === undefined) {
+    const segment = side === 'issued' ? before : after;
+    lineNode.append(segment
+      ? element(side === 'issued' ? 'del' : 'mark', `issued-change-diff issued-change-diff-${side}`, segment)
+      : element('span', 'issued-change-empty', 'Not present'));
+    return;
+  }
+  if (before === after) {
+    lineNode.append(element('span', 'issued-change-unchanged', before));
+    return;
+  }
+
+  let prefix = 0;
+  while (prefix < before.length && prefix < after.length && before[prefix] === after[prefix]) prefix++;
+  let suffix = 0;
+  while (suffix < before.length - prefix && suffix < after.length - prefix
+      && before[before.length - 1 - suffix] === after[after.length - 1 - suffix]) suffix++;
+  if (!prefix && !suffix) {
+    lineNode.append(element(side === 'issued' ? 'del' : 'mark', `issued-change-diff issued-change-diff-${side}`, side === 'issued' ? before : after));
+    return;
+  }
+
+  while (prefix > 0 && !/\s/.test(before[prefix - 1]) && !/\s/.test(after[prefix - 1])) prefix--;
+  let beforeEnd = before.length - suffix;
+  let afterEnd = after.length - suffix;
+  while (beforeEnd < before.length && afterEnd < after.length
+      && !/\s/.test(before[beforeEnd]) && !/\s/.test(after[afterEnd])) {
+    beforeEnd++;
+    afterEnd++;
+  }
+  const left = side === 'issued' ? before : after;
+  const end = side === 'issued' ? beforeEnd : afterEnd;
+  const tail = side === 'issued' ? before.slice(beforeEnd) : after.slice(afterEnd);
+  if (prefix) lineNode.append(element('span', 'issued-change-unchanged', left.slice(0, prefix)));
+  lineNode.append(element(side === 'issued' ? 'del' : 'mark', `issued-change-diff issued-change-diff-${side}`, left.slice(prefix, end)));
+  if (tail) lineNode.append(element('span', 'issued-change-unchanged', tail));
+}
+
+function renderIssuedChangeValue(value, counterpart, side) {
+  const node = element('div', 'issued-change-value');
+  const lines = String(value ?? '(blank)').split('\n');
+  const issuedLines = String(side === 'issued' ? value : counterpart ?? '(blank)').split('\n');
+  const currentLines = String(side === 'current' ? value : counterpart ?? '(blank)').split('\n');
+  const count = Math.max(lines.length, issuedLines.length, currentLines.length);
+  for (let index = 0; index < count; index++) {
+    const line = element('div', 'issued-change-line');
+    appendIssuedValueDiff(line, issuedLines[index], currentLines[index], side);
+    node.append(line);
+  }
+  return node;
+}
+
+function renderIssuedChangeReview(changes) {
+  const container = $('#issued-change-preview');
+  container.replaceChildren();
+  const list = element('div', 'issued-change-list');
+  for (const change of changes) {
+    const card = element('section', 'issued-change-card');
+    card.setAttribute('aria-label', `${change.field || 'Details'} changed`);
+    const heading = element('div', 'issued-change-heading');
+    heading.append(element('h3', 'issued-change-field', change.field || 'Details changed'),
+      element('span', 'issued-change-badge', 'Changed'));
+    const values = element('div', 'issued-change-values');
+    for (const [side, label, value, counterpart] of [
+      ['issued', 'Issued value', change.issued, change.current],
+      ['current', 'Excel now', change.current, change.issued],
+    ]) {
+      const panel = element('div', `issued-change-value-panel issued-change-value-${side}`);
+      panel.append(element('span', 'issued-change-value-label', label),
+        renderIssuedChangeValue(value, counterpart, side));
+      values.append(panel);
+    }
+    card.append(heading, values);
+    list.append(card);
+  }
+  container.append(list);
+}
+
+function openIssuedChangeReview() {
+  const editor = app.editor;
+  const changes = editor?.issuedChangePreview;
+  if (!editor || !Array.isArray(changes) || !changes.length || app.detailsBusy || app.generationBusy) return;
+  renderIssuedChangeReview(changes);
+  $('#issued-change-error').hidden = true;
+  $('#issued-change-review-modal').showModal();
+}
+
+function refreshIssuedChangeReview(row) {
+  if (!row || row.plant !== app.editor?.sourcePlant || String(row.sn) !== String(app.editor?.sourceSn)) return;
+  app.editor.sourceRow = row;
+  app.editor.issuedChangePreview = Array.isArray(row.excel_change_preview) ? row.excel_change_preview : [];
+  if (!app.editor.issuedChangePreview.length) {
+    $('#issued-change-review-modal').close();
+    $('#edit-issued-certificate').hidden = true;
+    return;
+  }
+  renderIssuedChangeReview(app.editor.issuedChangePreview);
+}
+
+async function resolveIssuedExcelChanges(action) {
+  const editor = app.editor;
+  if (!editor || app.issuedChangeBusy || !['restore', 'keep'].includes(action)) return;
+  const errorNode = $('#issued-change-error');
+  errorNode.hidden = true;
+  app.issuedChangeBusy = true;
+  for (const id of ['issued-change-restore', 'issued-change-keep']) $(`#${id}`).disabled = true;
+  try {
+    const response = await api('/api/clients/resolve-issued-changes', {
+      action, plant:editor.sourcePlant, sn:String(editor.sourceSn),
+    });
+    if (response.state) setState(response.state);
+    const details = response.source_details || {};
+    const refreshedRow = response.state?.rows?.find(row => row.source_kind !== 'manual'
+      && row.plant === editor.sourcePlant && String(row.sn) === String(editor.sourceSn));
+    if (refreshedRow) {
+      editor.sourceRow = refreshedRow;
+      editor.excelBaseline = workbookRowPayload(refreshedRow);
+      editor.excelCertificateWeight = refreshedRow.certificate_weight ?? '';
+    }
+    if (action === 'restore') {
+      for (const key of ['supplier','location','inward_date','form6','reference','comments',
+        'transporter_details','docket_vehicle_no','weight_slip_scale']) {
+        if (editor.touched?.has(key)) continue;
+        const input = $('#details-form').elements.namedItem(key);
+        if (input && Object.hasOwn(details, key)) {
+          const value = key === 'inward_date' && normalizeDate(details[key]) ? dateLabel(details[key]) : details[key];
+          input.value = value ?? '';
+        }
+      }
+      const baseline = JSON.parse(JSON.stringify(editor.baseline || {}));
+      baseline.details ||= {};
+      for (const key of ['supplier','location','inward_date','form6','reference','comments',
+        'transporter_details','docket_vehicle_no','weight_slip_scale']) {
+        if (Object.hasOwn(details, key)) baseline.details[key] = details[key] ?? '';
+      }
+      if (Array.isArray(details.items)) baseline.details.items = details.items;
+      editor.baseline = baseline;
+      renderMaterialRows(Array.isArray(details.items) && !editor.touched?.has('items') ? details.items : materialValues());
+      renderEditorSummary();
+      invalidatePreview();
+      schedulePreview({initial:true});
+    }
+    editor.issuedChangePreview = [];
+    $('#edit-issued-certificate').hidden = true;
+    $('#issued-change-review-modal').close();
+    toast(action === 'restore' ? 'Issued details restored in Excel.' : 'Current Excel values kept intentionally.');
+  } catch (error) {
+    const row = (app.state.rows || []).find(item => item.source_kind !== 'manual'
+      && item.plant === editor.sourcePlant && String(item.sn) === String(editor.sourceSn));
+    if (error.workspaceChanged && row) refreshIssuedChangeReview(row);
+    errorNode.textContent = error.workspaceChanged && row
+      ? 'Excel changed while this review was open. The comparison has been refreshed; review it again before choosing.'
+      : error.message;
+    errorNode.hidden = false;
+  } finally {
+    app.issuedChangeBusy = false;
+    for (const id of ['issued-change-restore', 'issued-change-keep']) $(`#${id}`).disabled = false;
+  }
 }
 
 function element(tag, className, value) {
@@ -291,7 +479,9 @@ async function saveClient() {
       && String(item.sn) === String(response.client.sn));
     const next = response.client.status === 'na' ? 'No certificate needed.'
       : row && readyForBatch(row) ? 'Ready to create a certificate.' : 'Open Review & edit to finish the certificate details.';
-    toast(`${response.client.supplier} added to ${labelPlant(response.client.plant)}. ${next}`);
+    const orderNote = response.order_warning
+      ? ' Excel kept its current row order; sort dates in Excel if needed.' : '';
+    toast(`${response.client.supplier} added to ${labelPlant(response.client.plant)}. ${next}${orderNote}`);
   } catch (error) {
     if (error.clientRequestEnded) {
       app.clientRequestId = null;
@@ -451,11 +641,13 @@ function hasWarnings(row) {
 function needsAttention(row) {
   const state = stateOf(row);
   return Boolean(row.destruction_pending) || ['alert', 'blank', 'unknown'].includes(state)
+    || Boolean(row.recycling_completed_pending_hdd)
     || (state === 'ready' && hasWarnings(row))
     || Boolean(row.system_alert) || Boolean(row.reminder_due);
 }
 function stateLabel(row) {
   const state = stateOf(row);
+  if (row.recycling_completed_pending_hdd) return 'Recycling sent';
   if (state === 'blank') return '';
   if (state === 'ready' && hasWarnings(row)) return 'Needs attention';
   return ({ ready: 'Ready', alert: 'Needs attention', draft: 'Draft', generated: 'Generated', generated_manual: 'Generated Externally', completed: 'Completed', na: 'N/A', unknown: 'Needs attention' })[state] || 'Needs attention';
@@ -756,6 +948,7 @@ function renderWarningList(list, warnings, compact = false) {
 
 function nextStep(row) {
   if (recordIdentityIssue(row)) return recordIdentityIssue(row);
+  if (row.recycling_completed_pending_hdd) return 'Recycling has been sent. Complete the requested Data Destruction certificate to finish this inward.';
   const destructionAction = destructionFollowupAction(row);
   if (destructionAction) return destructionAction;
   switch (stateOf(row)) {
@@ -1385,7 +1578,17 @@ function updateUploadSelection() {
   const local = mode === 'local';
   const company = $('#upload-company-fields');
   company.disabled = company.hidden = !local && !row;
-  $('#upload-detail-scope').hidden = company.hidden;
+  const viewOnlyClientDetails = !local && Boolean(row);
+  const scope = $('#upload-detail-scope');
+  scope.hidden = !viewOnlyClientDetails;
+  scope.textContent = 'Client details are shown from the inward. To change them, use Review & edit.';
+  company.querySelector('legend').textContent = viewOnlyClientDetails ? 'Client details' : 'Certificate details';
+  for (const name of uploadDetailFields) {
+    const field = form.elements.namedItem(name);
+    if (!field) continue;
+    field.readOnly = viewOnlyClientDetails;
+    field.setAttribute('aria-readonly', String(viewOnlyClientDetails));
+  }
   const rowKey = JSON.stringify([mode, uploadInwardPicker.selection()]);
   if (row && rowKey !== uploadDetailDraft?.rowKey && !app.uploadTypeExplicit) {
     type.value = templateId(row);
@@ -1438,7 +1641,7 @@ function updateUploadCod() {
     const cod = row?.certificate_no || '';
     input.value = cod;
     input.readOnly = true;
-    hint.textContent = cod ? 'The replacement PDF must use this COD.' : 'Choose the existing certificate first.';
+    hint.textContent = cod ? 'The replacement must keep this existing COD.' : 'Choose the existing certificate first.';
     return;
   }
   const form = $('#upload-certificate-form');
@@ -1446,17 +1649,17 @@ function updateUploadCod() {
   if (!upload) {
     input.readOnly = true;
     input.value = existing || '';
-    hint.textContent = existing ? 'Using the inward’s existing COD.' : 'Choose a PDF to check its COD.';
+    hint.textContent = existing ? 'Using the inward’s existing COD.' : 'Choose a PDF to read its printed COD.';
     return;
   }
-  const editable = !upload.ambiguous_cod && !upload.cod && !existing;
+  const editable = !upload.cod && !existing;
   input.readOnly = !editable;
-  input.value = upload.ambiguous_cod ? '' : upload.cod || existing || upload.manualCod || upload.filename_cod || '';
-  input.placeholder = editable ? app.state.numbering?.next_cod || 'Assigned automatically' : 'Assigned automatically';
-  hint.textContent = upload.ambiguous_cod ? 'The first page has multiple CODs. Choose a PDF with one certificate number.'
+  input.value = upload.cod || existing || upload.manualCod || upload.filename_cod || '';
+  input.placeholder = editable ? 'Enter the COD printed on the PDF' : 'Read from PDF';
+  hint.textContent = upload.ambiguous_cod ? 'The PDF text has more than one possible COD. Enter the number beside “Certificate No.”; this records it but does not assign a new number.'
     : upload.cod ? 'Read from the PDF.'
     : existing ? 'Using the inward’s existing COD.'
-    : 'Enter the COD printed on the file, or leave blank to assign the next available number.';
+    : 'Enter the COD printed on this certificate. This records its existing number; the app will not assign one.';
 }
 
 function openUploadCertificate({entry = null, replacement = null} = {}) {
@@ -1563,13 +1766,9 @@ async function saveUploadedCertificate(event) {
   const cod = $('#upload-cod');
   if (!replace && !cod.readOnly && cod.value.trim()) details.cod_no = cod.value.trim();
   if (mode !== 'local' && !selected) return;
-  const certificateEdits = {};
-  if (selected) {
-    for (const name of uploadDetailFields) {
-      if (name in details) certificateEdits[name] = details[name];
-      delete details[name];
-    }
-  }
+  // Attached-client details are a read-only reference. Corrections belong in
+  // Review & edit, where the app can save them back to the right inward.
+  if (selected) for (const name of uploadDetailFields) delete details[name];
   const error = $('#upload-certificate-error');
   error.hidden = true;
   app.uploadingCertificate = true;
@@ -1580,7 +1779,6 @@ async function saveUploadedCertificate(event) {
       token:upload.token, details,
       inward:mode === 'workbook' && !replace ? selected : null,
       replacement:replace ? selected : null,
-      ...(Object.keys(certificateEdits).length ? {certificate_edits:certificateEdits} : {}),
     });
     setState(saved.state);
     $('#upload-certificate-modal').close();
@@ -2051,6 +2249,7 @@ function destructionFollowupAction(row) {
 function attentionReason(row) {
   const state = stateOf(row);
   if (recordIdentityIssue(row)) return attentionWarning(recordIdentityIssue(row));
+  if (row.recycling_completed_pending_hdd) return 'Recycling has been sent; Data Destruction is still pending.';
   const destructionAction = destructionFollowupAction(row);
   if (destructionAction) return destructionAction;
   if (Number.isFinite(row.age_days) && row.age_days < 0) return 'Received date is in the future. Check the date.';
@@ -2077,6 +2276,10 @@ function makeStatus(row) {
   td.append(status);
   if ($('#status-filter').value === 'needs_attention') {
     td.append(element('small', 'age-note attention-reason', attentionReason(row)));
+    return td;
+  }
+  if (row.recycling_completed_pending_hdd) {
+    td.append(element('small', 'age-note', 'Data Destruction is still pending'));
     return td;
   }
   const destruction = destructionFollowup(row);
@@ -2155,7 +2358,9 @@ function makeActions(row, index) {
       link.addEventListener('click', () => openCertificateLocally(row.pdf_relative_path || row.pdf_filename));
       link.setAttribute('aria-label', `Open PDF for ${row.supplier || 'this company'}`);
       wrap.append(link);
-      if (stateOf(row) !== 'completed') wrap.append(actionButton('Mark Completed', 'complete', index));
+      if (stateOf(row) !== 'completed') wrap.append(actionButton(
+        row.recycling_completed_pending_hdd ? 'Undo Completed' : 'Mark Completed',
+        row.recycling_completed_pending_hdd ? 'undo-completed' : 'complete', index));
     } else wrap.append(actionButton('Review & edit', 'edit-details', index));
   }
   else if (['generated', 'generated_manual'].includes(stateOf(row))) wrap.append(actionButton('Review & edit', 'edit-details', index, true));
@@ -2166,7 +2371,11 @@ function makeActions(row, index) {
     if (!wrap.children.length || ![...wrap.children].some(button => button.dataset.action === 'edit-details')) {
       wrap.append(actionButton('Review & edit', 'edit-details', index));
     }
-    if (stateOf(row) === 'completed') wrap.append(actionButton('Undo Completed', 'undo-completed', index));
+    if (stateOf(row) === 'completed' || row.recycling_completed_pending_hdd) {
+      if (![...wrap.children].some(button => button.dataset.action === 'undo-completed')) {
+        wrap.append(actionButton('Undo Completed', 'undo-completed', index));
+      }
+    }
   }
   if (canSetPrimaryCertificateStatus(row) || (isManual(row) && row.record_id && !recordIdentityIssue(row) && !certificateWasGenerated(row))) {
     const state = stateOf(row);
@@ -2546,7 +2755,7 @@ function updateAnnexureDisplay() {
   const attachment = app.editor.annexures[values._annexure] || app.attachments?.[values._annexure];
   const name = $('#annexure-name');
   name.hidden = !values._annexure;
-  name.textContent = attachment ? `${attachment.name}${attachment.pages != null ? ` · ${attachment.pages} page${attachment.pages === 1 ? '' : 's'}` : ''}` : 'A PDF list is attached.';
+  name.textContent = attachment ? `${attachment.name}${attachment.pages != null ? ` · ${attachment.pages} page${attachment.pages === 1 ? '' : 's'}` : ''}` : 'Additional pages are attached.';
   $('#remove-annexure').hidden = !values._annexure;
 }
 
@@ -2554,7 +2763,7 @@ async function pickAnnexure() {
   if (app.detailsBusy) return;
   captureTemplateFields();
   setDetailsBusy(true);
-  setBusy(true, 'Choose a PDF list…', 'The Windows file picker will open.');
+  setBusy(true, 'Add certificate pages…', 'The Windows file picker will open.');
   try {
     // The picker must validate this snapshot before saving the attachment.
     // Its returned revision covers that attachment as well as the source data.
@@ -2826,53 +3035,63 @@ function updateDestructionChoice(payload = null) {
   const editor = app.editor;
   const linkedRequestEditor = editor?.template === 'destruction' && Boolean(editor.destructionSource);
   const available = ((editor?.sourceSn != null || editor?.localInwardId) && editor.template !== 'destruction') || linkedRequestEditor;
-  $('#destruction-needed-card').hidden = !available;
-  $('#destruction-needed-label').textContent = linkedRequestEditor
-    ? 'Keep this Data Destruction request active' : 'Data Destruction needed';
-  const checkbox = $('#destruction-needed');
   const request = available ? editorDestructionRequest() : null;
+  const requested = Boolean(request && request.destruction_requested !== false);
   const issued = Boolean(request && certificateWasGenerated(request));
-  $('#destruction-request-toggle').hidden = issued;
-  $('#destruction-issued-label').hidden = !issued;
-  checkbox.disabled = !available || issued || Boolean(editor?.identityIssue) || Boolean(linkedRequestEditor && !request);
-  if (request && (issued || editor.destructionChoiceRecordId !== request.record_id)) {
-    checkbox.checked = request.destruction_requested !== false;
-    editor.destructionChoiceRecordId = request.record_id;
+  $('#destruction-needed-card').hidden = !available || linkedRequestEditor;
+  const checkbox = $('#destruction-needed');
+  const existingRequest = requested || issued || linkedRequestEditor;
+  $('#destruction-request-toggle').hidden = linkedRequestEditor;
+  $('#destruction-issued-label').hidden = true;
+  $('#destruction-needed-label').textContent = issued ? 'Data Destruction certificate created'
+    : requested ? 'Data Destruction request added' : 'Add Data Destruction certificate';
+  // The server validates the live workbook identity when the user confirms.
+  // A cached identity warning must not make this reversible request control a dead end.
+  checkbox.disabled = app.destructionChoicePending || !available || existingRequest;
+  if (!app.destructionChoicePending) {
+    if (request && (issued || editor.destructionChoiceRecordId !== request.record_id)) {
+      checkbox.checked = requested || issued;
+      editor.destructionChoiceRecordId = request.record_id;
+    } else if (!request) {
+      checkbox.checked = false;
+    }
   }
   const inward = available ? editorInwardRow() : null;
   const primaryCard = $('#primary-certificate-needed-card');
   if (primaryCard) {
-    primaryCard.hidden = !inward || templateId(inward) === 'destruction' || !canSetPrimaryCertificateStatus(inward);
-    if (!primaryCard.hidden) {
-      const label = templateLabel(inward);
-      const needed = stateOf(inward) !== 'na' && !editor.pendingPrimaryNa;
-      if (!editor.savingPrimaryChoice) $('#primary-certificate-needed').checked = needed;
-      $('#primary-certificate-needed-label').textContent = `${label} certificate needed`;
-      $('#primary-certificate-needed-status').textContent = editor.pendingPrimaryNa
-        ? `Save to mark ${label} N/A and keep the inward.` : needed
-        ? `Uncheck to skip ${label}. The inward and any HDD request are kept.`
-        : `Check to return ${label} to certificate review.`;
+    const canRestorePrimary = inward && canSetPrimaryCertificateStatus(inward);
+    const primaryIssued = inward && certificateWasGenerated(inward);
+    const showPrimary = linkedRequestEditor && inward && (canRestorePrimary || primaryIssued);
+    primaryCard.hidden = !showPrimary;
+    if (showPrimary) {
+      const addPrimary = canRestorePrimary && stateOf(inward) === 'na';
+      $('#primary-certificate-needed-toggle').hidden = false;
+      $('#primary-certificate-existing-label').hidden = true;
+      $('#primary-certificate-needed').disabled = !addPrimary || Boolean(editor.identityIssue);
+      $('#primary-certificate-needed').checked = !addPrimary;
+      $('#primary-certificate-needed-label').textContent = addPrimary ? `Add ${templateLabel(inward)} certificate`
+        : primaryIssued ? `${templateLabel(inward)} certificate created` : `${templateLabel(inward)} certificate needed`;
+      $('#primary-certificate-needed-status').textContent = addPrimary
+        ? `Confirm to return ${templateLabel(inward)} to certificate review.`
+        : primaryIssued ? 'The certificate is already created.' : 'This certificate is active in the client list.';
     }
   }
   const companion = $('#open-companion-certificate');
-  companion.hidden = !inward || Boolean(editor?.identityIssue);
+  const companionFooter = $('#companion-certificate-footer');
+  const companionNeeded = linkedRequestEditor ? Boolean(inward && stateOf(inward) !== 'na') : requested || issued;
+  companionFooter.hidden = companion.hidden = !companionNeeded || !inward || Boolean(editor?.identityIssue);
   companion.textContent = linkedRequestEditor && inward
     ? `Open ${templateLabel(inward)}` : 'Open Data Destruction (HDD)';
-  const requested = Boolean(request && request.destruction_requested !== false);
   $('#destruction-choice-status').textContent = issued
     ? unavailableCertificatePdf(request) ? 'PDF missing. Recreate it with the same certificate number.'
       : stateOf(request) === 'completed' ? 'Marked Completed.' : 'PDF ready to send.'
     : linkedRequestEditor
-    ? !request ? 'This request could not be matched to its inward. Refresh before changing it.'
-      : !checkbox.checked && requested ? 'Save to remove this request. Any existing HDD files and details will be kept.'
-      : checkbox.checked && requested ? 'This request stays in the follow-up list until it is Completed.'
-      : checkbox.checked ? 'Save to return this request to the follow-up list.'
-      : 'This request is removed from follow-up. Its saved details and any files are kept.'
-    : !checkbox.checked && requested ? 'Save to remove this request. Existing HDD files and details will be kept.'
-    : request && checkbox.checked ? 'Open the HDD certificate whenever you’re ready.'
-    : checkbox.checked ? 'Save this request below to add it to follow-up.'
-    : 'You can create the HDD certificate first. Check this box to save an HDD request for later.';
-  const pendingRequest = available && !issued && checkbox.checked !== requested;
+    ? !request ? 'This request could not be matched to its inward. Refresh before continuing.'
+      : 'This Data Destruction request is active.'
+    : requested ? 'This request is already saved. Open Data Destruction whenever you’re ready to create the certificate.'
+    : checkbox.checked ? 'Confirm to add a Data Destruction request for later.'
+    : 'Add a Data Destruction request if this client also needs HDD destruction.';
+  const pendingRequest = available && !issued && !linkedRequestEditor && !requested && checkbox.checked;
   const excelChanges = editor?.baseline && payload && fieldDifferences(editor.excelBaseline || editor.baseline, payload).length > 0;
   const changes = editor?.baseline && payload ? fieldDifferences(editor.excelBaseline || editor.baseline, payload) : [];
   const newEdits = editor?.baseline && payload ? fieldDifferences(editor.baseline, payload) : [];
@@ -2881,26 +3100,78 @@ function updateDestructionChoice(payload = null) {
   const canSaveInward = available && !linkedRequestEditor
     && (editor.localInwardId ? pendingRequest : !editor.issuedCertificate || pendingRequest || onlyInwardChanges);
   const bothUnchecked = bothCertificatesUnchecked();
-  const pendingCertificateChoices = (bothUnchecked && pendingRequest) || editor?.pendingPrimaryNa;
-  $('#save-details').hidden = Boolean(editor?.uploadRow || editor?.noCertificate || bothUnchecked || editor?.pendingPrimaryNa);
-  $('#save-inward-details').hidden = !(canSaveLinkedRequest || canSaveInward || pendingCertificateChoices) || Boolean(editor.identityIssue);
-  $('#save-inward-details').textContent = pendingCertificateChoices
-    ? bothUnchecked ? 'Save as N/A' : 'Save certificate choices'
-    : linkedRequestEditor || editor?.localInwardId || (pendingRequest && !onlyInwardChanges && (editor.issuedCertificate || !excelChanges))
+  $('#save-details').hidden = Boolean(editor?.uploadRow || editor?.noCertificate || bothUnchecked);
+  $('#save-inward-details').hidden = !(canSaveLinkedRequest || canSaveInward) || Boolean(editor.identityIssue);
+  $('#save-inward-details').textContent = linkedRequestEditor || editor?.localInwardId || (pendingRequest && !onlyInwardChanges && (editor.issuedCertificate || !excelChanges))
     ? 'Save request' : 'Save to Excel';
-  if (bothUnchecked) $('#change-scope').textContent = pendingCertificateChoices
-    ? 'Saves both certificate choices as N/A and keeps the inward.'
-    : 'Both certificates are marked N/A. The inward is kept.';
+  if (bothUnchecked) $('#change-scope').textContent = 'No certificate is selected. Use Mark N/A in Companies if no certificate is needed.';
 }
 
-function changeDestructionChoice() {
+async function changeDestructionChoice() {
   const checkbox = $('#destruction-needed');
+  if (app.destructionChoicePending) return;
   const request = editorDestructionRequest();
-  if (checkbox.disabled || (request && certificateWasGenerated(request))) {
+  if (checkbox.disabled || (request && (request.destruction_requested !== false || certificateWasGenerated(request)))) {
     updateDestructionChoice();
     return;
   }
-  renderChangeSummary(); saveWorkingDraft();
+  if (!checkbox.checked) {
+    updateDestructionChoice();
+    return;
+  }
+  const editor = app.editor;
+  app.destructionChoicePending = true;
+  checkbox.disabled = true;
+  try {
+    const inward = editorInwardRow();
+    const localRecordId = String(editor?.localInwardId || '').trim();
+    const plant = inward?.plant ?? editor?.sourcePlant ?? null;
+    // A local-only certificate may have neither a workbook plant nor an SN.
+    // Its stable record ID is the server-side link for the new HDD request.
+    const caseId = [inward?.sn, inward?.case_id, editor?.sourceSn, localRecordId]
+      .find(value => value != null && String(value).trim() !== '');
+    if ((!localRecordId && !['plant1', 'plant2'].includes(plant)) || caseId == null) {
+      showDetailsError('Refresh and reopen this client before adding a Data Destruction request.');
+      return;
+    }
+    const supplier = inward?.supplier || $('#details-form').elements.namedItem('supplier')?.value || 'this client';
+    const approved = await confirmAction({title:'Add a Data Destruction request?',
+      message:`Add a Data Destruction certificate request for ${supplier}? It will appear in the follow-up list. The HDD certificate is created separately when you are ready.`,
+      confirmLabel:'Yes, add request', cancelLabel:'No'});
+    if (!approved) return;
+
+    setDetailsBusy(true);
+    $('#details-error').hidden = true;
+    try {
+      await persistDestructionChoice({plant,
+        case_id:String(caseId),
+        ...(localRecordId ? {record_id:localRecordId} : {})}, true);
+      if (app.editor !== editor) return;
+      updateDestructionChoice(detailsBody($('#details-form')));
+      if (editorDirty()) saveWorkingDraft();
+      toast('Data Destruction request added.');
+    } catch (error) {
+      if (app.editor === editor) showDetailsError(error.message);
+    } finally {
+      setDetailsBusy(false);
+    }
+  } finally {
+    app.destructionChoicePending = false;
+    if (app.editor === editor && $('#details-modal').open) {
+      updateDestructionChoice(detailsBody($('#details-form')));
+      if (!checkbox.disabled) checkbox.focus({preventScroll:true});
+    }
+  }
+}
+
+function handleDestructionChoiceActivation() {
+  void changeDestructionChoice().catch(error => {
+    app.destructionChoicePending = false;
+    try {
+      if (app.editor && $('#details-modal').open) updateDestructionChoice(detailsBody($('#details-form')));
+    } catch { /* Keep a secondary UI recovery error from escaping the event handler. */ }
+    if ($('#details-modal').open) showDetailsError(error?.message || 'Could not add the Data Destruction request. Try again.');
+  });
 }
 
 function destructionRequestNeeded() {
@@ -2915,17 +3186,21 @@ async function changePrimaryCertificateNeeded() {
   const editor = app.editor;
   const checkbox = $('#primary-certificate-needed');
   const needed = checkbox.checked;
-  if ((editor.pendingPrimaryNa && needed) || (!needed && bothCertificatesUnchecked())) {
-    editor.pendingPrimaryNa = !needed;
-    renderChangeSummary();
-    if (editorDirty()) saveWorkingDraft();
-    else if (clearWorkingDraft()) editor.workingDraftSaved = false;
+  if (editor.template !== 'destruction' || stateOf(row) !== 'na' || !needed) {
+    updateDestructionChoice();
+    return;
+  }
+  const approved = await confirmAction({title:`Add ${templateLabel(row)} certificate?`,
+    message:`Return ${templateLabel(row)} for ${row.supplier || 'this client'} to certificate review? This does not create the PDF.`,
+    confirmLabel:'Yes, add certificate', cancelLabel:'No'});
+  if (!approved) {
+    checkbox.checked = false;
     return;
   }
   editor.savingPrimaryChoice = true;
   setDetailsBusy(true);
   try {
-    const response = await persistPrimaryCertificateChoice(row, needed);
+    await persistPrimaryCertificateChoice(row, needed);
     if (editor.template !== 'destruction') {
       editor.noCertificate = !needed;
       editor.certificateStatus = needed ? '' : 'N/A';
@@ -2936,9 +3211,9 @@ async function changePrimaryCertificateNeeded() {
     }
     updateDestructionChoice(detailsBody($('#details-form')));
     if (editorDirty()) saveWorkingDraft();
-    toast(needed ? `Certificate status is ${response.status}.` : 'Certificate marked N/A. The inward was kept.');
+    toast(`${templateLabel(row)} returned to certificate review.`);
   } catch (error) {
-    checkbox.checked = !needed;
+    checkbox.checked = false;
     showDetailsError(error.message);
   } finally {
     editor.savingPrimaryChoice = false;
@@ -3314,7 +3589,7 @@ function renderEditorSummary() {
     }
   }
   const attachment = app.editor.fields?.[app.editor.template]?._annexure;
-  if (attachment) rows.push(['Attached list', app.editor.annexures[attachment]?.name || app.attachments?.[attachment]?.name || 'PDF list attached']);
+  if (attachment) rows.push(['Additional pages', app.editor.annexures[attachment]?.name || app.attachments?.[attachment]?.name || 'Pages attached']);
   app.editor.summaryHosts = {};
   for (const [label, text, fieldKey] of rows) {
     const key = fieldKey || summaryFields[label];
@@ -3396,7 +3671,7 @@ function setEditorMode(editing = false) {
   }
   $('#save-details').textContent = first ? 'Generate certificate' : app.editor?.existing ? 'Save corrected certificate' : 'Create PDF';
   const noCertificate = Boolean(app.editor?.noCertificate);
-  $('#save-details').hidden = noCertificate || bothCertificatesUnchecked() || Boolean(app.editor?.pendingPrimaryNa || app.editor?.uploadRow);
+  $('#save-details').hidden = noCertificate || bothCertificatesUnchecked() || Boolean(app.editor?.uploadRow);
   $('#replace-uploaded-pdf').hidden = !app.editor?.uploadRow || Boolean(app.editor.identityIssue || app.editor.uploadRow.workbook_read_only);
   $('#preview-details').hidden = noCertificate || Boolean(app.editor?.uploadRow);
   if (noCertificate) {
@@ -3541,9 +3816,11 @@ async function openDetails(row = null, skipRecovery = false, startEditing = fals
   const sourceRow = row;
   const uploadRow = row?.uploaded_pdf_sha256 && row.pdf_relative_path ? row : null;
   const issued = row && (row.has_issued_certificate || ['generated', 'generated_manual', 'completed'].includes(stateOf(row)));
-  if (row?.last_certificate_details && !recordIdentityIssue(row)) {
-    row = { ...row, ...row.last_certificate_details };
-  }
+  const issuedDetails = row?.last_certificate_details && !recordIdentityIssue(row) ? row.last_certificate_details : null;
+  const issuedDetailsChanged = Boolean(issued && issuedDetails && !isManual(row) && !uploadRow
+    && (typeof row.excel_details_changed_since_issue === 'boolean'
+      ? row.excel_details_changed_since_issue : issuedExcelDetailsChanged(row, issuedDetails)));
+  $('#edit-issued-certificate').hidden = !issuedDetailsChanged;
   const form = $('#details-form');
   form.reset();
   const rowItems = row && Array.isArray(row.items) ? row.items : [];
@@ -3553,6 +3830,8 @@ async function openDetails(row = null, skipRecovery = false, startEditing = fals
   const id = templateId(row || {});
   app.editor = { existing: Boolean(row), recordId: row?.record_id || null, template: id,
     uploadRow,
+    sourceRow,
+    issuedChangePreview: Array.isArray(row?.excel_change_preview) ? row.excel_change_preview : [],
     noCertificate: Boolean(sourceRow && stateOf(sourceRow) === 'na'),
     certificateStatus: sourceRow ? issued ? stateLabel(sourceRow) : 'Not created' : '',
     destructionSource: row?.destruction_source || row?.raw_details?.destruction_source || null,
@@ -3568,7 +3847,7 @@ async function openDetails(row = null, skipRecovery = false, startEditing = fals
     sourceSn: row && !isManual(row) ? String(row.sn) : null, sourcePlant: row?.plant || null,
     excelCertificateWeight: !isManual(row || {}) ? sourceRow?.certificate_weight ?? '' : '',
     issuedCertificate: Boolean(issued),
-    fields: { [id]: { ...(row?.certificate_fields || {}) } }, annexures: {}, annexureId: row?.certificate_fields?._annexure || null,
+    fields: { [id]: { ...(issuedDetails?.certificate_fields || row?.certificate_fields || {}) } }, annexures: {}, annexureId: (issuedDetails?.certificate_fields || row?.certificate_fields)?._annexure || null,
     touched: new Set(), sourceExplicit: false, rawNumeric: {}, rawDetails: isManual(row || {}) ? { ...(row.raw_details || {}) } : {}, workspaceRevision: app.workspaceRevision ?? app.state.workspace_revision ?? '' };
   app.editor.linkedHddSaveSnapshot = linkedHddSaveSnapshot();
   form.elements.namedItem('certificate_type').value = id;
@@ -3588,8 +3867,9 @@ async function openDetails(row = null, skipRecovery = false, startEditing = fals
       plant: row.plant, case_id: isManual(row) ? row.case_id || '' : row.sn ?? row.case_id, supplier: row.supplier, location: row.location,
       inward_date: row.inward_date, item: items[0]?.item ?? row.item ?? '', quantity: items[0]?.quantity ?? row.quantity,
       per_piece_weight: items[0]?.per_piece_weight ?? row.per_piece_weight, weight: items[0]?.weight ?? row.weight,
-      certificate_weight: row.certificate_weight, form6: row.form6, reference: row.reference,
-      cod_no: row.cod_no ?? row.certificate_no, cod_date: row.cod_date ?? row.certificate_date,
+      certificate_weight: issuedDetails?.certificate_weight ?? row.certificate_weight, form6: row.form6, reference: row.reference,
+      cod_no: issuedDetails?.cod_no ?? row.cod_no ?? row.certificate_no,
+      cod_date: issuedDetails?.cod_date ?? row.cod_date ?? row.certificate_date,
       ...Object.fromEntries(Object.keys(followupFields).map(key => [key, sourceRow?.[key] || ''])),
     };
     if (isManual(row)) Object.assign(values, row.raw_details || {});
@@ -3713,7 +3993,7 @@ function changeDisplay(key, value) {
 function editorDirty() {
   if (!app.editor?.baseline || !$('#details-modal').open) return false;
   const current = detailsBody($('#details-form'));
-  return Boolean(app.editor.pendingPrimaryNa) || fieldDifferences(app.editor.baseline, current).length > 0 || current.edit_scope !== app.editor.baseline.edit_scope
+  return fieldDifferences(app.editor.baseline, current).length > 0 || current.edit_scope !== app.editor.baseline.edit_scope
     || Boolean(current.data_destruction_needed) !== Boolean(app.editor.baseline.data_destruction_needed);
 }
 
@@ -3742,7 +4022,7 @@ function renderChangeSummary() {
   for (const change of changes) {
     const key = change.key.replace(/^certificate_fields\./, '');
     const spec = app.templates.find(template => template.id === app.editor.template)?.fields.find(field => field.key === key);
-    const label = key === '_annexure' ? 'Attached PDF list' : fieldLabels[key] || spec?.label || key.replace(/_/g, ' ');
+    const label = key === '_annexure' ? 'Additional pages' : fieldLabels[key] || spec?.label || key.replace(/_/g, ' ');
     const display = value => key === '_annexure' && value ? app.editor.annexures[value]?.name || value : changeDisplay(key, value);
     const entry = element('div', 'field-change');
     const values = element('dd');
@@ -4085,7 +4365,7 @@ function detailsBody(form) {
 async function saveDetails(event) {
   event.preventDefault();
   if (app.editor?.uploadRow) return;
-  if (app.editor?.noCertificate || app.editor?.pendingPrimaryNa || bothCertificatesUnchecked()) return saveInwardDetails();
+  if (app.editor?.noCertificate || bothCertificatesUnchecked()) return saveInwardDetails();
   if (app.detailsBusy || !app.templatesLoaded) return;
   if (app.editor?.identityIssue) { updateDetailsButtons(); return; }
   finishInlineEdit();
@@ -4175,23 +4455,11 @@ async function saveCertificateChoices(inward, requestChanged, needed) {
   setDetailsBusy(true);
   $('#details-error').hidden = true;
   try {
-    if (!inward || !canSetPrimaryCertificateStatus(inward)) throw new Error('Refresh and reopen this inward before changing its certificate status.');
-    if (editor.pendingPrimaryNa) {
-      if (stateOf(inward) !== 'na') await persistPrimaryCertificateChoice(inward, false);
-      editor.pendingPrimaryNa = false;
-      if (editor.template !== 'destruction') {
-        editor.noCertificate = true;
-        editor.certificateStatus = 'N/A';
-      }
-    }
     if (requestChanged) {
+      if (!inward) throw new Error('Refresh and reopen this inward before changing its Data Destruction request.');
       await persistDestructionChoice({plant:inward.plant, case_id:inward.sn}, needed);
-      if (editor.template === 'destruction') {
-        editor.noCertificate = !needed;
-        editor.certificateStatus = needed ? 'Not created' : 'N/A';
-      }
     }
-    toast(needed ? 'Certificate choices saved.' : 'Both certificates marked N/A. The inward was kept.');
+    toast(needed ? 'Data Destruction request saved.' : 'Data Destruction request removed. Certificate status was not changed.');
   } catch (error) {
     saveError = error;
   } finally {
@@ -4215,7 +4483,7 @@ async function saveInwardDetails() {
   const request = editorDestructionRequest();
   const needed = Boolean(payload.data_destruction_needed);
   const requestChanged = needed !== Boolean(request && request.destruction_requested !== false);
-  if (app.editor.pendingPrimaryNa || (bothCertificatesUnchecked() && requestChanged)) {
+  if (bothCertificatesUnchecked() && requestChanged) {
     return saveCertificateChoices(editorInwardRow(), requestChanged, needed);
   }
   const changes = fieldDifferences(app.editor.excelBaseline || app.editor.baseline, payload);
@@ -4571,7 +4839,7 @@ function openEntryDeletion({showDialog = true} = {}) {
     const meta=element('span','bulk-client-meta'); meta.append(element('span','',stateLabel(row)));
     label.append(input,copy,meta);app.entryDeletion.labels.push(label);return label;
   }));
-  backToEntryDeletionSelection();filterEntryDeletion();
+  resetEntryDeletionReview();filterEntryDeletion();
   if (showDialog) { $('#entry-deletion-modal').showModal();$('#entry-delete-search').focus(); }
 }
 
@@ -4593,12 +4861,12 @@ function filterEntryDeletion() {
   $('#entry-delete-preview').disabled=app.entryDeletionBusy || !state.checked.size || state.checked.size>50;
 }
 
-function backToEntryDeletionSelection() {
+function resetEntryDeletionReview() {
   if(app.entryDeletionBusy)return;
   if(app.entryDeletion)app.entryDeletion.pending=null;
   $('#entry-delete-selection').hidden=false;$('#entry-delete-review').hidden=true;
   $('#entry-delete-preview').hidden=false;$('#entry-delete-confirm').hidden=true;
-  $('#entry-delete-back').hidden=true;$('#entry-delete-checked').checked=false;
+  $('#entry-delete-selected').hidden=false;$('#entry-delete-checked').checked=false;
   $('#entry-delete-confirm').disabled=true;$('#entry-delete-error').hidden=true;
 }
 
@@ -4613,22 +4881,32 @@ async function reviewEntryDeletion() {
     const response=await api('/api/entries/delete-preview',payload);
     if(app.entryDeletion!==state)return;
     state.pending={...payload,review_token:response.review_token};
+    const entryCount=response.review.entries.length;
+    $('#entry-delete-review-title').textContent=`Review ${entryCount} ${entryCount===1?'entry':'entries'}`;
     const list=$('#entry-delete-review-list');list.replaceChildren();
     for(const entry of response.review.entries){
       const section=element('section');
-      section.append(element('strong','',entry.supplier || 'Unnamed company'),element('p','',`${labelPlant(entry.plant)} · ${entry.source_kind==='workbook' ? 'SN '+entry.sn+' · '+entry.materials+(entry.materials===1?' material row':' material rows') : 'Local certificate record'} · COD ${entry.cod || 'not assigned'} · ${templateNames[entry.certificate_type] || entry.certificate_type}`));
-      if(entry.status || entry.reference || entry.form6) section.append(element('p','',[
-        entry.status ? stateLabel({certificate_status:entry.status}) : '',entry.received ? 'Received '+dateLabel(entry.received) : '',entry.reference ? 'Reference '+entry.reference : '',entry.form6 ? 'Form 6 '+entry.form6 : ''
-      ].filter(Boolean).join(' · ')));
+      const facts=[labelPlant(entry.plant)];
+      if(entry.source_kind==='workbook') facts.push(`SN ${entry.sn}`,`${entry.materials} ${entry.materials===1?'material':'materials'}`);
+      facts.push(templateNames[entry.certificate_type] || entry.certificate_type || 'Certificate');
+      if(entry.cod) facts.push(`COD ${entry.cod}`);
+      if(entry.status) facts.push(stateLabel({certificate_status:entry.status}));
+      if(entry.received) facts.push(`Received ${dateLabel(entry.received)}`);
+      section.append(element('strong','',entry.supplier || 'Unnamed company'),element('p','',facts.join(' · ')));
       list.append(section);
     }
-    const pdfList=element('ul');for(const path of response.review.pdfs)pdfList.append(element('li','',path));
-    list.append(element('h3','',`${response.review.pdfs.length} PDF${response.review.pdfs.length===1?'':'s'} to remove`),pdfList);
+    const pdfs=response.review.pdfs || [];
+    if(pdfs.length){
+      const pdfList=element('ul');for(const path of pdfs)pdfList.append(element('li','',path));
+      list.append(element('h3','',`${pdfs.length} PDF${pdfs.length===1?'':'s'} will be removed`),pdfList);
+    } else list.append(element('p','', 'No PDFs to remove.'));
     const kept=response.review.kept_hdd || [];
-    $('#entry-delete-kept-hdd').textContent=kept.length ? `${kept.length} linked HDD ${kept.length===1?'record will':'records will'} be kept as standalone: ${kept.map(row=>row.supplier+(row.cod?' · COD '+row.cod:'')).join('; ')}` : 'No linked HDD records will be left behind.';
+    $('#entry-delete-kept-hdd').textContent=kept.length
+      ? `Linked Data Destruction records kept: ${kept.map(row=>row.supplier+(row.cod?' · COD '+row.cod:'')).join('; ')}` : '';
+    $('#entry-delete-kept-hdd').hidden=!kept.length;
     $('#entry-delete-selection').hidden=true;$('#entry-delete-review').hidden=false;
     $('#entry-delete-preview').hidden=true;$('#entry-delete-confirm').hidden=false;
-    $('#entry-delete-back').hidden=false;$('#entry-delete-checked').checked=false;
+    $('#entry-delete-selected').hidden=true;$('#entry-delete-checked').checked=false;
     $('#entry-delete-confirm').disabled=true;
     if (!$('#entry-deletion-modal').open) $('#entry-deletion-modal').showModal();
     $('#entry-delete-cancel').focus();
@@ -4726,7 +5004,7 @@ async function undoLastDeletion() {
     toast(error.message, true);
   } finally {
     app.removalBusy = false;
-    setBusy(false);
+      setBusy(false);
   }
 }
 
@@ -4819,7 +5097,12 @@ async function handleAction(button) {
     setBusy(true, isManual(row) ? 'Updating your local register…' : 'Updating the workbook…');
     try { const response = await api(isManual(row) ? '/api/manual/complete' : '/api/complete', { expected_revision: expectedRevision,
       ...(undo ? {undo_completed:true} : {}),
-      ...(isManual(row) ? { record_id: row.record_id } : { plant: row.plant, sn: row.sn }) }); setState(response.state); toast(undo ? 'Completion undone.' : 'Marked Completed.'); }
+      ...(isManual(row) ? { record_id: row.record_id } : { plant: row.plant, sn: row.sn }) });
+      setState(response.state);
+      const updatedRow = response.state?.rows?.find(item => item.source_kind !== 'manual'
+        && item.plant === row.plant && String(item.sn) === String(row.sn));
+      toast(undo ? 'Completion undone.' : updatedRow?.recycling_completed_pending_hdd
+        ? 'Recycling marked sent. Data Destruction is still pending.' : 'Marked Completed.'); }
     catch (error) { toast(error.message, true); }
     finally { app.completionBusy = false; setBusy(false); }
     return;
@@ -4976,7 +5259,7 @@ function historyDifferences(record) {
 }
 
 function historyFieldLabel(key, record) {
-  const printedLabels = {company_display:'Company line',weight_display:'Weight label',_annexure:'Attached PDF list',serial_no:'Serial number'};
+  const printedLabels = {company_display:'Company line',weight_display:'Weight label',_annexure:'Additional pages',serial_no:'Serial number'};
   const id = record.after?.certificate_type || record.after?.details?.certificate_type || record.before?.certificate_type || record.before?.details?.certificate_type || 'standard';
   const fields = app.templates.find(template => template.id === id)?.fields || [];
   return key.split('.').filter(part => !['details', 'certificate_fields', 'items'].includes(part))
@@ -5254,7 +5537,6 @@ function wire() {
   $('#entry-delete-search').addEventListener('input', filterEntryDeletion);
   $('#entry-delete-clear').addEventListener('click',()=>{$('#entry-delete-search').value='';filterEntryDeletion();$('#entry-delete-search').focus();});
   $('#entry-delete-preview').addEventListener('click', reviewEntryDeletion);
-  $('#entry-delete-back').addEventListener('click',()=>{backToEntryDeletionSelection();filterEntryDeletion();});
   $('#entry-delete-checked').addEventListener('change',()=>{$('#entry-delete-confirm').disabled=!$('#entry-delete-checked').checked || app.entryDeletionBusy;});
   $('#entry-delete-confirm').addEventListener('click', confirmEntryDeletion);
   $('#entry-deletion-modal').addEventListener('close',()=>{
@@ -5262,7 +5544,7 @@ function wire() {
     $('#entry-delete-checked').checked=false;$('#entry-delete-confirm').disabled=true;
   });
   $('#entry-deletion-modal').addEventListener('keydown',event=>{
-    if(event.key==='Enter' && !['entry-delete-cancel','entry-delete-preview','entry-delete-confirm','entry-delete-back'].includes(event.target.id))event.preventDefault();
+    if(event.key==='Enter' && !['entry-delete-cancel','entry-delete-preview','entry-delete-confirm'].includes(event.target.id))event.preventDefault();
   });
   $('#remove-inward-checked').addEventListener('change', () => {
     $('#confirm-remove-inward').disabled = !$('#remove-inward-checked').checked || app.removalBusy;
@@ -5405,10 +5687,18 @@ function wire() {
     setEditorMode(false);
     await previewDetails();
   });
+  $('#edit-issued-certificate').addEventListener('click', openIssuedChangeReview);
+  $('#issued-change-restore').addEventListener('click', () => resolveIssuedExcelChanges('restore'));
+  $('#issued-change-keep').addEventListener('click', () => resolveIssuedExcelChanges('keep'));
   $('#excel-save-yes').addEventListener('click', () => saveExcelChoice(true));
   $('#excel-save-no').addEventListener('click', () => saveExcelChoice(false));
   $('#save-inward-details').addEventListener('click', saveInwardDetails);
   $('#open-companion-certificate').addEventListener('click', openCompanionCertificate);
+  // Bind at the control itself so the request action does not depend on event
+  // bubbling through the details form. Native click covers pointer and Space;
+  // change remains a fallback, with the pending guard deduplicating both.
+  $('#destruction-needed').addEventListener('click', handleDestructionChoiceActivation);
+  $('#destruction-needed').addEventListener('change', handleDestructionChoiceActivation);
   $('#primary-certificate-needed').addEventListener('change', changePrimaryCertificateNeeded);
   $('#excel-save-modal').addEventListener('close', () => { app.excelSavePayload = null; });
   $('#change-details').addEventListener('click', () => {
@@ -5450,7 +5740,6 @@ function wire() {
   $('#details-form').addEventListener('change', event => {
     if (event.target.id === 'primary-certificate-needed') return;
     const form = event.currentTarget;
-    if (event.target.name === 'data_destruction_needed') { changeDestructionChoice(); return; }
     if (event.target.name === 'certificate_type' && switchesLinkedCertificate(event.target.value)) {
       switchLinkedCertificate(event.target.value); return;
     }

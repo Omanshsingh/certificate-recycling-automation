@@ -8,6 +8,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from openpyxl import load_workbook
+
 from certificate_core import read_batches
 from issuance_safety import workbook_receipt_conflict
 import run_certificates as runner
@@ -63,6 +65,44 @@ class ExcelEditResilienceTests(unittest.TestCase):
         runner.run(self.paths, self.root, check_only=True, as_of=AS_OF, progress=None,
                    report_sink=report, **kwargs)
         return report
+
+    def test_background_refresh_picks_up_saved_excel_edits_and_inserted_or_deleted_rows(self):
+        with patch.object(web_app, 'WORKBOOK_CHECK_STAMPS', {}):
+            initial = web_app.refresh()
+            self.assertTrue(initial['scan_complete'])
+            self.assertTrue(any(row['sn'] == '1001' for row in initial['rows']))
+
+            book = load_workbook(self.paths[0])
+            sheet = book['Inward Register']
+            sheet['C2'] = 'Updated directly in Excel'
+            sheet.insert_rows(3)
+            for column, value in enumerate((
+                    '1002', date(2026, 10, 5), 'Added directly in Excel', 'Pune',
+                    'Printer', 1, 4, 4, 'FORM6-NEW', 'REF-NEW', '', '', 'Ready'), 1):
+                sheet.cell(3, column, value)
+            book.save(self.paths[0])
+            book.close()
+
+            added = web_app.check_workbook_changes()
+            self.assertTrue(added['changed'])
+            self.assertTrue(added['state']['scan_complete'])
+            self.assertTrue(any(row['sn'] == '1001' and row['supplier'] == 'Updated directly in Excel'
+                                for row in added['state']['rows']))
+            self.assertTrue(any(row['sn'] == '1002' and row['supplier'] == 'Added directly in Excel'
+                                for row in added['state']['rows']))
+
+            added_batch = next(batch for batch in read_batches(self.paths[0]) if batch['case_id'] == '1002')
+            book = load_workbook(self.paths[0])
+            book['Inward Register'].delete_rows(added_batch['source_row'], 1)
+            book.save(self.paths[0])
+            book.close()
+
+            removed = web_app.check_workbook_changes()
+            self.assertTrue(removed['changed'])
+            self.assertTrue(removed['state']['scan_complete'])
+            self.assertFalse(any(row['sn'] == '1002' for row in removed['state']['rows']))
+            self.assertTrue(any(row['sn'] == '1001' and row['supplier'] == 'Updated directly in Excel'
+                                for row in removed['state']['rows']))
 
     @unittest.skipUnless(os.name == 'nt', 'Windows file sharing behavior')
     def test_refresh_reads_locked_excel_and_shows_effective_ready_without_saving_it(self):

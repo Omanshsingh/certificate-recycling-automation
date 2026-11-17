@@ -389,6 +389,7 @@ def _read_batches(path):
                 "external_pdf": saved.get('_external_pdf'),
                 "hdd_cod_no": text(saved.get('_hdd_cod_no')),
                 "hdd_cod_date": saved.get('_hdd_cod_date', ''),
+                "recycling_completed": bool(saved.get('_recycling_completed')),
                 **{key: text(raw[cols[key]]) if key in cols else '' for key in
                    ('comments', 'transporter_details', 'docket_vehicle_no', 'weight_slip_scale')},
                 "certificate_weight": None if 'certificate_weight' in cols else number(saved.get('certificate_weight')),
@@ -558,10 +559,32 @@ def inward_details_complete(batch, as_of=None):
     page. COD and date are assigned on creation.
     """
     as_of = as_of or date.today()
-    if source_value_issues(batch, as_of):
+    if source_value_issues(batch, as_of) or batch.get("blocking_issues"):
         return False
-    received = batch.get("inward_date")
+    if not text(batch.get("supplier")):
+        return False
+    received = parse_date(batch.get("inward_date"))
     if not received or received > as_of:
+        return False
+
+    # Keep the Ready/Alert decision tied to the source material facts, even
+    # when a caller supplied a partially constructed batch without its parser
+    # issue list. A missing line weight must never turn into Ready on Undo N/A.
+    items = batch.get("items")
+    if not isinstance(items, list) or not items:
+        return False
+    weights = []
+    for item in items:
+        if not isinstance(item, dict):
+            return False
+        weight = item.get("weight")
+        if (isinstance(weight, bool) or not isinstance(weight, (int, float))
+                or not math.isfinite(weight) or weight < 0):
+            return False
+        weights.append(weight)
+    total = batch.get("total_weight")
+    if (isinstance(total, bool) or not isinstance(total, (int, float))
+            or not math.isfinite(total) or total <= 0 or sum(weights) <= 0):
         return False
     return True
 

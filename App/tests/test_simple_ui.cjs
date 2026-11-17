@@ -85,13 +85,13 @@ function harness(options = {}) {
       requests.push({endpoint, ...init, payload:init.body ? JSON.parse(init.body) : undefined});
       return options.fetch ? options.fetch(endpoint, init) : {ok:true,json:async () => ({workspace_revision:'revision-2'})};
     }});
-  const ui = vm.runInContext(`${source}\n({app, stateLabel, statusClass, nextStep, matches, makeActions, makeClientCell, makeDetailRow, renderFolderInventory, simpleWarning, readableNumber, detailsBody, materialWeightTotal, updateMaterialWeightTotal, renderMaterialRows, visiblePage, pastCertificateNumbers, certificateFileTitle, showSavedFile, renderPastNumbers, api, fieldDifferences, renderChangeSummary, editorDirty, saveWorkingDraft, saveDraft, readWorkingDraft, clearWorkingDraft, offerDraftRecovery, restoreWorkingDraft, requestDetailsClose, finishDraftClose, certificateUrl, showGenerationSuccess, submitGeneration, bulkGenerationPayload, openBulkGeneration, startBulkGeneration, renderEditorSummary, setEditorMode, validateEditor, finishEditing, openDetails, saveDetails, showWarnings, confirmWarnings, pickAnnexure, previewDetails, toggleFullPdfPreview, backupAction, openBackupRestore, restoreBackup, historyDifferences, loadHistory, showHistoryDetail, invalidatePreview, confirmAction, settleActionConfirmation, handleAction, wire, stopApp, summarize})`, context);
+  const ui = vm.runInContext(`${source}\n({app, stateLabel, statusClass, nextStep, matches, makeActions, makeClientCell, makeDetailRow, renderFolderInventory, simpleWarning, readableNumber, detailsBody, materialWeightTotal, updateMaterialWeightTotal, renderMaterialRows, visiblePage, pastCertificateNumbers, certificateFileTitle, showSavedFile, renderPastNumbers, api, fieldDifferences, renderChangeSummary, editorDirty, saveWorkingDraft, saveDraft, readWorkingDraft, clearWorkingDraft, offerDraftRecovery, restoreWorkingDraft, requestDetailsClose, finishDraftClose, certificateUrl, showGenerationSuccess, submitGeneration, bulkGenerationPayload, openBulkGeneration, startBulkGeneration, renderEditorSummary, setEditorMode, validateEditor, finishEditing, openDetails, beginIssuedCertificateCorrection, renderIssuedChangeReview, openIssuedChangeReview, resolveIssuedExcelChanges, saveDetails, showWarnings, confirmWarnings, pickAnnexure, previewDetails, toggleFullPdfPreview, backupAction, openBackupRestore, restoreBackup, historyDifferences, loadHistory, showHistoryDetail, invalidatePreview, confirmAction, settleActionConfirmation, handleAction, wire, stopApp, summarize})`, context);
   Object.assign(ui, vm.runInContext('({savedFilePlant, savedFileUrl, savedFileMatches, setWorkspaceView, resetRecordFilters, nextWorkbookId, suggestWorkbookId, printedWeight, updatePrintedWeight, schedulePreview, saveSettings, settingsValues, openSettings, requestSettingsClose, returnFromWarnings, toast, makeStatus, reconnectDashboard, saveExcelChoice, renderTemplateEditor})',context));
   Object.assign(ui, vm.runInContext('({startInlineEdit, finishInlineEdit, syncWorkbookChanges, setState, renderWorkbookIssues, refreshState, pollReminderReview})',context));
   Object.assign(ui, vm.runInContext('({openAddClient, renderClientMaterials, clientMaterialValues, saveClient, validateClientSerialNumber, duplicateSerialNumber, compareRows})',context));
   Object.assign(ui, vm.runInContext('({excelTarget, openClientInExcel})',context));
   Object.assign(ui, vm.runInContext('({openInwardRemoval, confirmInwardRemoval, rememberDeletion, undoLastDeletion})',context));
-  Object.assign(ui, vm.runInContext('({openEntryDeletion,filterEntryDeletion,reviewEntryDeletion,confirmEntryDeletion,backToEntryDeletionSelection})',context));
+  Object.assign(ui, vm.runInContext('({openEntryDeletion,filterEntryDeletion,reviewEntryDeletion,confirmEntryDeletion})',context));
   Object.assign(ui, vm.runInContext('({changeDisplay})',context));
   Object.assign(ui, vm.runInContext('({saveInwardDetails, openCompanionCertificate, updateDestructionChoice, showExcelSaveChoice})',context));
   Object.assign(ui, vm.runInContext('({noticeText, showDetailsError, warningInfo, renderWarningList, hasWarnings, needsAttention})',context));
@@ -3476,21 +3476,104 @@ test('Issued Siemens identifiers are available from the single details editor', 
   assert.doesNotMatch(h.controls.get('#editor-summary-note').textContent,/update Excel/);
 });
 
-test('Reopening a PDF-only correction restores last issued details and its weight override', async () => {
-  const h = harness(); editing(h); h.controls.get('#details-modal').open = false;
+test('Completed record review uses current Excel details and retains issued certificate fields', async () => {
+  const h = harness(); editing(h); h.ui.wire(); h.controls.get('#details-modal').open = false;
   vm.runInContext('updateSourceControls = () => {}; renderTemplateEditor = () => {}; previewDetails = async () => {};',h.context);
-  const row = {plant:'plant1',sn:'1001',supplier:'Excel company',location:'Pune',has_issued_certificate:true,
+  const row = {source_kind:'workbook',plant:'plant1',sn:'1001',supplier:'Excel company',location:'Pune',inward_date:'2026-09-01',
+    form6:'F6-NEW',reference:'REF-NEW',comments:'Current comments',has_issued_certificate:true,
+    excel_details_changed_since_issue:true,
+    excel_change_preview:[
+      {field:'Company name',issued:'Old Excel company',current:'Excel company'},
+      {field:'Materials and weights',issued:'Laptop · Qty 1 · 10 kg',current:'Laptop · Qty 2 · 20 kg'},
+      {field:'Comments',issued:'Old comments',current:'Current comments'},
+    ],
     items:[{item:'Asset',quantity:1,per_piece_weight:10,weight:10}],certificate_weight:8,
-    last_certificate_details:{supplier:'PDF correction',location:'Mumbai',certificate_type:'siemens',certificate_weight:'7.25',
+    last_certificate_details:{supplier:'Old Excel company',location:'Mumbai',inward_date:'2026-08-31',form6:'F6-OLD',reference:'REF-OLD',
+      comments:'Old comments',certificate_type:'siemens',certificate_weight:'7.25',
       certificate_fields:{model_name:'Corrected scanner'},cod_no:'0041',cod_date:'2026-10-01',
       items:[{item:'Asset',quantity:'1',per_piece_weight:'10',weight:'10'}]}};
   await h.ui.openDetails(row);
   const form = h.controls.get('#details-form');
-  assert.equal(form.values.supplier,'PDF correction'); assert.equal(form.values.location,'Mumbai');
+  assert.equal(form.values.supplier,'Excel company'); assert.equal(form.values.location,'Pune');
+  assert.equal(form.values.form6,'F6-NEW'); assert.equal(form.values.reference,'REF-NEW');
+  assert.equal(form.values.comments,'Current comments');
   assert.equal(form.values.cod_no,'0041'); assert.equal(form.values.use_certificate_weight,true);
+  assert.equal(form.values.certificate_type,'siemens');
+  assert.equal(h.ui.app.editor.fields.siemens.model_name,'Corrected scanner');
+  assert.equal(h.controls.get('#edit-issued-certificate').hidden,false);
   assert.equal(h.ui.app.editor.excelCertificateWeight,8);
   assert.equal(h.ui.app.editor.firstGeneration,false);
   assert.equal(h.controls.get('#excel-detail-fields').hidden,true);
+  assert.equal(h.ui.app.editor.editingDetails,false);
+  h.controls.get('#edit-issued-certificate').dispatch('click');
+  assert.equal(h.controls.get('#issued-change-review-modal').open,true);
+  const preview = h.controls.get('#issued-change-preview');
+  assert.match(text(preview),/Company name.*Old Excel\s+company.*Excel\s+company/);
+  assert.match(text(preview),/Materials and weights.*Laptop.*Qty\s+2/);
+  assert.match(text(preview),/Comments.*Old\s+comments.*Current\s+comments/);
+  assert.match(text(preview),/Changed/);
+  assert.match(fs.readFileSync(path.join(__dirname,'../web/index.html'),'utf8'),/Changed values are highlighted below/);
+  assert.match(fs.readFileSync(path.join(__dirname,'../web/index.html'),'utf8'),/issued PDF and status stay the same/);
+});
+
+test('Issued-detail comparison highlights changed material values and marks added or removed lines', () => {
+  const h = harness();
+  h.ui.renderIssuedChangeReview([{field:'Materials and weights',
+    issued:'Desktop · Qty 1 · 10 kg\nCable',current:'Desktop · Qty 2 · 20 kg\nDock\nMouse'}]);
+  const preview = h.controls.get('#issued-change-preview');
+  const issuedChanges = all(preview,node => node.tag === 'del').map(node => node.textContent);
+  const currentChanges = all(preview,node => node.tag === 'mark').map(node => node.textContent);
+  assert.deepEqual(issuedChanges,['1 · 10','Cable']);
+  assert.deepEqual(currentChanges,['2 · 20','Dock','Mouse']);
+  assert.match(text(preview),/Not present/);
+  assert.match(text(preview),/Issued value.*Excel now/);
+});
+
+test('Issued-detail resolution sends the selected explicit action and refreshes restored form values', async () => {
+  for (const action of ['keep','restore']) {
+    const h = harness({fetch:async () => ({ok:true,json:async () => ({
+      saved:true,action,workspace_revision:'after-resolution',state:{rows:[]},
+      source_details:{supplier:'Issued company',location:'Pune',inward_date:'2026-09-01',form6:'F6-OLD',
+        reference:'REF-OLD',comments:'Issued comments',items:[{item:'Laptop',quantity:'1',weight:'10'}]},
+    })})});
+    const form = editing(h); Object.assign(h.ui.app.editor,{sourcePlant:'plant1',sourceSn:'1001'});
+    if (action === 'restore') { form.values.supplier='Unsaved user edit'; h.ui.app.editor.touched.add('supplier'); }
+    h.ui.app.workspaceRevision='reviewed-revision';
+    await h.ui.resolveIssuedExcelChanges(action);
+    assert.equal(h.requests[0].endpoint,'/api/clients/resolve-issued-changes');
+    assert.equal(h.requests[0].payload.action,action);
+    assert.equal(h.requests[0].payload.expected_revision,'reviewed-revision');
+    assert.equal(h.controls.get('#issued-change-review-modal').open,false);
+    assert.equal(h.controls.get('#edit-issued-certificate').hidden,true);
+    if (action === 'restore') {
+      assert.equal(form.values.supplier,'Unsaved user edit');
+      assert.equal(form.values.form6,'F6-OLD');
+      assert.equal(h.ui.app.materialRows.length,1);
+      assert.equal(h.ui.editorDirty(),true);
+    }
+  }
+});
+
+test('Failed issued-detail resolution keeps the comparison open and reports the error', async () => {
+  const h = harness({fetch:async () => ({ok:false,status:400,json:async () => ({error:'Excel has changed. Refresh and try again.'})})});
+  editing(h); Object.assign(h.ui.app.editor,{sourcePlant:'plant1',sourceSn:'1001'});
+  h.controls.get('#issued-change-review-modal').open=true;
+  await h.ui.resolveIssuedExcelChanges('restore');
+  assert.equal(h.controls.get('#issued-change-review-modal').open,true);
+  assert.equal(h.controls.get('#issued-change-error').hidden,false);
+  assert.match(h.controls.get('#issued-change-error').textContent,/changed/);
+  assert.equal(h.ui.app.issuedChangeBusy,false);
+});
+
+test('Unchanged issued details do not show a correction notice for date formats or Excel weight overrides', async () => {
+  const h = harness(); editing(h); h.controls.get('#details-modal').open = false;
+  vm.runInContext('updateSourceControls = () => {}; renderTemplateEditor = () => {}; previewDetails = async () => {};',h.context);
+  await h.ui.openDetails({source_kind:'workbook',plant:'plant1',sn:'1002',supplier:'Acme',location:'Pune',inward_date:'01/09/26',
+    form6:'F6-1',reference:'REF-1',items:[{item:'Asset',quantity:1,per_piece_weight:10,weight:10}],certificate_weight:10,
+    has_issued_certificate:true,last_certificate_details:{supplier:'Acme',location:'Pune',inward_date:'2026-09-01',
+      form6:'F6-1',reference:'REF-1',items:[{item:'Asset',quantity:'1.0',per_piece_weight:'10.00',weight:'10'}],
+      certificate_weight:'8.5',certificate_type:'standard',cod_no:'0042'}});
+  assert.equal(h.controls.get('#edit-issued-certificate').hidden,true);
 });
 
 test('Edits before and after first creation wait for Yes or No before updating Excel', async () => {
@@ -4178,6 +4261,38 @@ test('A local certificate retained after Excel deletion can add its own HDD requ
   assert.equal(h.requests.length,1);assert.equal(h.requests[0].endpoint,'/api/destruction/request');
   assert.equal(h.requests[0].payload.record_id,base.record_id);
   assert.equal(h.context.opened[0],hdd);
+});
+
+test('The Data Destruction checkbox works for an app-only certificate with no plant or SN', async () => {
+  const base={source_kind:'manual',record_id:'local-only',plant:null,case_id:'',supplier:'Local client',
+    certificate_type:'standard',certificate_status:'generated_manual'};
+  const hdd={source_kind:'manual',record_id:'local-hdd',plant:null,supplier:'Local client',
+    certificate_type:'destruction',certificate_status:'ready',
+    destruction_source:{plant:null,case_id:base.record_id,record_id:base.record_id}};
+  const h=harness({fetch:async()=>({ok:true,json:async()=>({record_id:hdd.record_id,workspace_revision:'after-request',state:{rows:[base,hdd]}})})});
+  const form=editing(h);
+  Object.assign(h.ui.app.editor,{existing:true,sourceSn:null,sourcePlant:null,localInwardId:base.record_id,
+    recordId:base.record_id,template:'standard',issuedCertificate:true});
+  form.values.source_kind='manual';form.values.certificate_type='standard';
+  h.ui.app.state.rows=[base];
+  vm.runInContext('setState=state=>{app.state=state;}; setDetailsBusy=on=>{app.detailsBusy=on;};',h.context);
+  h.ui.wire();h.ui.updateDestructionChoice();
+  const checkbox=h.controls.get('#destruction-needed');
+  assert.equal(checkbox.disabled,false);assert.equal(h.controls.get('#destruction-needed-card').hidden,false);
+  checkbox.checked=true;
+  checkbox.dispatch('click');
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(h.controls.get('#action-confirmation-modal').open,true,'adding the request must show its yes/no confirmation');
+  assert.match(h.controls.get('#action-confirmation-title').textContent,/Add a Data Destruction request/);
+  assert.equal(h.requests.length,0,'do not save until the user confirms');
+  h.controls.get('#confirm-action').dispatch('click');
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(h.requests.length,1,'checking the box must save the request immediately after confirmation');
+  assert.equal(h.requests[0].endpoint,'/api/destruction/request');
+  assert.deepEqual(h.requests[0].payload,{plant:null,sn:'local-only',record_id:'local-only',expected_revision:'revision-1',needed:true});
+  assert.equal(checkbox.checked,true);assert.equal(checkbox.disabled,true);
+  assert.equal(h.ui.app.editor.workspaceRevision,'after-request');
+  assert.equal(h.controls.get('#details-error').hidden,true);
 });
 
 test('Canceling a switch preserves unsaved edits and the current dropdown; discarding opens only the selected certificate', async () => {

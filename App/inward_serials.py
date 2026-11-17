@@ -101,10 +101,11 @@ def project_manual_sources(root, data):
     return data
 
 
-def resequence_added_inward(data, added, original_data, *, root, plant, request_id):
+def resequence_added_inward(data, added, original_data, *, root, plant, request_id, on_order_warning=None):
     """Insert an automatic numeric SN in date order, shifting following numeric SNs."""
     from certificate_core import read_batches, batch_content, select_register, text
-    from workbook_store import _set_cell, _sheet_member, sort_register_by_inward_date
+    from workbook_store import (_set_cell, _sheet_member, sort_register_by_inward_date,
+                                UnsupportedReorderError)
     from openpyxl import load_workbook
     from openpyxl.utils import get_column_letter
     from issuance_safety import audit_records, workbook_receipt_conflict
@@ -113,7 +114,18 @@ def resequence_added_inward(data, added, original_data, *, root, plant, request_
     before = read_batches(BytesIO(data))
     target_rows = [row for row in before if row['source_sheet'] == added['source_sheet']]
     if target_rows != sorted(target_rows, key=lambda row:(row['inward_date'] is None, row['inward_date'])):
-        data = sort_register_by_inward_date(data)
+        try:
+            data = sort_register_by_inward_date(data)
+        except UnsupportedReorderError as exc:
+            # A special Excel formula makes physical row movement unsafe.
+            # Keep every existing SN stable and keep the newly added max+1 SN;
+            # the client add itself must remain usable.
+            if on_order_warning:
+                on_order_warning(str(exc))
+            current = next(row for row in before
+                           if row['source_sheet'] == added['source_sheet']
+                           and row['case_id'] == added['case_id'])
+            return data, current, {}
         before = read_batches(BytesIO(data))
     original = read_batches(BytesIO(original_data))
     if len({row['case_id'].strip().casefold() for row in original}) != len(original):

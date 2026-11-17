@@ -14,7 +14,7 @@ from openpyxl import load_workbook
 from openpyxl.formula.tokenizer import Tokenizer
 from openpyxl.utils.cell import range_boundaries
 
-from register_protection import externally_protected, protect_issued_inwards
+from register_protection import externally_protected, remove_issued_inward_protection
 from certificate_core import batch_content, read_batches, select_register, status_value, text
 from certificate_inventory import scan_inventory
 from certificate_drafts import read_register
@@ -97,7 +97,7 @@ def stage_removal(data, sn, sheet_name, source_row, *, certificate_conversion=Fa
                             if top <= last and bottom >= first:
                                 raise ValueError('Another calculation uses this inward. Remove the entry in Excel instead.')
         from register_rows import shift_register_rows
-        updated = shift_register_rows(data, first, last - first + 1, delete=True)
+        updated = shift_register_rows(data, first, last - first + 1, delete=True, expand_shared=True)
         updated = remove_details(updated, sheet.title, batch['case_id'], original_data=data)
         remaining = read_batches(BytesIO(updated))
         expected = [b for b in batches if b is not batch]
@@ -182,7 +182,7 @@ def remove_inward(root, body, *, commit=False):
                 return {'entry': entry, 'review_token': token, 'expected_revision': body['expected_revision']}
             if body.get('checked') is not True or not isinstance(body.get('review_token'), str) or not hmac.compare_digest(body['review_token'], token):
                 raise ValueError('Check the entry in the removal message before choosing Remove entry.')
-            updated = protect_issued_inwards(updated)
+            updated = remove_issued_inward_protection(updated)
             journal = {'identity': identity, 'path': str(path), 'entry': entry,
                        'snapshot': json.loads(json.dumps(batch_content(batch), default=str)),
                        'at': datetime.now(timezone.utc).isoformat(), 'saved': False,

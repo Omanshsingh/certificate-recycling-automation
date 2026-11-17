@@ -29,20 +29,23 @@ class RegisterPresentationTests(unittest.TestCase):
             for cell in row:
                 self.assertEqual((cell.alignment.horizontal,cell.alignment.vertical),('left','top'))
         self.assertEqual(sheet['A2'].font.name,'Arial');self.assertTrue(sheet['A2'].font.bold)
-        self.assertEqual(sheet['A2'].fill.fgColor.rgb,'00EEFFAA');self.assertTrue(sheet['A2'].alignment.wrap_text)
+        self.assertEqual(sheet['A2'].fill.fgColor.rgb,'00EEFFAA')
+        self.assertTrue(sheet['A2'].alignment.wrap_text);self.assertFalse(sheet['B2'].alignment.wrap_text)
         book.close()
 
     def test_repeated_formatting_is_idempotent(self):
         updated=normalize_register_presentation(self.source())
         self.assertEqual(normalize_register_presentation(updated),updated)
 
-    def test_wrap_all_register_fields_and_expand_fixed_and_merged_rows(self):
+    def test_existing_wrap_settings_and_row_heights_survive_status_save(self):
         book = load_workbook(BytesIO(self.source()))
         sheet = book.active
         sheet.column_dimensions['C'].width = 17
+        sheet.column_dimensions['C'].alignment = Alignment(wrap_text=True)
         sheet.column_dimensions['E'].width = 14
         sheet.merge_cells('C2:C4')
         sheet['C2'] = '\n'.join(['Company branch name'] * 8)
+        sheet['C2'].alignment = Alignment(vertical='center', wrap_text=True)
         sheet['E2'] = 'EquipmentID' * 12
         sheet['E2'].alignment = Alignment(horizontal='right', shrink_to_fit=True)
         sheet.row_dimensions[2].height = 15
@@ -62,14 +65,39 @@ class RegisterPresentationTests(unittest.TestCase):
         self.assertEqual(sheet['F2'].value, '=2+3')
         self.assertEqual(sheet['B2'].value, '02.11.2026')
         self.assertEqual(sheet['E2'].alignment.horizontal, 'right')
-        self.assertFalse(sheet['E2'].alignment.shrink_to_fit)
-        self.assertTrue(all(sheet[coordinate].alignment.wrap_text for coordinate in ('B2', 'C2', 'E2', 'F2')))
-        self.assertGreater(sheet.row_dimensions[2].height, 30)
-        self.assertGreaterEqual(sum(sheet.row_dimensions[row].height for row in range(2, 5)), 120)
+        self.assertTrue(sheet['E2'].alignment.shrink_to_fit)
+        self.assertTrue(sheet['C2'].alignment.wrap_text)
+        self.assertTrue(all(not sheet[coordinate].alignment.wrap_text for coordinate in ('B2', 'E2', 'F2')))
+        self.assertEqual(sheet.row_dimensions[2].height, 15)
+        self.assertEqual(sheet.row_dimensions[3].height, 15)
         self.assertIsNone(result['Unrelated']['A1'].alignment.wrap_text)
         self.assertTrue(sheet.column_dimensions['C'].alignment.wrap_text)
         self.assertTrue(all('Generated Externally' not in rule.formula1
                             for rule in sheet.data_validations.dataValidation))
+
+    def test_auto_fit_only_touches_the_new_inward_and_its_wrapped_cells(self):
+        book = Workbook()
+        sheet = book.active
+        sheet.append(['SN','Inward Date','Supplier Name','Location','Item','Weight (KG)','Form 6 No','COD No','COD Date','Certificate Issued'])
+        sheet.append([1,'02.11.2026','A company name long enough to wrap across the narrow column','Pune','Laptop',5,'F6-1','0042','03/11/26','Ready'])
+        sheet.append([2,'03.11.2026','Another company name long enough to wrap across the narrow column','Mumbai','Monitor',8,'F6-2','0043','04/11/26','Ready'])
+        sheet.column_dimensions['C'].width = 15
+        sheet['C2'].alignment = Alignment(wrap_text=True, vertical='top')
+        sheet['C3'].alignment = Alignment(wrap_text=False, vertical='top')
+        sheet.row_dimensions[2].height = 15
+        sheet.row_dimensions[3].height = 15
+        buffer = BytesIO()
+        book.save(buffer)
+        book.close()
+
+        updated = normalize_register_presentation(buffer.getvalue(), fit_inward=('Sheet', '1'))
+        result = load_workbook(BytesIO(updated))
+        self.addCleanup(result.close)
+        sheet = result.active
+        self.assertTrue(sheet['C2'].alignment.wrap_text)
+        self.assertFalse(sheet['C3'].alignment.wrap_text)
+        self.assertGreater(sheet.row_dimensions[2].height, 15)
+        self.assertEqual(sheet.row_dimensions[3].height, 15)
 
 
 if __name__=='__main__':unittest.main()

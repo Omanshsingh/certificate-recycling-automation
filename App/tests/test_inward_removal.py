@@ -5,6 +5,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
+from xml.etree import ElementTree as ET
 from zipfile import ZipFile
 
 from openpyxl import load_workbook
@@ -214,9 +215,37 @@ class InwardRemovalTests(unittest.TestCase):
                     data=data.replace(b'<f>F3*G3</f>',b'<f t="shared" si="0" ref="H3:H5">F3*G3</f>')
                 target.writestr(info,data)
         self.paths[0].write_bytes(output.getvalue());before=self.paths[0].read_bytes()
-        with self.assertRaisesRegex(ValueError,'shared calculations'):
+        with self.assertRaisesRegex(ValueError,'shared formula group is incomplete'):
             remove_inward(self.root,self.body())
         self.assertEqual(self.paths[0].read_bytes(),before)
+
+    def test_complete_shared_formula_group_survives_removing_an_inward(self):
+        book=load_workbook(self.paths[0]);sheet=book.active
+        for row in range(2,6): sheet[f'H{row}']=f'=F{row}*G{row}'
+        book.save(self.paths[0]);book.close()
+        output=BytesIO()
+        with ZipFile(self.paths[0]) as source,ZipFile(output,'w') as target:
+            for member in source.infolist():
+                payload=source.read(member.filename)
+                if member.filename=='xl/worksheets/sheet1.xml':
+                    xml=ET.fromstring(payload)
+                    for row in range(2,6):
+                        formula=xml.find(f'.//{{*}}c[@r="H{row}"]/{{*}}f')
+                        formula.attrib.update(t='shared',si='0')
+                        if row==2: formula.attrib['ref']='H2:H5'
+                        else: formula.text=None
+                    payload=ET.tostring(xml)
+                target.writestr(member,payload)
+        self.paths[0].write_bytes(output.getvalue())
+
+        result=remove_inward(self.root,self.reviewed(),commit=True)
+
+        self.assertTrue(result['removed'])
+        self.assertEqual([row['case_id'] for row in read_batches(self.paths[0])],['1','2'])
+        book=load_workbook(self.paths[0],data_only=False)
+        self.assertEqual(book.active['H2'].value,'=F2*G2')
+        self.assertEqual(book.active['H3'].value,'=F3*G3')
+        book.close()
 
 
 if __name__=='__main__':
