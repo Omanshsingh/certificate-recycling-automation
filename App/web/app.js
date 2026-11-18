@@ -2097,6 +2097,15 @@ function compareRows(a, b) {
     const first=companySerial(a),second=companySerial(b);
     return (first === '—') - (second === '—') || first.localeCompare(second, undefined, {numeric:true}) || String(a.plant).localeCompare(String(b.plant));
   }
+  if (order === 'added-newest' || order === 'added-oldest') {
+    const first = companySerial(a), second = companySerial(b);
+    const firstMissing = !first || first === '—', secondMissing = !second || second === '—';
+    if (firstMissing !== secondMissing) return Number(firstMissing) - Number(secondMissing);
+    const direction = order === 'added-newest' ? -1 : 1;
+    return direction * first.localeCompare(second, undefined, {numeric:true, sensitivity:'base'})
+      || String(a.plant || '').localeCompare(String(b.plant || ''))
+      || company(a).localeCompare(company(b), undefined, {numeric:true});
+  }
   if (order === 'received-newest') return received(b).localeCompare(received(a)) || companySerial(a).localeCompare(companySerial(b), undefined, {numeric:true});
   return (received(a) || '9999-99-99').localeCompare(received(b) || '9999-99-99')
     || String(a.plant || '').localeCompare(String(b.plant || ''))
