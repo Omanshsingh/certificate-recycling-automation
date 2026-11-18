@@ -41,8 +41,8 @@ def _require_unissued(details, status, identity, receipts, inventory):
 
 def _selected(body):
     choices = body.get('selected')
-    if not isinstance(choices, list) or not 1 <= len(choices) <= 50 or type(body.get('include_linked_hdd')) is not bool:
-        raise ValueError('Select between 1 and 50 entries and review whether linked HDD records are included.')
+    if not isinstance(choices, list) or not 1 <= len(choices) <= 50:
+        raise ValueError('Select between 1 and 50 entries to review.')
     result = []
     for choice in choices:
         if (not isinstance(choice, dict) or choice.get('source_kind') not in {'manual', 'workbook'}
@@ -86,9 +86,6 @@ def _prepare(root, body, sessions):
             linked.append(record)
             _require_unissued(record['details'], record.get('status'),
                               ('manual', record['plant'], record['id'].casefold()), receipts, inventory)
-            if body['include_linked_hdd'] and record['id'] not in manual_ids:
-                choice = {'source_kind':'manual', 'plant':record['plant'], 'record_id':record['id']}
-                selected.append(choice); identities.add(_key(choice)); manual_ids.add(record['id'])
     for choice in selected:
         plant = choice['plant']
         if choice['source_kind'] == 'workbook':
@@ -161,7 +158,7 @@ def _prepare(root, body, sessions):
     ids = [row['id'] for row in receipts if row.get('state') == 'complete' and
         (row.get('source_kind'),row.get('plant'),str(row.get('key','')).strip().casefold()) in identities]
     review = {'entries': entries, 'pdfs': [pdf['path'] for pdf in pdfs], 'kept_hdd': kept_hdd,
-              'include_linked_hdd':body['include_linked_hdd']}
+              'include_linked_hdd':False}
     return review, sources, pdfs, ids
 
 
@@ -252,7 +249,12 @@ def delete_entries(root, body, *, commit=False):
     identifier = body.get('request_id')
     if not re.fullmatch(r'[a-f0-9]{32}', str(identifier or '')):
         raise ValueError('Open the Settings deletion search and review the selected entries.')
-    request = {'selected':selected, 'include_linked_hdd':body['include_linked_hdd'], 'request_id':identifier}
+    # Allow a retry to read its old committed journal, but require explicit
+    # selection of each entry for any new deletion.
+    legacy_include = body.get('include_linked_hdd', False)
+    if type(legacy_include) is not bool:
+        raise ValueError('Search and review the selected entries again.')
+    request = {'selected':selected, 'include_linked_hdd':legacy_include, 'request_id':identifier}
     journal = root/'Data'/'Entry Deletions'/(identifier+'.json')
     with run_lock(root):
         from issuance_safety import recover_issuances
@@ -264,6 +266,8 @@ def delete_entries(root, body, *, commit=False):
             if existing.get('state') == 'complete' and commit:
                 return {'deleted':True, 'review':existing['review']}
             raise ValueError('Review the selection again before retrying this deletion.')
+        if legacy_include:
+            raise ValueError('Select each Data Destruction entry you want to delete, then review the selection again.')
         settings = load_settings(root)
         paths = []
         for choice in selected:

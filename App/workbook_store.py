@@ -1855,6 +1855,7 @@ class WorkbookSession:
         if current.get('external_pdf'):
             metadata['_external_pdf'] = None
         updated = write_details(updated, current['source_sheet'], current['case_id'], metadata)
+        updated = self._move_primary_hdd_after_recycling_write(updated, current)
         updated = order_register_for_save(updated, self)
 
         verified_matches = [b for b in read_batches(BytesIO(updated))
@@ -1972,6 +1973,8 @@ class WorkbookSession:
             metadata_updates['_pdf_recovery_pending'] = True
         if metadata_updates:
             updated = write_details(updated, current['source_sheet'], current['case_id'], metadata_updates)
+        if external:
+            updated = self._move_primary_hdd_after_recycling_write(updated, current)
         verified = next(batch for batch in read_batches(BytesIO(updated))
                         if batch["case_id"] == current['case_id']
                         and batch["source_sheet"] == source_sheet
@@ -1983,6 +1986,15 @@ class WorkbookSession:
                 or (external_type and verified['certificate_type'] != external_type)):
             raise ValueError("The workbook status update could not be verified; the original file was kept.")
         return self._persist(updated)
+
+    def _move_primary_hdd_after_recycling_write(self, data, previous):
+        if not previous.get('hdd_on_main_row'):
+            return data
+        from hdd_workbook import stage_hdd_tracking
+        staged = WorkbookSnapshot(self.path)
+        staged.data = data
+        return stage_hdd_tracking(staged, previous['case_id'], previous['hdd_cod_no'],
+                                  parse_date(previous['hdd_cod_date']), format_register=False)
 
     def _persist(self, updated, *, exact=False):
         if not exact:
@@ -2338,6 +2350,9 @@ def stage_certificate_details(session, details, validate_cells=True, *, inward_s
                 # Excel's number format. Keep its original numeric cell and
                 # legacy metadata key when editing an existing inward.
                 continue
+            if (key in {'cod_no', 'cod_date'} and original_batch
+                    and original_batch.get('hdd_on_main_row')):
+                continue  # Only a successful recycling write may move the HDD tracking.
             if material_override is not None and key in {'item', 'quantity', 'per_piece_weight', 'weight'}:
                 # Real saves write all material rows together below; PDF-only
                 # projections are applied directly to the returned batch.

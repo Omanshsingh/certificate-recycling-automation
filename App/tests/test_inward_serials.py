@@ -186,6 +186,7 @@ class InwardSerialTests(unittest.TestCase):
         self.assertEqual((self.root / 'Data' / 'Custom Certificates.json').read_bytes(), register_bytes)
         self.assertTrue(all(path.read_bytes() == data for path, data in pdfs.items()))
         self.assertTrue(all(path.read_bytes() == data for path, data in history.items()))
+
         expected = workspace_revision(self.root)
         with patch.object(web_app, 'WORKSPACE_STATE_CACHE', (expected, result['state'])):
             completion_state = web_app.complete_workbook_record({'plant':'plant1','sn':'6','expected_revision':expected})
@@ -204,6 +205,18 @@ class InwardSerialTests(unittest.TestCase):
         self.add(1, 'd')
         self.assertEqual(latest_issuance(self.root, 'workbook', 'plant1', '7')['cod'], original['5']['cod_no'])
         self.assertEqual(read_register(self.root)['records'][0]['details']['destruction_source']['case_id'], '7')
+
+    def test_backdated_add_keeps_existing_numbers_when_history_reserves_a_missing_number(self):
+        receipt = {'id': 'older-receipt', 'state': 'complete', 'source_kind': 'workbook',
+                   'plant': 'plant1', 'key': '7', 'cod': '0099'}
+        with patch('issuance_safety.audit_records', return_value=[receipt]):
+            result, request = self.add(2)
+        self.assertEqual(result['client']['sn'], '8')
+        self.assertTrue(result['serial_order_kept'])
+        rows = read_batches(self.paths[0])
+        self.assertEqual([(row['case_id'], row['supplier']) for row in rows],
+                         [('4', 'Company 4'), ('8', 'Backdated a'), ('5', 'Company 5'), ('6', 'Company 6')])
+        self.assertEqual(web_app.add_client(request)['client']['sn'], '8')
 
     def test_repeated_backdated_additions_and_lost_response_follow_the_same_client(self):
         first, first_body = self.add(2)

@@ -10,6 +10,7 @@ revisionEndpoints.add('/api/entries/undo-delete');
 const deletionUndoKey = 'ecoreco-last-deletion';
 revisionEndpoints.add('/api/clients/status'); revisionEndpoints.add('/api/certificates/link-external');
 revisionEndpoints.add('/api/certificates/save-upload');
+revisionEndpoints.add('/api/certificates/save-upload-details');
 function hasInward(row) { return row && !isManual(row) && ['plant1','plant2'].includes(row.plant) && String(row.sn || '').trim(); }
 function missingFollowup(row) { return hasInward(row) ? Object.keys(followupFields).filter(key => !String(row[key] || '').trim()) : []; }
 const workingDraftKey = 'ecoreco.certificate.working-draft.v1';
@@ -106,6 +107,15 @@ function issuedExcelDetailsChanged(current, issued) {
     .filter(item => item && typeof item === 'object' && Object.values(item).some(field => String(field ?? '').trim()))
     .map(item => ['item', 'quantity', 'per_piece_weight', 'weight'].map(key => comparable(item[key], key)));
   return JSON.stringify(materials(current.items)) !== JSON.stringify(materials(issued.items));
+}
+
+function hasExcelDetailsChangedSinceIssue(row) {
+  const issued = row && (row.has_issued_certificate || ['generated', 'generated_manual', 'completed'].includes(stateOf(row)));
+  const issuedDetails = row?.last_certificate_details && !recordIdentityIssue(row) ? row.last_certificate_details : null;
+  const uploadRow = row?.uploaded_pdf_sha256 && row.pdf_relative_path;
+  return Boolean(issued && issuedDetails && !isManual(row) && !uploadRow
+    && (typeof row.excel_details_changed_since_issue === 'boolean'
+      ? row.excel_details_changed_since_issue : issuedExcelDetailsChanged(row, issuedDetails)));
 }
 
 function beginIssuedCertificateCorrection() {
@@ -479,7 +489,9 @@ async function saveClient() {
       && String(item.sn) === String(response.client.sn));
     const next = response.client.status === 'na' ? 'No certificate needed.'
       : row && readyForBatch(row) ? 'Ready to create a certificate.' : 'Open Review & edit to finish the certificate details.';
-    const orderNote = response.order_warning
+    const orderNote = response.serial_order_kept
+      ? ' Existing serial numbers were kept to protect earlier certificates.'
+      : response.order_warning
       ? ' Excel kept its current row order; sort dates in Excel if needed.' : '';
     toast(`${response.client.supplier} added to ${labelPlant(response.client.plant)}. ${next}${orderNote}`);
   } catch (error) {
@@ -1009,9 +1021,33 @@ async function api(path, payload, {background = false} = {}) {
   const options = payload === undefined ? { method: 'GET' } : {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
   };
-  let response;
-  try { response = await fetch(path, options); }
+  if (path === '/api/workbook-changes') options.headers = {
+    'X-Workspace-Revision': app.state.workspace_revision || '-',
+    'X-Workbook-Report': app.state.run_id || '-',
+  };
+  const requestTimeoutMs = path === '/api/state' ? 20000
+    : ['/api/workbook-changes', '/api/check', '/api/templates'].includes(path) ? 60000 : 0;
+  const controller = requestTimeoutMs ? new AbortController() : null;
+  if (controller) options.signal = controller.signal;
+  let requestTimer;
+  let response, data;
+  try {
+    if (controller) requestTimer = setTimeout(() => controller.abort(), requestTimeoutMs);
+    response = await fetch(path, options);
+    data = await response.json().catch(error => {
+      if (error.name === 'AbortError') throw error;
+      return {};
+    });
+  }
   catch (error) {
+    if (error.name === 'AbortError') {
+      const message = path === '/api/workbook-changes' || path === '/api/check'
+        ? 'The Excel check is taking longer than expected. Your last checked list is still available; close both plant workbooks, then try Refresh again.'
+        : path === '/api/templates'
+          ? 'Certificate templates are taking too long to load. The company list is still available; try Refresh.'
+          : 'The company list is taking too long to load. Click Refresh to try again; your Excel files and PDFs are unchanged.';
+      throw new Error(message);
+    }
     if (background) throw new Error('The local dashboard could not be reached. Click Refresh to check the connection.');
     $('#offline-title').textContent = 'Connection lost';
     $('#offline-message').textContent = 'The app is not responding. Your saved files are safe. Check the connection, or reopen Prepare Certificates. Do not repeat creation until you have checked Saved certificates.';
@@ -1020,7 +1056,7 @@ async function api(path, payload, {background = false} = {}) {
     if (document.querySelector('dialog[open]') && !$('#connection-modal').open) $('#connection-modal').showModal();
     throw new Error('The local dashboard server is not responding. Reopen Prepare Certificates.bat.');
   }
-  const data = await response.json().catch(() => ({}));
+  finally { if (requestTimer) clearTimeout(requestTimer); }
   if (!response.ok) {
     const error = new Error((data.error || `Request failed (${response.status}).`) + (response.status === 409 ? ' Refresh Excel and reopen the details to review the latest data. Your working draft is kept.' : ''));
     error.clientRequestEnded = path === '/api/clients/add' && data.client_request_ended === true;
@@ -1230,6 +1266,7 @@ const recordFilterDefaults = {
 };
 const recordStatusTitles = {
   all:'All companies', ready:'Ready', needs_attention:'Needs attention', details_to_finish:'Details to finish',
+  excel_changed:'Excel changed',
   generated:'Generated', generated_manual:'Generated Externally', completed:'Completed', blank:'No status selected',
   na:'N/A', pending_review:'Not ready yet', awaiting_send:'Created, not completed',
   destruction_pending:'Data Destruction follow-up', overdue_unissued:'No certificate after 30 days',
@@ -1403,10 +1440,12 @@ function inwardPicker(id, onSelection = () => {}) {
   const status = $(`#${id}-results`);
   let rows = [], matches = [], selected = null, active = -1;
   let emptyMessage = 'No available Excel inwards.';
-  const key = row => row.record_id || `${row.plant}:${row.sn}`;
+  const key = row => row.upload_slot_key || row.record_id || `${row.plant}:${row.sn}`;
   const company = row => savedCertificateDetails(row).supplier || 'Company name missing';
-  const identity = row => [labelPlant(row.plant), row.plant && `SN ${row.sn}`, templateNames[templateId(row)],
-    row.certificate_no && `COD ${row.certificate_no}`, uploadCanReplace(row) && 'Existing PDF · can replace'].filter(Boolean).join(' · ');
+  const identity = row => [labelPlant(row.plant), row.plant && `SN ${row.sn}`,
+    templateNames[row.upload_certificate_type || templateId(row)], row.upload_slot_action,
+    uploadExistingCod(row) && `COD ${uploadExistingCod(row)}`,
+    !row.upload_slot_action && uploadCanReplace(row) && 'Existing PDF · can replace'].filter(Boolean).join(' · ');
   const label = row => `${company(row)} · ${identity(row)}`;
   const normalize = value => String(value).toLocaleLowerCase()
     .replace(/[^\p{L}\p{N}]+/gu, ' ').trim().replace(/\bplant\s+([12])\b/g, 'plant$1');
@@ -1491,7 +1530,14 @@ function inwardPicker(id, onSelection = () => {}) {
 
   return {
     select(row) {
-      const candidate = rows.find(item => key(item.row) === key(row));
+      const candidate = rows.find(item => {
+        const option = item.row;
+        if (row.upload_slot_key) return key(option) === key(row);
+        if (row.record_id) return option.record_id === row.record_id
+          || option.upload_target?.record_id === row.record_id;
+        return option.plant === row.plant && String(option.sn) === String(row.sn)
+          && (option.upload_certificate_type || templateId(option)) === templateId(row);
+      });
       if (candidate) choose(candidate.row);
     },
     update(candidates, {reset = false, disabled = false, empty = 'No available Excel inwards.'} = {}) {
@@ -1509,6 +1555,7 @@ function inwardPicker(id, onSelection = () => {}) {
     selection() {
       const row = this.row();
       if (!row) return null;
+      if (row.upload_target) return {...row.upload_target, certificate_type:row.upload_certificate_type};
       return row.record_id ? {record_id:row.record_id} : {plant:row.plant, sn:String(row.sn)};
     },
   };
@@ -1517,6 +1564,19 @@ function inwardPicker(id, onSelection = () => {}) {
 const uploadInwardPicker = inwardPicker('upload-inward', updateUploadSelection);
 const uploadDetailFields = ['supplier', 'location', 'inward_date', 'reference', 'form6', 'certificate_weight'];
 let uploadDetailDraft = null;
+
+function uploadExistingCod(row) {
+  if (row?.upload_certificate_type === 'destruction' && !row.upload_replacement) return '';
+  return row?.certificate_no || '';
+}
+
+function attachedUploadCod(row, upload) {
+  const existing = uploadExistingCod(row);
+  if (upload?.cod && (upload.cod_source !== 'filename' || !existing)) {
+    return {value:upload.cod, source:upload.cod_source || 'pdf'};
+  }
+  return {value:existing, source:'inward'};
+}
 
 function uploadDestructionRequest(row) {
   return linkedDestructionRequest(isManual(row) ? {record_id:row.record_id}
@@ -1533,10 +1593,65 @@ function uploadCanReplace(row) {
     && String(inward.sn) === String(link.case_id) && !inward.workbook_read_only && !recordIdentityIssue(inward));
 }
 
+function uploadSlotKey(row, type) {
+  const link = row?.destruction_source || row?.raw_details?.destruction_source;
+  const owner = link?.record_id ? `local:${link.record_id}`
+    : link?.plant ? `${link.plant}:${link.case_id}`
+      : isManual(row) ? `manual:${row.record_id}` : `${row?.plant}:${row?.sn}`;
+  return `${owner}:${type}`;
+}
+
+function uploadSlot(row, type, target, replacing) {
+  return {...row, upload_certificate_type:type, upload_target:target,
+    upload_replacement:Boolean(replacing), upload_slot_key:uploadSlotKey(row, type),
+    upload_slot_action:replacing ? 'Replace existing PDF' : 'Add certificate'};
+}
+
+function uploadCandidates() {
+  const candidates = [], seen = new Set();
+  const add = (row, type, target, replacing) => {
+    const candidate = uploadSlot(row, type, target, replacing);
+    if (!seen.has(candidate.upload_slot_key)) {
+      seen.add(candidate.upload_slot_key);
+      candidates.push(candidate);
+    }
+  };
+  for (const row of app.state.rows) {
+    if (hasInward(row)) {
+      if (row.workbook_read_only || recordIdentityIssue(row)) continue;
+      const inwardType = templateId(row) === 'destruction' ? 'standard' : templateId(row);
+      const recyclingReplace = uploadCanReplace(row) && inwardType === templateId(row);
+      const recyclingAdd = !recyclingReplace && !row.external_pdf && !row.pdf_relative_path && !row.pdf_missing
+        && (!row.has_issued_certificate || stateOf(row) === 'generated_manual')
+        && ['blank','alert','ready','generated_manual'].includes(stateOf(row));
+      if (recyclingReplace || recyclingAdd) {
+        add(row, inwardType, {plant:row.plant, sn:String(row.sn)}, recyclingReplace);
+      }
+
+      const request = uploadDestructionRequest(row);
+      if (request && uploadCanReplace(request)) {
+        add(request, 'destruction', {record_id:request.record_id}, true);
+        continue;
+      }
+      const requestIssued = request && (request.certificate_no
+        || ['generated','generated_manual','completed'].includes(stateOf(request)));
+      const requestActive = request?.record_id && request.destruction_requested !== false && stateOf(request) !== 'na';
+      if (!row.hdd_cod_no && !requestIssued && requestActive) {
+        add(row, 'destruction', {plant:row.plant, sn:String(row.sn)}, false);
+      }
+      continue;
+    }
+    if (isManual(row) && uploadCanReplace(row)) {
+      add(row, templateId(row), {record_id:row.record_id}, true);
+    }
+  }
+  return candidates;
+}
+
 function uploadIsReplacement(row = uploadInwardPicker.row()) {
-  const type = $('#upload-certificate-form').elements.namedItem('certificate_type').value;
-  return $('#external-upload-target').value === 'workbook' && uploadCanReplace(row)
-    && type === templateId(row);
+  if ($('#external-upload-target').value !== 'workbook') return false;
+  if (row && Object.hasOwn(row, 'upload_replacement')) return row.upload_replacement === true;
+  return uploadCanReplace(row);
 }
 
 function updateUploadTarget(reset = false) {
@@ -1548,25 +1663,16 @@ function updateUploadTarget(reset = false) {
   $('#upload-inward').placeholder = 'Search company, certificate number, SN or plant';
   const form = $('#upload-certificate-form');
   const type = form.elements.namedItem('certificate_type');
-  type.disabled = false;
-  const hdd = type.value === 'destruction';
-  const eligible = app.state.rows.filter(row => {
-    if (recordIdentityIssue(row) || row.workbook_read_only) return false;
-    const canReplace = uploadCanReplace(row) && (!type.value || type.value === templateId(row));
-    if (hdd) {
-      if (canReplace) return true;
-      if (!hasInward(row) && !(isManual(row) && row.record_id && templateId(row) !== 'destruction')) return false;
-      const linked = uploadDestructionRequest(row);
-      return !row.hdd_cod_no && !(templateId(row) === 'destruction' && row.certificate_no)
-        && (!linked || (!linked.certificate_no && stateOf(linked) !== 'na'));
-    }
-    return canReplace || (hasInward(row) && !row.external_pdf && !row.pdf_relative_path && !row.pdf_missing
-      && ['blank','alert','ready','generated_manual'].includes(stateOf(row)));
-  });
-  uploadInwardPicker.update(eligible, {reset, disabled:local,
-    empty:hdd
-      ? 'No matching clients without a Data Destruction certificate.'
-      : 'No available Excel inwards. To add an HDD certificate, choose Data Destruction above.'});
+  const codField = $('#upload-cod-field');
+  const autoNote = $('#upload-attached-auto-note');
+  type.disabled = !local;
+  type.required = local;
+  $('#upload-type-field').hidden = !local;
+  $('#upload-cod').disabled = !local;
+  codField.hidden = !local;
+  autoNote.hidden = local;
+  uploadInwardPicker.update(uploadCandidates(), {reset, disabled:local,
+    empty:'No eligible certificate slots are available for this client. Existing PDFs can be replaced from the client’s Review & edit screen.'});
   updateUploadSelection();
 }
 
@@ -1589,14 +1695,15 @@ function updateUploadSelection() {
     field.readOnly = viewOnlyClientDetails;
     field.setAttribute('aria-readonly', String(viewOnlyClientDetails));
   }
-  const rowKey = JSON.stringify([mode, uploadInwardPicker.selection()]);
-  if (row && rowKey !== uploadDetailDraft?.rowKey && !app.uploadTypeExplicit) {
-    type.value = templateId(row);
+  const selected = uploadInwardPicker.selection();
+  const rowKey = JSON.stringify([mode, selected]);
+  if (row && mode === 'workbook') {
+    type.value = selected.certificate_type;
+    type.disabled = true;
   }
   const replacing = uploadIsReplacement(row);
-  type.disabled = replacing;
+  if (local) type.disabled = false;
   $('#upload-replacement-note').hidden = !replacing;
-  $('#upload-replacement-note').textContent = 'This client already has this certificate. The new PDF will replace it, keep the existing COD and archive the previous PDF.';
   $('#save-uploaded-certificate').textContent = replacing ? 'Replace PDF' : 'Save certificate';
   const hdd = type.value === 'destruction';
   const pending = row && mode === 'workbook' && hdd && !replacing && uploadDestructionRequest(row);
@@ -1609,7 +1716,7 @@ function updateUploadSelection() {
   for (const name of [...uploadDetailFields, 'cod_date']) {
     const field = form.elements.namedItem(name);
     const value = name === 'cod_date'
-      ? (hdd && !replacing ? pending?.certificate_date : row?.certificate_date)
+      ? (hdd && !replacing ? pending?.certificate_date || '' : row?.certificate_date)
       : saved?.[name];
     defaults[name] = escapeText(name.endsWith('_date') && value ? dateLabel(value) : value);
     if (!prior || field.value === prior[name]) {
@@ -1637,11 +1744,30 @@ function updateUploadCod() {
   const upload = app.uploadedFile;
   const row = uploadInwardPicker.row();
   const replace = uploadIsReplacement(row);
-  if (replace) {
-    const cod = row?.certificate_no || '';
-    input.value = cod;
+  const local = $('#external-upload-target').value === 'local';
+  $('#save-uploaded-certificate').disabled = !upload || (!local && !row);
+  $('#upload-duplicate-alert').hidden = replace || !upload?.previously_used;
+  if (!local) {
+    input.value = '';
     input.readOnly = true;
-    hint.textContent = cod ? 'The replacement must keep this existing COD.' : 'Choose the existing certificate first.';
+    const note = $('#upload-attached-auto-note');
+    if (replace) {
+      const printed = upload?.printed_cods ?? (upload?.cod_source === 'pdf' && upload.cod ? [upload.cod] : []);
+      note.hidden = !printed.length;
+      note.textContent = printed.length ? `COD on the uploaded PDF · ${printed.join(', ')}` : '';
+      $('#upload-replacement-note').textContent = `Replaces the saved PDF and keeps its filename and COD ${uploadExistingCod(row)}.`;
+      return;
+    }
+    note.hidden = false;
+    const selectedCod = attachedUploadCod(row, upload);
+    const source = {filename:'from the file name', pdf:'from the PDF', inward:'from the selected record'};
+    hint.textContent = selectedCod.value ? `Using COD ${selectedCod.value} ${source[selectedCod.source]}.`
+      : upload?.ambiguous_cod ? 'The certificate number could not be identified from this PDF.'
+        : 'The certificate number will be read from the PDF automatically.';
+    note.textContent = selectedCod.value
+      ? `Type: ${templateNames[row?.upload_certificate_type] || 'Certificate'} · ${hint.textContent}`
+      : upload?.ambiguous_cod ? 'The PDF has multiple possible numbers. Use a searchable PDF with one clear certificate number.'
+        : 'Certificate type comes from the selected slot. COD is read from the PDF.';
     return;
   }
   const form = $('#upload-certificate-form');
@@ -1674,9 +1800,9 @@ function openUploadCertificate({entry = null, replacement = null} = {}) {
   const filename = $('#upload-saved-filename');
   filename.hidden = !entry;
   filename.textContent = entry ? certificateFileName(entry) : '';
-  $('#save-uploaded-certificate').disabled = Boolean(entry);
   formatFormDates(form);
   $('#upload-certificate-error').hidden = true;
+  $('#upload-duplicate-alert').hidden = true;
   const kind = entry && savedFileTypeId(entry);
   if (kind) {
     form.elements.namedItem('certificate_type').value = kind;
@@ -1699,6 +1825,20 @@ function fillUploadReference() {
   }
 }
 
+function showDuplicatePdfReview() {
+  const upload = app.uploadedFile;
+  if (!upload?.previously_used) return;
+  const savedName = app.savedFileEntry?.path?.split(/[\\/]/).pop();
+  const fileName = upload.file?.name || savedName || 'Selected certificate PDF';
+  const cod = upload.cod || upload.filename_cod || upload.manualCod || '';
+  $('#upload-duplicate-previous').textContent = cod ? `Previously used · COD ${cod}` : 'Previously used in this workspace';
+  $('#upload-duplicate-current').textContent = cod ? `${fileName} · COD ${cod}` : fileName;
+  $('#upload-duplicate-next-step').textContent = uploadIsReplacement()
+    ? 'You can continue. Only the certificate selected for replacement is affected; other saved certificates stay as they are.'
+    : 'You can still save it. The app keeps it as a separate certificate copy and leaves existing PDFs unchanged.';
+  $('#upload-duplicate-review-modal').showModal();
+}
+
 async function inspectUploadedCertificate() {
   const file = $('#external-upload-file').files[0];
   const previous = app.uploadedFile;
@@ -1707,16 +1847,15 @@ async function inspectUploadedCertificate() {
   const reference = form.elements.namedItem('reference');
   if (previous?.suggestedReference && reference.value === previous.suggestedReference) reference.value = '';
   const error = $('#upload-certificate-error');
-  const submit = $('#save-uploaded-certificate');
   error.hidden = true;
-  submit.disabled = Boolean(file);
+  $('#upload-duplicate-alert').hidden = true;
   updateUploadCod();
   if (!file) return;
   try {
     const contentType = /\.png$/i.test(file.name) ? 'image/png'
       : /\.jpe?g$/i.test(file.name) ? 'image/jpeg' : 'application/pdf';
     const response = await fetch('/api/certificates/upload-file', {method:'POST',
-      headers:{'Content-Type':contentType}, body:file});
+      headers:{'Content-Type':contentType, 'X-Certificate-Filename':encodeURIComponent(file.name)}, body:file});
     const upload = await response.json();
     if ($('#external-upload-file').files[0] !== file || !$('#upload-certificate-modal').open) return;
     if (!response.ok || !upload.token) throw new Error(upload.error || 'The certificate file could not be uploaded.');
@@ -1728,8 +1867,6 @@ async function inspectUploadedCertificate() {
       error.textContent = exception.message;
       error.hidden = false;
     }
-  } finally {
-    if ($('#external-upload-file').files[0] === file) submit.disabled = !app.uploadedFile;
   }
 }
 
@@ -1743,7 +1880,6 @@ async function inspectSavedCertificate(entry) {
     app.uploadedFile = result;
     if ($('#external-upload-target').value === 'local') fillUploadReference();
     updateUploadCod();
-    $('#save-uploaded-certificate').disabled = false;
   } catch (exception) {
     if (!$('#upload-certificate-modal').open || !input.disabled || app.savedFileEntry !== entry) return;
     const error = $('#upload-certificate-error');
@@ -1764,8 +1900,20 @@ async function saveUploadedCertificate(event) {
   const mode = $('#external-upload-target').value;
   const replace = uploadIsReplacement();
   const cod = $('#upload-cod');
-  if (!replace && !cod.readOnly && cod.value.trim()) details.cod_no = cod.value.trim();
   if (mode !== 'local' && !selected) return;
+  if (replace) {
+    delete details.cod_no;
+  } else if (mode === 'workbook') {
+    details.certificate_type = selected.certificate_type;
+    const attachedCod = attachedUploadCod(uploadInwardPicker.row(), upload).value;
+    if (!attachedCod) {
+      const error = $('#upload-certificate-error');
+      error.textContent = 'I could not identify one certificate number. Upload a searchable PDF with its number on the first page, or use a clear filename such as COD_0210.pdf.';
+      error.hidden = false;
+      return;
+    }
+    details.cod_no = attachedCod;
+  } else if (!cod.readOnly && cod.value.trim()) details.cod_no = cod.value.trim();
   // Attached-client details are a read-only reference. Corrections belong in
   // Review & edit, where the app can save them back to the right inward.
   if (selected) for (const name of uploadDetailFields) delete details[name];
@@ -1789,7 +1937,8 @@ async function saveUploadedCertificate(event) {
     app.savedFilesPage = 1;
     renderFolderInventory();
     const action = saved.replaced ? 'PDF replaced' : 'PDF saved';
-    toast(saved.state?.setup_warning || `Certificate ${saved.certificate_no}: ${action}.`, Boolean(saved.state?.setup_warning));
+    const duplicateNote = saved.previously_used ? ' This exact PDF was used before.' : '';
+    toast(saved.state?.setup_warning || `Certificate ${saved.certificate_no}: ${action}.${duplicateNote}`, Boolean(saved.state?.setup_warning));
   } catch (exception) {
     if (exception.workspaceRecovered) updateUploadTarget();
     if (/upload has expired/i.test(exception.message)) {
@@ -1837,7 +1986,7 @@ function showSavedFile(entry) {
   typeChoice.hidden = identifiedByApp;
   selectType.value = entry.certificate_type || filenameType || '';
   $('#saved-type-status').textContent = '';
-  $('#use-saved-upload').hidden = !(entry.present && (entry.linkable_external ?? entry.external)
+  $('#use-saved-upload').hidden = !(entry.present && (entry.linkable_external || entry.external)
     && entry.sha256 && !identifiedByApp);
   renderWarningList($('#saved-file-warnings'), entry.warnings || []);
   $('#saved-file-warnings').hidden = !entry.warnings?.length;
@@ -1959,6 +2108,7 @@ function summarize(filters = readRecordFilters()) {
   $('#count-ready').textContent = ready;
   $('#count-attention').textContent = attention;
   $('#count-details-to-finish').textContent = rows.filter(row => missingFollowup(row).length).length;
+  $('#count-excel-changed').textContent = rows.filter(hasExcelDetailsChangedSinceIssue).length;
   $('#count-generated').textContent = generated;
   $('#count-generated-externally').textContent = generatedExternally;
   $('#count-completed').textContent = completed;
@@ -2093,18 +2243,27 @@ function compareRows(a, b) {
   const company = row => String(savedCertificateDetails(row).supplier || '');
   const order = $('#company-sort')?.value;
   if (order === 'company') return company(a).localeCompare(company(b), undefined, {numeric:true}) || String(a.plant).localeCompare(String(b.plant));
-  if (order === 'serial') {
-    const first=companySerial(a),second=companySerial(b);
-    return (first === '—') - (second === '—') || first.localeCompare(second, undefined, {numeric:true}) || String(a.plant).localeCompare(String(b.plant));
-  }
-  if (order === 'added-newest' || order === 'added-oldest') {
+  if (order === 'serial' || order === 'serial-lowest' || order === 'serial-highest') {
     const first = companySerial(a), second = companySerial(b);
     const firstMissing = !first || first === '—', secondMissing = !second || second === '—';
-    if (firstMissing !== secondMissing) return Number(firstMissing) - Number(secondMissing);
+    if (firstMissing !== secondMissing) return firstMissing ? 1 : -1;
+    if (firstMissing) return String(a.plant || '').localeCompare(String(b.plant || ''));
+    const direction = order === 'serial-highest' ? -1 : 1;
+    return direction * first.localeCompare(second, undefined, {numeric:true})
+      || String(a.plant || '').localeCompare(String(b.plant || ''));
+  }
+  if (order === 'added-newest' || order === 'added-oldest') {
+    const addedTime = row => {
+      const value = Date.parse(row.added_at || row.created_at || '');
+      return Number.isFinite(value) ? value : null;
+    };
+    const first = addedTime(a), second = addedTime(b);
+    if (first == null || second == null) {
+      if (first == null && second == null) return 0;
+      return order === 'added-oldest' ? (first == null ? -1 : 1) : (first == null ? 1 : -1);
+    }
     const direction = order === 'added-newest' ? -1 : 1;
-    return direction * first.localeCompare(second, undefined, {numeric:true, sensitivity:'base'})
-      || String(a.plant || '').localeCompare(String(b.plant || ''))
-      || company(a).localeCompare(company(b), undefined, {numeric:true});
+    return direction * (first - second);
   }
   if (order === 'received-newest') return received(b).localeCompare(received(a)) || companySerial(a).localeCompare(companySerial(b), undefined, {numeric:true});
   return (received(a) || '9999-99-99').localeCompare(received(b) || '9999-99-99')
@@ -2166,9 +2325,10 @@ function matches(row, ignoreStatus = false, filters = readRecordFilters()) {
   if (status === 'ready' && (state !== 'ready' || hasWarnings(row))) return false;
   if (status === 'needs_attention' && (attentionOnly ? stateLabel(row) !== 'Needs attention' : !needsAttention(row))) return false;
   if (status === 'details_to_finish' && !missingFollowup(row).length) return false;
+  if (status === 'excel_changed' && !hasExcelDetailsChangedSinceIssue(row)) return false;
   if (recordFollowupModes.has(status)) {
     if (!matchesRecordFollowup(row, status, state)) return false;
-  } else if (!['all', 'ready', 'needs_attention', 'details_to_finish'].includes(status) && state !== status) {
+  } else if (!['all', 'ready', 'needs_attention', 'details_to_finish', 'excel_changed'].includes(status) && state !== status) {
     return false;
   }
   if (search) {
@@ -2244,6 +2404,7 @@ function destructionFollowup(row) {
   if (state === 'completed' || state === 'na') return null;
   if (unavailableCertificatePdf(row)) return 'missing';
   if (state === 'generated' || state === 'generated_manual') return row.pdf_filename ? 'send' : 'missing';
+  if (state === 'alert') return 'details';
   return 'create';
 }
 
@@ -2251,7 +2412,8 @@ function destructionFollowupAction(row) {
   return ({
     missing:'Data Destruction PDF missing. Create it again in Review & edit.',
     send:'Send the Data Destruction PDF, then click Mark Completed.',
-    create:'Add the device details in Review & edit, then create the Data Destruction PDF.',
+    details:'Add the device details in Review & edit, then create the Data Destruction PDF.',
+    create:'Open Review & edit to create the Data Destruction PDF.',
   })[destructionFollowup(row)];
 }
 
@@ -2293,7 +2455,7 @@ function makeStatus(row) {
   }
   const destruction = destructionFollowup(row);
   if (destruction) {
-    const note = {missing:'PDF missing', send:'PDF ready to send', create:'PDF to create'}[destruction];
+    const note = {missing:'PDF missing', send:'PDF ready to send', create:'PDF to create', details:'Device details needed'}[destruction];
     td.append(element('small', destruction === 'send' ? 'age-note' : 'row-alert-note', note));
     return td;
   }
@@ -2542,14 +2704,36 @@ function render() {
 
 function renderWorkbookIssues() {
   const notes = $('#workbook-maintenance-note');
-  const plants = [...new Set((app.state.maintenance_notes || []).map(note => labelPlant(note.plant)))];
-  notes.hidden = plants.length === 0;
-  notes.textContent = plants.length
-    ? `${plants.join(' and ')}: Excel row order was kept. Sort dates in Excel if needed; certificates can still be created.` : '';
+  const maintenance = app.state.maintenance_notes || [];
+  const isHddNote = note => note.kind === 'hdd_tracking' || note.detail?.startsWith('HDD number could not be added to Excel:');
+  const plants = [...new Set(maintenance.filter(note => !isHddNote(note)).map(note => labelPlant(note.plant)))];
+  const messagesForMaintenance = plants.length
+    ? [`${plants.join(' and ')}: Excel row order was kept. Sort dates in Excel if needed; certificates can still be created.`] : [];
+  for (const note of maintenance.filter(isHddNote)) {
+    messagesForMaintenance.push(`${labelPlant(note.plant)}: ${note.detail}`);
+  }
+  notes.textContent = [...new Set(messagesForMaintenance)].join(' ');
+  notes.hidden = !notes.textContent;
+  const startupSnapshot = app.state.startup_snapshot === true;
+  const issuesHeading = $('#workbook-issues h2');
+  if (issuesHeading) issuesHeading.textContent = startupSnapshot
+    ? (app.workbookSyncError ? 'Excel check is taking longer' : 'Checking Excel')
+    : 'Excel files need attention';
+  const issueSettings = $('#workbook-issue-settings');
+  if (issueSettings) issueSettings.hidden = startupSnapshot && !app.workbookSyncError;
+  const issueHelp = $('#workbook-issues > p');
+  if (issueHelp) issueHelp.textContent = startupSnapshot
+    ? (app.workbookSyncError
+      ? 'Your last checked company list is still available. Close both plant workbooks, then select Refresh to check them again.'
+      : 'Your last checked company list is shown while the app checks Excel. Certificate creation will be available when the check finishes.')
+    : app.state.scan_complete === false
+      ? 'Companies we could read are shown below. Certificate creation is paused until both plant files can be checked.'
+    : 'Other companies remain available. Correct these Excel rows, then refresh.';
   const messages = (app.state.workbook_issues || []).map(row => row.detail || '').filter(Boolean);
   if (app.state.setup_warning) messages.push(app.state.setup_warning);
   if (app.workbookSyncError) messages.push(app.workbookSyncError);
-  if (app.state.scan_complete === false && !app.state.workbooks_disconnected && !messages.length) messages.push('Both Excel files could not be checked. Choose the correct plant files in Settings, then refresh.');
+  if (startupSnapshot && !messages.length) messages.push('Checking the latest Excel rows. Your saved list is available in the meantime.');
+  else if (app.state.scan_complete === false && !app.state.workbooks_disconnected && !messages.length) messages.push('Both Excel files could not be checked. Choose the correct plant files in Settings, then refresh.');
   const unique = [...new Set(messages)];
   $('#workbook-issues').hidden = unique.length === 0;
   renderWarningList($('#workbook-issue-list'), unique, true);
@@ -2615,24 +2799,45 @@ async function pollReminderReview() {
   finally { app.pollingReminderReview = false; }
 }
 
-async function syncWorkbookChanges() {
+async function syncWorkbookChanges({requested = false} = {}) {
+  if (requested && app.syncingWorkbooks) {
+    toast('Excel is already being checked.');
+    return;
+  }
   if (app.loadingWorkspace || app.syncingWorkbooks || app.stopping || !$('#offline-screen').hidden || !$('#busy-overlay').hidden
       || document.hidden || document.querySelector('dialog[open]')) return;
   app.syncingWorkbooks = true;
   const stateVersion = app.stateVersion || 0;
+  if (requested) toast('Checking Excel…');
   try {
     const response = await api('/api/workbook-changes', undefined, {background:true});
     if (stateVersion !== (app.stateVersion || 0) || app.completionBusy
         || app.removalBusy || app.entryDeletionBusy || document.querySelector('dialog[open]')) return;
+    if (response.check_pending) {
+      if (requested) toast('Another action is finishing. Excel will be checked again automatically.');
+      return;
+    }
     const hadError = Boolean(app.workbookSyncError);
     app.workbookSyncError = '';
     if (response.state) setState(response.state);
-    else if (hadError) renderWorkbookIssues();
+    else if (response.changed === false && app.state.startup_snapshot && app.workspaceRevision) {
+      app.state.scan_complete = app.state.startup_scan_complete === true;
+      delete app.state.startup_scan_complete;
+      app.state.startup_snapshot = false;
+      renderWorkbookIssues();
+      summarize();
+    } else if (hadError) renderWorkbookIssues();
+    if (requested) {
+      if (app.state.workbooks_disconnected) toast('No Excel files connected.');
+      else if (app.state.scan_complete === false || app.state.setup_warning) toast('Check the Excel message above the company list.', true);
+      else toast(response.changed ? 'Workbooks refreshed.' : 'Everything is up to date.');
+    }
   } catch (error) {
     if (app.workbookSyncError !== error.message) {
       app.workbookSyncError = error.message;
       renderWorkbookIssues();
     }
+    if (requested) toast(error.message, true);
   } finally { app.syncingWorkbooks = false; }
 }
 
@@ -2867,7 +3072,7 @@ function renderTemplateEditor() {
   const inward = editorInwardRow();
   // A linked HDD is a separate record. Its other choice opens the inward;
   // it never changes the HDD record into a recycling certificate.
-  typeSelect.disabled = Boolean(app.editor.existing && id === 'destruction' && !inward);
+  typeSelect.disabled = Boolean(app.editor.uploadRow || (app.editor.existing && id === 'destruction' && !inward));
   for (const option of typeSelect.options || []) {
     option.disabled = Boolean(id === 'destruction' && inward && !['destruction', templateId(inward)].includes(option.value));
   }
@@ -2927,7 +3132,7 @@ function renderTemplateEditor() {
       }
       label.append(input);
       if (date) configureDateInput(input, value);
-      if (field.help) label.append(element('small', '', field.help));
+      if (field.help && !app.editor.uploadRow) label.append(element('small', '', field.help));
       container.append(label);
     }
   }
@@ -3101,16 +3306,16 @@ function updateDestructionChoice(payload = null) {
     : checkbox.checked ? 'Confirm to add a Data Destruction request for later.'
     : 'Add a Data Destruction request if this client also needs HDD destruction.';
   const pendingRequest = available && !issued && !linkedRequestEditor && !requested && checkbox.checked;
-  const excelChanges = editor?.baseline && payload && fieldDifferences(editor.excelBaseline || editor.baseline, payload).length > 0;
-  const changes = editor?.baseline && payload ? fieldDifferences(editor.excelBaseline || editor.baseline, payload) : [];
+  const changes = editor?.baseline && payload ? excelFieldDifferences(editor.excelBaseline || editor.baseline, payload) : [];
+  const excelChanges = changes.length > 0;
   const newEdits = editor?.baseline && payload ? fieldDifferences(editor.baseline, payload) : [];
   const onlyInwardChanges = inwardChanges(payload).length > 0 && newEdits.every(change => Object.hasOwn(followupFields, change.key));
   const canSaveLinkedRequest = linkedRequestEditor && Boolean(request) && pendingRequest;
   const canSaveInward = available && !linkedRequestEditor
     && (editor.localInwardId ? pendingRequest : !editor.issuedCertificate || pendingRequest || onlyInwardChanges);
   const bothUnchecked = bothCertificatesUnchecked();
-  $('#save-details').hidden = Boolean(editor?.uploadRow || editor?.noCertificate || bothUnchecked);
-  $('#save-inward-details').hidden = !(canSaveLinkedRequest || canSaveInward) || Boolean(editor.identityIssue);
+  $('#save-details').hidden = Boolean(editor?.noCertificate || bothUnchecked);
+  $('#save-inward-details').hidden = !(canSaveLinkedRequest || canSaveInward) || Boolean(editor?.identityIssue || editor?.uploadRow);
   $('#save-inward-details').textContent = linkedRequestEditor || editor?.localInwardId || (pendingRequest && !onlyInwardChanges && (editor.issuedCertificate || !excelChanges))
     ? 'Save request' : 'Save to Excel';
   if (bothUnchecked) $('#change-scope').textContent = 'No certificate is selected. Use Mark N/A in Companies if no certificate is needed.';
@@ -3270,13 +3475,13 @@ function updateSourceControls() {
   if (sourceChoice) sourceChoice.hidden = kind === 'destruction';
   const plantChoice = form.elements.namedItem('plant').closest?.('.field');
   if (plantChoice) plantChoice.hidden = manual;
-  $('#record-options').hidden = Boolean(existingWorkbook);
+  $('#record-options').hidden = Boolean(existingWorkbook || app.editor?.uploadRow);
   $('#edit-scope-hint').textContent = existingWorkbook
     ? 'Excel still records the certificate number, date and Generated status. Cancel does not save changes.'
     : 'A new Excel row is saved only when the PDF is created successfully.';
   form.elements.namedItem('case_id').required = !manual;
   form.elements.namedItem('form6').required = !manual && kind === 'standard' && (!app.editor?.existing || Boolean(app.editor?.firstGeneration));
-  form.elements.namedItem('reference').required = kind !== 'destruction';
+  form.elements.namedItem('reference').required = kind !== 'destruction' && !app.editor?.uploadRow;
   form.elements.namedItem('reference').disabled = kind === 'destruction';
   $('#certificate-number-label').textContent = kind === 'destruction' ? 'Certificate number (HDD)' : 'Certificate number (COD)';
   $('#case-required').hidden = manual;
@@ -3284,8 +3489,8 @@ function updateSourceControls() {
   $('#pick-workbook').hidden = manual || Boolean(existingWorkbook);
   $('#details-plant-label').textContent = manual ? 'Plant' : 'Plant *';
   $('#material-options').hidden = manual;
-  $('#save-draft').hidden = !manual;
-  $('#draft-options').hidden = !manual;
+  $('#save-draft').hidden = !manual || Boolean(app.editor?.uploadRow);
+  $('#draft-options').hidden = !manual || Boolean(app.editor?.uploadRow);
   $('#certificate-weight-choice').hidden = true;
   certificateWeight.disabled = false;
   certificateWeight.required = !manual && Boolean(useCertificateWeight?.checked);
@@ -3313,7 +3518,8 @@ function updateSourceControls() {
     form.elements.namedItem('form6').closest('.field').hidden = true;
   }
   $('#weight-options-title').textContent = 'Certificate Weight';
-  $('#certificate-weight-hint').textContent = manual ? 'Enter the total weight to print on this certificate.'
+  $('#certificate-weight-hint').textContent = app.editor?.uploadRow ? ''
+    : manual ? 'Enter the total weight to print on this certificate.'
     : 'Enter the weight to print. Clear it to use the Excel weight or material total.';
   $('#case-id-hint').textContent = existingWorkbook ? 'This identifies the original Excel record, so it cannot be changed here.'
     : 'Filled in automatically when your Excel SNs are numeric. You can change it.';
@@ -3369,7 +3575,7 @@ function applyCertificateWeight(value) {
 }
 
 function usesSummaryEditor() {
-  return Boolean(app.editor?.uploadRow || (app.editor?.existing && !app.editor.firstGeneration && app.editor.template !== 'destruction'));
+  return Boolean(app.editor?.existing && !app.editor.uploadRow && !app.editor.firstGeneration && app.editor.template !== 'destruction');
 }
 
 function summaryEditorVisible() {
@@ -3659,7 +3865,6 @@ function setEditorMode(editing = false) {
   $('#change-details').hidden = true;
   $('#finish-editing').hidden = true;
   $('#edit-pdf-details').hidden = !(first || usesSummaryEditor());
-  if (app.editor?.uploadRow) $('#edit-pdf-details').hidden = true;
   $('#edit-pdf-details').textContent = editing ? 'Done editing' : '✎ Edit details';
   $('#edit-pdf-details').setAttribute('aria-pressed', String(Boolean(editing)));
   $('#editor-mode-title').textContent = editing ? 'Edit details' : app.editor?.existing ? 'Review & edit' : 'Certificate details';
@@ -3670,7 +3875,7 @@ function setEditorMode(editing = false) {
     : 'Choose a template, enter the details, and preview your certificate.';
   for (const name of ['supplier', 'location', 'inward_date', 'form6', 'reference', 'cod_no', 'cod_date']) {
     form.elements.namedItem(name).readOnly = name === 'cod_no'
-      || (name === 'cod_date' && !app.editor?.issuedCertificate)
+      || (name === 'cod_date' && (!app.editor?.issuedCertificate || Boolean(app.editor?.uploadRow)))
       || (first && !editing && ['supplier', 'location', 'inward_date', 'form6', 'reference'].includes(name));
   }
   if (first) form.elements.namedItem('case_id').readOnly = true;
@@ -3680,9 +3885,10 @@ function setEditorMode(editing = false) {
   }
   $('#save-details').textContent = first ? 'Generate certificate' : app.editor?.existing ? 'Save corrected certificate' : 'Create PDF';
   const noCertificate = Boolean(app.editor?.noCertificate);
-  $('#save-details').hidden = noCertificate || bothCertificatesUnchecked() || Boolean(app.editor?.uploadRow);
+  $('#save-details').hidden = noCertificate || bothCertificatesUnchecked();
   $('#replace-uploaded-pdf').hidden = !app.editor?.uploadRow || Boolean(app.editor.identityIssue || app.editor.uploadRow.workbook_read_only);
   $('#preview-details').hidden = noCertificate || Boolean(app.editor?.uploadRow);
+  $('#certificate-annexure').hidden = Boolean(app.editor?.uploadRow);
   if (noCertificate) {
     $('#details-description').textContent = app.editor.sourceSn != null
       ? `The ${templateNames[app.editor.template]} certificate is marked N/A. Use Save to Excel to update the inward.`
@@ -3695,7 +3901,10 @@ function setEditorMode(editing = false) {
       ? `Data Destruction for ${labelPlant(app.editor.destructionSource.plant)} inward ${app.editor.destructionSource.case_id}. Check the actual destruction details and both preview pages.`
       : 'Enter the company and actual destruction details, then check both preview pages. An inward entry is optional.';
   }
-  if (app.editor?.uploadRow) $('#details-description').textContent = 'Review the saved details and the original uploaded certificate.';
+  if (app.editor?.uploadRow) {
+    $('#details-description').textContent = 'Edit the certificate details or choose Replace PDF to upload a revised document.';
+    $('#save-details').textContent = 'Save details';
+  }
   renderEditorSummary();
 }
 
@@ -3751,28 +3960,31 @@ function setDetailsBusy(on) {
 }
 
 function invalidatePreview() {
-  clearAttachmentPreview();
-  $('#preview-detail-images').replaceChildren();
+  const preserveUploadedPreview = app.editor?.uploadRow && $('#details-modal').open;
   clearTimeout(app.previewTimer);
   app.previewRevision++;
-  if (app.editor) app.editor.previewFacts = null;
   $('#details-error').hidden = true;
-  $('#preview-frame').removeAttribute('src');
-  $('#preview-frame').hidden = true;
-  $('#preview-image').removeAttribute('src');
-  $('#preview-image').hidden = true;
-  $('#preview-image-note').hidden = true;
-  $('#preview-full-pdf').textContent = 'Enlarge preview';
-  $('#preview-full-pdf').setAttribute('aria-expanded', 'false');
-  $('#preview-link').removeAttribute('href');
-  $('#preview-document').hidden = true;
-  $('#preview-number').hidden = true;
-  $('#preview-warnings').hidden = true;
-  $('#editor-checks').hidden = true;
-  $('#preview-warnings-title').hidden = true;
-  $('#preview-warnings').replaceChildren();
-  $('#preview-status').textContent = app.editor?.noCertificate ? `${templateNames[app.editor.template]} certificate marked N/A.` : 'Preview updates automatically.';
-  $('#preview-details').textContent = 'Update preview';
+  if (!preserveUploadedPreview) {
+    clearAttachmentPreview();
+    $('#preview-detail-images').replaceChildren();
+    if (app.editor) app.editor.previewFacts = null;
+    $('#preview-frame').removeAttribute('src');
+    $('#preview-frame').hidden = true;
+    $('#preview-image').removeAttribute('src');
+    $('#preview-image').hidden = true;
+    $('#preview-image-note').hidden = true;
+    $('#preview-full-pdf').textContent = 'Enlarge preview';
+    $('#preview-full-pdf').setAttribute('aria-expanded', 'false');
+    $('#preview-link').removeAttribute('href');
+    $('#preview-document').hidden = true;
+    $('#preview-number').hidden = true;
+    $('#preview-warnings').hidden = true;
+    $('#editor-checks').hidden = true;
+    $('#preview-warnings-title').hidden = true;
+    $('#preview-warnings').replaceChildren();
+    $('#preview-status').textContent = app.editor?.noCertificate ? `${templateNames[app.editor.template]} certificate marked N/A.` : 'Preview updates automatically.';
+    $('#preview-details').textContent = 'Update preview';
+  }
   if (app.editor?.baseline && $('#details-modal').open) {
     updatePrintedWeight();
     renderChangeSummary();
@@ -3783,7 +3995,6 @@ function invalidatePreview() {
     }
   }
   if (app.editor?.identityIssue) updateDetailsButtons();
-  if (app.editor?.uploadRow && $('#details-modal').open) showUploadedCertificate(app.editor.uploadRow);
 }
 
 function showUploadedCertificate(row) {
@@ -3795,7 +4006,7 @@ function showUploadedCertificate(row) {
   const image = $('#preview-image');
   $('#preview-link').href = pdf.href;
   $('#preview-document').hidden = false;
-  $('#preview-status').textContent = 'Original uploaded certificate';
+  $('#preview-status').textContent = 'Saved PDF';
   $('#preview-number').textContent = `${row.certificate_no}${row.certificate_date ? ` · ${dateLabel(row.certificate_date)}` : ''}`;
   $('#preview-number').hidden = !row.certificate_no;
   image.hidden = false;
@@ -3826,9 +4037,7 @@ async function openDetails(row = null, skipRecovery = false, startEditing = fals
   const uploadRow = row?.uploaded_pdf_sha256 && row.pdf_relative_path ? row : null;
   const issued = row && (row.has_issued_certificate || ['generated', 'generated_manual', 'completed'].includes(stateOf(row)));
   const issuedDetails = row?.last_certificate_details && !recordIdentityIssue(row) ? row.last_certificate_details : null;
-  const issuedDetailsChanged = Boolean(issued && issuedDetails && !isManual(row) && !uploadRow
-    && (typeof row.excel_details_changed_since_issue === 'boolean'
-      ? row.excel_details_changed_since_issue : issuedExcelDetailsChanged(row, issuedDetails)));
+  const issuedDetailsChanged = hasExcelDetailsChangedSinceIssue(row);
   $('#edit-issued-certificate').hidden = !issuedDetailsChanged;
   const form = $('#details-form');
   form.reset();
@@ -3845,7 +4054,7 @@ async function openDetails(row = null, skipRecovery = false, startEditing = fals
     certificateStatus: sourceRow ? issued ? stateLabel(sourceRow) : 'Not created' : '',
     destructionSource: row?.destruction_source || row?.raw_details?.destruction_source || null,
     localInwardId: row && isManual(row) && id !== 'destruction' ? row.record_id : null,
-    editingDetails: !uploadRow && Boolean(startEditing || !row || (row && !isManual(row) && !issued && (!row.form6 || !row.reference))),
+    editingDetails: Boolean(uploadRow || startEditing || !row || (row && !isManual(row) && !issued && (!row.form6 || !row.reference))),
     pdfEditUsed: Boolean(startEditing && row && !isManual(row) && !issued),
     firstGeneration: Boolean(row && !isManual(row) && !issued), sourceLocation: sourceRow?.location || '',
     reviewEdits: Boolean(row && !isManual(row)),
@@ -3856,7 +4065,7 @@ async function openDetails(row = null, skipRecovery = false, startEditing = fals
     sourceSn: row && !isManual(row) ? String(row.sn) : null, sourcePlant: row?.plant || null,
     excelCertificateWeight: !isManual(row || {}) ? sourceRow?.certificate_weight ?? '' : '',
     issuedCertificate: Boolean(issued),
-    fields: { [id]: { ...(issuedDetails?.certificate_fields || row?.certificate_fields || {}) } }, annexures: {}, annexureId: (issuedDetails?.certificate_fields || row?.certificate_fields)?._annexure || null,
+    fields: { [id]: { ...((!uploadRow && issuedDetails?.certificate_fields) || row?.certificate_fields || {}) } }, annexures: {}, annexureId: ((!uploadRow && issuedDetails?.certificate_fields) || row?.certificate_fields)?._annexure || null,
     touched: new Set(), sourceExplicit: false, rawNumeric: {}, rawDetails: isManual(row || {}) ? { ...(row.raw_details || {}) } : {}, workspaceRevision: app.workspaceRevision ?? app.state.workspace_revision ?? '' };
   app.editor.linkedHddSaveSnapshot = linkedHddSaveSnapshot();
   form.elements.namedItem('certificate_type').value = id;
@@ -3876,7 +4085,7 @@ async function openDetails(row = null, skipRecovery = false, startEditing = fals
       plant: row.plant, case_id: isManual(row) ? row.case_id || '' : row.sn ?? row.case_id, supplier: row.supplier, location: row.location,
       inward_date: row.inward_date, item: items[0]?.item ?? row.item ?? '', quantity: items[0]?.quantity ?? row.quantity,
       per_piece_weight: items[0]?.per_piece_weight ?? row.per_piece_weight, weight: items[0]?.weight ?? row.weight,
-      certificate_weight: issuedDetails?.certificate_weight ?? row.certificate_weight, form6: row.form6, reference: row.reference,
+      certificate_weight: uploadRow ? row.certificate_weight : issuedDetails?.certificate_weight ?? row.certificate_weight, form6: row.form6, reference: row.reference,
       cod_no: issuedDetails?.cod_no ?? row.cod_no ?? row.certificate_no,
       cod_date: issuedDetails?.cod_date ?? row.cod_date ?? row.certificate_date,
       ...Object.fromEntries(Object.keys(followupFields).map(key => [key, sourceRow?.[key] || ''])),
@@ -3895,7 +4104,8 @@ async function openDetails(row = null, skipRecovery = false, startEditing = fals
       }
     }
     const savedWeight = row.last_certificate_details?.certificate_weight;
-    if (savedWeight && String(savedWeight) !== String(sourceRow?.certificate_weight ?? '')) {
+    if (uploadRow ? row.certificate_weight != null && row.certificate_weight !== ''
+      : savedWeight && String(savedWeight) !== String(sourceRow?.certificate_weight ?? '')) {
       form.elements.namedItem('use_certificate_weight').checked = true;
     }
   } else {
@@ -3973,6 +4183,10 @@ function fieldDifferences(before, after) {
     .map(key => ({ key, before: token(original[key]), after: token(current[key]) }));
 }
 
+function excelFieldDifferences(before, after) {
+  return fieldDifferences(before, after).filter(change => change.key !== 'starting_cod');
+}
+
 function changeDisplay(key, value) {
   if (key === 'device_receipts' || key === 'certificate_fields.device_receipts') {
     try {
@@ -4025,7 +4239,9 @@ function scopeDescription(payload) {
 function renderChangeSummary() {
   if (!app.editor?.baseline) return;
   const payload = detailsBody($('#details-form'));
-  $('#change-scope').textContent = app.editor.uploadRow ? '' : scopeDescription(payload);
+  $('#change-scope').textContent = app.editor.uploadRow
+    ? (payload.source_kind === 'workbook' ? 'Saves the details to Excel.' : 'Saves the details in the app.')
+    : scopeDescription(payload);
   const changes = fieldDifferences(app.editor.baseline, payload);
   const list = $('#change-list'); list.replaceChildren();
   for (const change of changes) {
@@ -4373,24 +4589,53 @@ function detailsBody(form) {
 
 async function saveDetails(event) {
   event.preventDefault();
-  if (app.editor?.uploadRow) return;
   if (app.editor?.noCertificate || bothCertificatesUnchecked()) return saveInwardDetails();
   if (app.detailsBusy || !app.templatesLoaded) return;
   if (app.editor?.identityIssue) { updateDetailsButtons(); return; }
   finishInlineEdit();
   if (!validateEditor()) return;
   const payload = detailsBody(event.currentTarget);
+  if (app.editor?.uploadRow) {
+    await saveUploadedEditorDetails(payload);
+    return;
+  }
   if (payload.create_new && duplicateSerialNumber(payload.plant, payload.details.case_id)) {
     setEditorMode(true); $('#record-options').open = true;
     showDetailsError('This Serial Number already exists in this plant.');
     event.currentTarget.elements.namedItem('case_id').focus(); return;
   }
   if (payload.source_kind === 'workbook' && app.editor.existing
-      && fieldDifferences(app.editor.excelBaseline || app.editor.baseline, payload).length) {
+      && excelFieldDifferences(app.editor.excelBaseline || app.editor.baseline, payload).length) {
     showExcelSaveChoice(payload, 'create');
     return;
   }
   await submitGeneration(payload, false, payload.source_kind === 'manual' ? '/api/manual/generate' : '/api/create', true);
+}
+
+async function saveUploadedEditorDetails(payload) {
+  if (!editorDirty()) { toast('No details have changed.'); return; }
+  const editor = app.editor;
+  const workbook = payload.source_kind === 'workbook';
+  if (workbook && editor.touched.has('certificate_weight') && !payload.use_certificate_weight) {
+    payload.details.certificate_weight = '';
+  }
+  setDetailsBusy(true);
+  try {
+    if (workbook && !await confirmAction({title:'Save details to Excel?',
+      message:'Save these details to the selected client’s Excel row?',
+      confirmLabel:'Yes, save details', cancelLabel:'No, keep editing'})) return;
+    const response = await api('/api/certificates/save-upload-details', {
+      ...payload, pdf_sha256:editor.uploadRow.uploaded_pdf_sha256,
+    });
+    setState(response.state);
+    clearWorkingDraft();
+    $('#details-modal').close();
+    toast('Certificate details saved.');
+  } catch (error) {
+    showDetailsError(error.message);
+  } finally {
+    setDetailsBusy(false);
+  }
 }
 
 function workbookTypeChanged(payload) {
@@ -4419,7 +4664,7 @@ function showExcelSaveChoice(payload, mode) {
     $('#excel-save-note').textContent = `Both choices save the ${requiredDetails.join(' and ')}, certificate number, date and Generated status. A backup is kept before updating Excel.`;
   }
   const list = $('#excel-save-change-list'); list.replaceChildren();
-  const changes = fieldDifferences(app.editor.excelBaseline || app.editor.baseline, payload)
+  const changes = excelFieldDifferences(app.editor.excelBaseline || app.editor.baseline, payload)
     .filter(change => mode !== 'inward_only' || Object.hasOwn(followupFields, change.key));
   for (const change of changes) {
     const key = change.key.replace(/^certificate_fields\./, '');
@@ -4495,7 +4740,7 @@ async function saveInwardDetails() {
   if (bothCertificatesUnchecked() && requestChanged) {
     return saveCertificateChoices(editorInwardRow(), requestChanged, needed);
   }
-  const changes = fieldDifferences(app.editor.excelBaseline || app.editor.baseline, payload);
+  const changes = excelFieldDifferences(app.editor.excelBaseline || app.editor.baseline, payload);
   if (!app.editor.localInwardId && inwardChanges(payload).length && fieldDifferences(app.editor.baseline, payload).every(change => Object.hasOwn(followupFields, change.key))) {
     showExcelSaveChoice(payload, 'inward_only'); return;
   }
@@ -4525,7 +4770,7 @@ async function saveInwardDetails() {
     return;
   }
   if (linkedRequestEditor || app.editor.issuedCertificate || app.editor.localInwardId) return;
-  if (!fieldDifferences(app.editor.excelBaseline || app.editor.baseline, payload).length) {
+  if (!changes.length) {
     toast('No changes to save.'); return;
   }
   // An inward may be saved before the Form 6/reference or first COD is known.
@@ -4617,6 +4862,7 @@ async function saveExcelChoice(updateExcel) {
       $('#details-modal').close();
       const moved = response.sn && response.sn !== app.editor.sourceSn;
       toast(response.state?.setup_warning || (moved ? `Changes saved to Excel. This inward is now SN ${response.sn}.`
+        : response.serial_order_kept ? 'Changes saved to Excel. Existing serial numbers were kept to protect earlier certificates.'
         : 'Changes saved to Excel. No PDF was created.'), Boolean(response.state?.setup_warning));
       if (request) { setDetailsBusy(false); await openDetails(request, true, true); }
     } catch (error) { showDetailsError(error.message); }
@@ -4834,22 +5080,36 @@ function entryDeletionIdentity(row) {
 }
 
 function openEntryDeletion({showDialog = true} = {}) {
-  if (app.entryDeletionBusy || app.loadingWorkspace || app.generationBusy || app.backupBusy || app.detailsBusy || app.clientBusy || app.settingsBusy) return;
+  if (app.entryDeletionBusy || app.loadingWorkspace || app.generationBusy || app.backupBusy || app.detailsBusy || app.clientBusy || app.settingsBusy) return null;
   const rows = app.state.rows.filter(row => (isManual(row) || ['plant1','plant2'].includes(row.plant)) && canDeleteEntry(row)
     && (isManual(row) ? Boolean(row.record_id) : Boolean(row.sn && row.sheet && row.row)));
   app.entryDeletion = {rows,checked:new Set(),labels:[],revision:app.workspaceRevision ?? app.state.workspace_revision ?? ''};
-  $('#entry-delete-search').value = ''; $('#entry-delete-hdd').checked = false;
+  $('#entry-delete-search').value = '';
   $('#entry-delete-choices').replaceChildren(...rows.map((row,index) => {
     const label=element('label','bulk-choice'),input=element('input'); input.type='checkbox';
-    input.setAttribute('aria-label',`${row.supplier || 'Unnamed company'}, ${labelPlant(row.plant)}, ${isManual(row) ? row.certificate_no || 'local record' : 'SN '+row.sn}`);
+    const serial = isManual(row) ? (row.destruction_source || row.raw_details?.destruction_source)?.case_id : row.sn;
+    const position = serial ? `SN ${serial}` : 'Local record';
+    const type = templateLabel(row);
+    input.setAttribute('aria-label',`${row.supplier || 'Unnamed company'}, ${type}, ${labelPlant(row.plant)}, ${position}`);
     input.addEventListener('change',()=>{if(input.checked)app.entryDeletion.checked.add(index);else app.entryDeletion.checked.delete(index);filterEntryDeletion();});
     const copy=element('span','bulk-client-copy');
-    copy.append(element('strong','',row.supplier || 'Company name missing'),element('small','',`${labelPlant(row.plant)} · ${isManual(row) ? 'Local record' : 'SN '+row.sn} · COD ${row.certificate_no || 'not assigned'} · ${row.location || ''}`));
+    copy.append(element('strong','',row.supplier || 'Company name missing'),
+      element('small','',[type, labelPlant(row.plant), position, row.certificate_no && `COD ${row.certificate_no}`, row.location].filter(Boolean).join(' · ')));
     const meta=element('span','bulk-client-meta'); meta.append(element('span','',stateLabel(row)));
     label.append(input,copy,meta);app.entryDeletion.labels.push(label);return label;
   }));
   resetEntryDeletionReview();filterEntryDeletion();
   if (showDialog) { $('#entry-deletion-modal').showModal();$('#entry-delete-search').focus(); }
+  return app.entryDeletion;
+}
+
+async function reviewOneEntryDeletion(row) {
+  const selection = openEntryDeletion({showDialog:false});
+  if (!selection) return;
+  const index = selection.rows.indexOf(row);
+  if (index < 0) return toast('This entry could not be selected. Refresh and try again.', true);
+  selection.checked.add(index);
+  await reviewEntryDeletion();
 }
 
 function filterEntryDeletion() {
@@ -4857,7 +5117,7 @@ function filterEntryDeletion() {
   const words=$('#entry-delete-search').value.trim().toLowerCase().split(/\s+/).filter(Boolean);
   let shown=0,hiddenSelected=0;
   state.rows.forEach((row,index)=>{
-    const searchable=[row.supplier,row.sn,row.case_id,row.certificate_no,row.reference,row.form6,row.location,
+    const searchable=[row.supplier,companySerial(row),row.sn,row.case_id,row.certificate_no,row.reference,row.form6,row.location,templateLabel(row),
       labelPlant(row.plant),stateLabel(row),row.removed_inward?.case_id].join(' ').toLowerCase();
     const visible=words.every(word=>searchable.includes(word));
     state.labels[index].hidden=!visible;
@@ -4883,7 +5143,7 @@ async function reviewEntryDeletion() {
   const state=app.entryDeletion;
   if(!state || app.entryDeletionBusy || !state.checked.size || state.checked.size>50)return;
   const payload={selected:[...state.checked].map(index=>entryDeletionIdentity(state.rows[index])),
-    include_linked_hdd:Boolean($('#entry-delete-hdd').checked), expected_revision:state.revision,
+    expected_revision:state.revision,
     request_id:Array.from({length:32},()=>Math.floor(Math.random()*16).toString(16)).join('')};
   app.entryDeletionBusy=true;$('#entry-delete-preview').disabled=true;$('#entry-delete-error').hidden=true;
   try {
@@ -4911,7 +5171,7 @@ async function reviewEntryDeletion() {
     } else list.append(element('p','', 'No PDFs to remove.'));
     const kept=response.review.kept_hdd || [];
     $('#entry-delete-kept-hdd').textContent=kept.length
-      ? `Linked Data Destruction records kept: ${kept.map(row=>row.supplier+(row.cod?' · COD '+row.cod:'')).join('; ')}` : '';
+      ? `Data Destruction kept as standalone: ${kept.map(row=>row.supplier+(row.cod?' · COD '+row.cod:'')).join('; ')}` : '';
     $('#entry-delete-kept-hdd').hidden=!kept.length;
     $('#entry-delete-selection').hidden=true;$('#entry-delete-review').hidden=false;
     $('#entry-delete-preview').hidden=true;$('#entry-delete-confirm').hidden=false;
@@ -5070,17 +5330,18 @@ async function handleAction(button) {
   if (action === 'fill-details') { openDetails(row, false, true); return; }
   if (action === 'delete-entry') {
     if (!canDeleteEntry(row)) {toast('Generated certificates cannot be deleted.',true);return;}
-    openEntryDeletion();app.entryDeletion.checked.add(app.entryDeletion.rows.indexOf(row));await reviewEntryDeletion();return;
+    await reviewOneEntryDeletion(row);
+    return;
   }
   if (action === 'remove-inward') {
     if (!canDeleteEntry(row)) { toast('Generated certificates cannot be deleted.', true); return; }
-    const pendingHdd = app.state.rows.some(item => isManual(item) && (item.destruction_source || item.raw_details?.destruction_source)?.plant === row.plant
-      && String((item.destruction_source || item.raw_details?.destruction_source)?.case_id) === String(row.sn));
-    if (pendingHdd) {
-      openEntryDeletion({showDialog:false}); const selected = app.entryDeletion.rows.indexOf(row);
-      app.entryDeletion.checked.add(selected); $('#entry-delete-hdd').checked = true;
-      await reviewEntryDeletion();
-    } else await openInwardRemoval(row);
+    const pendingHdd = app.state.rows.some(item => {
+      const link = item.destruction_source || item.raw_details?.destruction_source;
+      return isManual(item) && link && !link.record_id && link.plant === row.plant
+        && String(link.case_id).trim().toLowerCase() === String(row.sn).trim().toLowerCase();
+    });
+    if (pendingHdd) await reviewOneEntryDeletion(row);
+    else await openInwardRemoval(row);
     return;
   }
   if (action === 'details' || action === 'edit-details') {
@@ -5095,11 +5356,17 @@ async function handleAction(button) {
   if (action === 'complete' || action === 'undo-completed') {
     if (app.completionBusy || app.generationBusy || app.backupBusy) return;
     const undo = action === 'undo-completed';
+    const manual = isManual(row);
+    const hdd = manual ? null : linkedDestructionRequest({plant:row.plant, case_id:row.sn});
+    const hddPending = !manual && (hdd ? !['completed', 'na'].includes(stateOf(hdd))
+      && (hdd.destruction_requested !== false || certificateWasGenerated(hdd)) : Boolean(row.hdd_cod_no));
     const expectedRevision = app.workspaceRevision ?? app.state.workspace_revision ?? '';
     const approved = await confirmAction(undo ? { title: 'Undo Completed?',
       message: `This returns the ${templateLabel(row)} certificate for ${row.supplier || `Client ${row.sn}`}${row.certificate_no ? ` (COD ${row.certificate_no})` : ''} to the send queue.`,
       confirmLabel: 'Yes, undo', cancelLabel: 'No, keep Completed' } : { title: 'Mark certificate Completed?',
-      message: `Confirm that you have sent the certificate for ${row.supplier || `Client ${row.sn}`}. This marks it Completed in ${isManual(row) ? 'the local certificate register' : 'Excel'} and stops its reminder.`,
+      message: `Confirm that you have sent the certificate for ${row.supplier || `Client ${row.sn}`}. `
+        + (hddPending ? 'This records Recycling as sent. The Excel inward stays open while Data Destruction is pending.'
+          : `This marks it Completed in ${manual ? 'the local certificate register' : 'Excel'} and stops its reminder.`),
       confirmLabel: 'Mark Completed', cancelLabel: 'Go back' });
     if (!approved || app.completionBusy || app.generationBusy || app.backupBusy) return;
     app.completionBusy = true;
@@ -5609,9 +5876,10 @@ function wire() {
     $('#past-numbers-modal').showModal();
   });
   $('#past-number-search').addEventListener('input', renderPastNumbers);
-  $('#refresh-button').addEventListener('click', refreshState);
+  $('#refresh-button').addEventListener('click', () => syncWorkbookChanges({requested:true}));
   $('#upload-certificate').addEventListener('click', openUploadCertificate);
   $('#external-upload-file').addEventListener('change', inspectUploadedCertificate);
+  $('#upload-duplicate-alert').addEventListener('click', showDuplicatePdfReview);
   $('#upload-cod').addEventListener('input', event => {
     if (app.uploadedFile && !event.target.readOnly) app.uploadedFile.manualCod = event.target.value;
   });
@@ -5685,7 +5953,7 @@ function wire() {
     if (replacement) requestDetailsClose(() => openUploadCertificate({replacement}));
   });
   $('#edit-pdf-details').addEventListener('click', async () => {
-    if (!app.editor || app.detailsBusy || app.generationBusy) return;
+    if (!app.editor || app.editor.uploadRow || app.detailsBusy || app.generationBusy) return;
     if (summaryEditorVisible()) {
       if (app.editor.firstGeneration) app.editor.pdfEditUsed = true;
       setEditorMode(true);
@@ -5911,21 +6179,11 @@ async function init() {
   formatFormDates($('#details-form'));
   wire();
   if (new URL(window.location.href).searchParams.get('view') !== 'attention') setWorkspaceView('analytics');
-  const templatesReady = loadTemplates();
+  loadTemplates();
   try {
     const response = await api('/api/state');
     app.settings = response.settings || {};
     setState(response.state);
-    const startupStateVersion = app.stateVersion || 0;
-    await templatesReady;
-    const checked = await api('/api/workbook-changes');
-    if (checked.state) setState(checked.state);
-    else if (checked.changed === false && (app.stateVersion || 0) === startupStateVersion
-        && typeof response.workspace_revision === 'string') {
-      // Keep the revision paired with the initial rows. An unchanged-file
-      // response carries no new revision and must not erase this snapshot.
-      app.workspaceRevision = response.workspace_revision;
-    }
     if (showWorkingDraftRecovery) offerDraftRecovery();
   } catch (error) {
     toast(error.message, true);
@@ -5941,6 +6199,9 @@ async function init() {
     $('#new-button').disabled = false; $('#add-client-button').disabled = false; summarize();
     if (app.workspaceView === 'analytics') window.CertificateAnalytics?.load();
   }
+  // Excel reconciliation can be slow (for example, while a workbook is open).
+  // Do not make the first usable screen wait for that background check.
+  syncWorkbookChanges();
   window.setInterval(syncWorkbookChanges, 15000);
   pollReminderReview();
   window.setInterval(pollReminderReview, 2000);

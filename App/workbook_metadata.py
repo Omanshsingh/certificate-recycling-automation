@@ -12,7 +12,7 @@ VT = 'http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes'
 PROPERTY = 'EcorecoCertificateDetails'
 PROPERTY_V2 = 'EcorecoCertificateDetailsV2_'
 KEYS = {'form6', 'reference', 'certificate_type', 'certificate_fields', 'certificate_weight',
-        '_pdf_recovery_pending', '_hdd_cod_no', '_hdd_cod_date', '_external_pdf',
+        '_pdf_recovery_pending', '_hdd_cod_no', '_hdd_cod_date', '_hdd_primary', '_external_pdf',
         '_recycling_completed'}
 PROPERTY_CHUNK_SIZE = 180  # Excel limits each custom-property value to 255 characters.
 

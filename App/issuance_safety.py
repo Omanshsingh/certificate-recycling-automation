@@ -235,7 +235,8 @@ class IssuanceTransaction:
     def __init__(self, root, destination, temporary, source_path, source_before,
                  *, source_kind, plant, key, cod, issued_date, before, after,
                  warnings=(), override_reason='', old_paths=(), template_path=None,
-                 companion_source=None, converted_from=None, external_upload=False, retain_existing=False):
+                 companion_source=None, converted_from=None, external_upload=False, retain_existing=False,
+                 external_replacement=False):
         self.root = Path(root).resolve()
         self.id = uuid.uuid4().hex
         self.folder = self.root / 'Data' / 'Issuance Recovery' / self.id
@@ -276,6 +277,8 @@ class IssuanceTransaction:
         if external_upload:
             self.data['external_upload'] = True
             self.data['retain_existing'] = retain_existing
+        if external_replacement:
+            self.data['external_replacement'] = True
         if companion_source:
             path, before_payload, after_payload = companion_source
             path = Path(path).resolve()
@@ -305,7 +308,12 @@ class IssuanceTransaction:
                     raise ValueError('The existing PDF changed. Refresh and select the file again.')
             else:
                 _write_bytes(stage, (self.folder / 'new.pdf').read_bytes())
-                if self.data.get('external_upload'):
+                if self.data.get('external_replacement'):
+                    previous = next((old for old in self.data['previous_pdfs'] if old['path'] == self.data['pdf_path']), None)
+                    if not previous or file_digest(destination) != previous['sha256']:
+                        raise ValueError('The existing PDF changed. Refresh and select it again.')
+                    os.replace(stage, destination)
+                elif self.data.get('external_upload'):
                     if os.name == 'nt':
                         # Windows rename fails if a file appeared at the destination.
                         os.rename(stage, destination)
@@ -314,7 +322,7 @@ class IssuanceTransaction:
                         stage.unlink()
                 else:
                     os.replace(stage, destination)
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             try:
                 stage.unlink(missing_ok=True)
             except OSError:

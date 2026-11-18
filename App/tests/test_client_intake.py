@@ -428,8 +428,8 @@ class ClientIntakeTests(unittest.TestCase):
     def test_stale_external_change_at_save_boundary_is_rejected(self):
         before = self.paths[0].read_bytes(); body = self.body()
         original_stage = web_app.stage_new_client
-        def stage_then_other_change(session, details):
-            staged = original_stage(session,details)
+        def stage_then_other_change(session, details, **kwargs):
+            staged = original_stage(session, details, **kwargs)
             book = load_workbook(self.paths[1]); book.active['C2'] = 'External change'; book.save(self.paths[1]); book.close()
             return staged
         with patch.object(web_app,'stage_new_client',side_effect=stage_then_other_change):

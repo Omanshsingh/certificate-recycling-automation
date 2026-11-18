@@ -75,7 +75,14 @@ def workspace_batches(root, overrides=None):
             continue
         path = Path(value).expanduser().resolve()
         source = BytesIO(overrides[str(path)]) if str(path) in overrides else path
-        batches.extend(dict(batch, source_id=f'plant{index}') for batch in read_batches(source))
+        parsed = read_batches(source)
+        batches.extend(dict(batch, source_id=f'plant{index}') for batch in parsed)
+        for issue in getattr(parsed, 'row_issues', ()):
+            if issue.get('reserved_cod_numbers'):
+                batches.append({'case_id': '', 'source_id': f'plant{index}',
+                                'source_sheet': issue.get('sheet'), 'source_row': issue.get('row'),
+                                'reserved_cod_numbers': list(issue['reserved_cod_numbers']),
+                                '_unassigned_excel_row': True})
     return batches
 
 

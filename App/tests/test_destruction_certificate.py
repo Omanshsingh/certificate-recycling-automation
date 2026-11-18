@@ -45,9 +45,20 @@ class DestructionTests(unittest.TestCase):
         self.assertEqual(len(read_register(self.root)['records']), 1)
         row = manual_rows(self.root)[0]
         self.assertTrue(row['destruction_pending'])
+        self.assertEqual(row['certificate_status'], 'alert')
+        self.assertTrue(any('actual date' in warning for warning in row['warnings']))
         self.assertEqual(row['destruction_source'], {'plant': 'plant1', 'case_id': 'CLIENT1'})
         self.assertFalse(row['certificate_no'])
         self.assertEqual(before, [path.read_bytes() for path in self.paths])
+
+    def test_hdd_request_is_ready_after_its_required_details_are_saved(self):
+        record_id = request_for_inward(self.root, 'plant1', 'CLIENT1')
+        records = read_register(self.root)['records']
+        request = next(record for record in records if record['id'] == record_id)
+        details = {**request['details'], 'certificate_fields': self.details()['certificate_fields']}
+        row = manual_rows(self.root, as_of=AS_OF, records=[dict(request, details=details)])[0]
+        self.assertEqual(row['certificate_status'], 'ready')
+        self.assertTrue(row['destruction_pending'])
 
     def test_international_client_can_issue_without_an_inward_or_weight(self):
         result = generate_draft(self.root, 'plant2', self.details(), as_of=AS_OF)

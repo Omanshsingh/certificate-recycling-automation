@@ -16,6 +16,9 @@ from workflow_support import save_json, load_settings
 MAX_PDF_BYTES = 50 * 1024 * 1024
 MAX_PAGES = 8
 INSPECTION_VERSION = 6
+_RECORDED_COD_MISMATCH = 'Printed COD differs from the recorded certificate number. Check this PDF.'
+
+
 def ensure_certificate_folders(root):
     """Prepare the shared output folder and consolidate older layouts."""
     base = Path(root) / 'Certificates'
@@ -150,7 +153,7 @@ def _inspect_pdf(path, *, pdf_data=None, number_prefix='', certificate_pages=Non
             named = filename_matches[0]
             cods.add(named)
         if issued_cod and printed and any(identity(value) != identity(issued_cod) for value in printed):
-            warnings.append('Printed COD differs from the recorded certificate number. Check this PDF.')
+            warnings.append(_RECORDED_COD_MISMATCH)
         elif not issued_cod and named and printed and any(identity(value) != identity(named) for value in printed):
             warnings.append('Filename COD and printed COD differ; both numbers are treated as used. Check this PDF.')
         if len({identity(value) for value in printed}) > 1:
@@ -182,6 +185,8 @@ def _issued_certificate_facts(root, *, history=None):
     for record in records:
         if record.get('state') not in {'complete', 'source_committed'}:
             continue
+        if record.get('external_replacement'):
+            continue  # Its selected COD belongs to the recorded path, not every copy of the PDF.
         details = record.get('after')
         if not isinstance(details, dict):
             continue
@@ -237,15 +242,34 @@ def scan_inventory(root, persist=False, *, force=False):
     from issuance_safety import audit_records
     history = audit_records(root)
     issued = _issued_certificate_facts(root, history=history)
+    # A replacement associates those bytes with the selected certificate at
+    # this path. The same bytes may also be filed under a different COD.
+    replacements = {(record['pdf_path'].replace('\\', '/').casefold(), record['pdf_sha256']): str(record['cod'])
+                    for record in history if record.get('state') in {'complete', 'source_committed'}
+                    and record.get('external_replacement') and record.get('pdf_path')
+                    and record.get('pdf_sha256') and record.get('cod')}
     origins = {record['pdf_sha256']: 'external' if record.get('external_upload') else 'app'
                for record in history if record.get('state') in {'complete', 'source_committed'} and record.get('pdf_sha256')}
     migrated = migrated_certificate_origins(root)
     owners_by_digest = {record.get('pdf_sha256'):{'source_kind':record.get('source_kind'),
                         'plant':record.get('plant'), 'key':str(record.get('key')), 'cod':str(record.get('cod'))}
                         for record in history if record.get('state') == 'complete'
-                        and record.get('pdf_sha256')}
+                        and record.get('pdf_sha256') and not record.get('external_replacement')}
+    # A byte-identical PDF may now be intentionally saved for more than one
+    # inward. Prefer the issuance tied to this exact path; digest-only ownership
+    # remains a fallback for older files that were moved outside the app.
+    owners_by_path = {}
+    for record in history:
+        if record.get('state') != 'complete' or not record.get('pdf_path') or not record.get('pdf_sha256'):
+            continue
+        owner = {'source_kind':record.get('source_kind'), 'plant':record.get('plant'),
+                 'key':str(record.get('key')), 'cod':str(record.get('cod'))}
+        owners_by_path[str(record['pdf_path']).replace('\\', '/').casefold()] = (record['pdf_sha256'], owner)
     for entry in entries.values():
-        if entry.get('sha256') in owners_by_digest:
+        path_owner = owners_by_path.get(entry['path'].replace('\\', '/').casefold())
+        if path_owner and path_owner[0] == entry.get('sha256'):
+            entry['managed_owner'] = path_owner[1]
+        elif entry.get('sha256') in owners_by_digest:
             entry['managed_owner'] = owners_by_digest[entry['sha256']]
     folder = root / 'Certificates'
     if folder.is_dir():
@@ -267,10 +291,14 @@ def scan_inventory(root, persist=False, *, force=False):
             except OSError:
                 digest = None
             issued_cod, certificate_pages = issued.get(digest, (None, None))
+            replacement_cod = replacements.get((relative.casefold(), digest))
+            if replacement_cod:
+                issued_cod, certificate_pages = replacement_cod, None
             if (old and old.get('inspection_version') == INSPECTION_VERSION
                     and old.get('inspection_prefix') == number_prefix
                     and old.get('inspection_certificate_pages') == certificate_pages
                     and old.get('inspection_issued_cod') == issued_cod
+                    and old.get('inspection_replacement_cod') == replacement_cod
                     and digest is not None and old.get('sha256') == digest and old.get('size') == stat.st_size):
                 # A restored byte-identical PDF remains the same issuance even
                 # though atomic rollback changed its filesystem timestamp.
@@ -283,6 +311,7 @@ def scan_inventory(root, persist=False, *, force=False):
                 cods, refs, warnings, attachment_cods = _inspect_pdf(
                     path, pdf_data=pdf_data, number_prefix=number_prefix, certificate_pages=certificate_pages,
                     issued_cod=issued_cod)
+                observed_cods = set(cods)
                 previous_cods = set((old or {}).get('certificate_cods', (old or {}).get('cods', [])))
                 previous_numbers = set((old or {}).get('cods', []))
                 if old and digest is not None and old.get('sha256') == digest:
@@ -299,7 +328,9 @@ def scan_inventory(root, persist=False, *, force=False):
                             previous_cods.discard(filename_number)
                             previous_numbers.discard(filename_number)
                 # Corrections do not make a previously observed number free.
-                entry = {'path': relative, 'cods': sorted(set(cods) | set(attachment_cods) | previous_numbers),
+                if replacement_cod:
+                    cods, previous_cods = [replacement_cod], set()
+                entry = {'path': relative, 'cods': sorted(observed_cods | set(attachment_cods) | previous_numbers),
                          'certificate_cods': sorted(set(cods) | previous_cods),
                          'attachment_cods': attachment_cods,
                          'references': sorted(set(refs) | set((old or {}).get('references', []))),
@@ -307,10 +338,19 @@ def scan_inventory(root, persist=False, *, force=False):
                          'size': len(pdf_data) if pdf_data is not None else stat.st_size,
                          'mtime_ns': stat.st_mtime_ns, 'sha256': digest,
                          'inspection_version': INSPECTION_VERSION, 'inspection_prefix': number_prefix,
-                         'inspection_certificate_pages': certificate_pages, 'inspection_issued_cod': issued_cod}
+                         'inspection_certificate_pages': certificate_pages, 'inspection_issued_cod': issued_cod,
+                         'inspection_replacement_cod': replacement_cod}
                 if old and digest is not None and old.get('sha256') == digest and old.get('managed_owner'):
                     entry['managed_owner'] = old['managed_owner']
-            if digest in owners_by_digest:
+            if replacement_cod:
+                # The operator chose this PDF for this record. Apply to cached
+                # inspections too, but only while the committed bytes match.
+                entry['warnings'] = [warning for warning in entry['warnings']
+                                     if warning != _RECORDED_COD_MISMATCH]
+            path_owner = owners_by_path.get(relative.replace('\\', '/').casefold())
+            if path_owner and path_owner[0] == digest:
+                entry['managed_owner'] = path_owner[1]
+            elif digest in owners_by_digest:
                 entry['managed_owner'] = owners_by_digest[digest]
             origin = (origins.get(digest) or migrated.get((relative.casefold(), digest))
                       or legacy_certificate_origin(relative))

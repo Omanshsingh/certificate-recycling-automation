@@ -423,6 +423,15 @@ def manual_rows(root, as_of=None, records=None, *, history=None):
             status = "ready"
         else:
             status = _issued_status(root, status, receipt, path, origins)
+        warnings = current_warnings(record.get("warnings", []))
+        if (requested and not has_issued_certificate and details.get('certificate_type') == 'destruction'
+                and status in {'ready', 'alert'}):
+            from destruction_certificate import content_issues
+            fields = details.get('certificate_fields')
+            required_details = content_issues(
+                details if isinstance(fields, dict) else dict(details, certificate_fields={}), as_of)
+            status = 'alert' if required_details else 'ready'
+            warnings = list(dict.fromkeys([*required_details, *warnings]))
         received = parse_date(details.get('inward_date'))
         age = (as_of - received).days if received else None
         due = status not in {'completed', 'na'} and age is not None and age >= 25
@@ -433,6 +442,7 @@ def manual_rows(root, as_of=None, records=None, *, history=None):
                       if materials else number(details.get("weight")))
         rows.append({
             "source_kind": "manual", "record_id": record["id"], "plant": record["plant"],
+            "added_at": record.get("created_at", ""),
             'removed_inward': record.get('removed_inward'),
             'detached_inward': record.get('detached_inward'),
             "destruction_source": details.get('destruction_source'),
@@ -451,7 +461,7 @@ def manual_rows(root, as_of=None, records=None, *, history=None):
             "certificate_status": status, "outcome": "ready" if missing else status,
             "detail": f"PDF missing. Ready to recreate with COD {details.get('cod_no')}." if missing else
                       f"{TEMPLATE_NAMES.get(details.get('certificate_type'), 'Custom')} · Saved in the local certificate register.",
-            "warnings": current_warnings(record.get("warnings", [])),
+            "warnings": warnings,
             "system_alert": missing,
             "items": materials,
             "file": "", "reminder_due": due, "overdue": bool(due and age > 30),

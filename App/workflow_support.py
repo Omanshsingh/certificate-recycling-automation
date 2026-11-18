@@ -129,6 +129,8 @@ class Report:
         self.rows = []
         self.created = 0
         self.maintenance_notes = []
+        self.reserved_cod_numbers = []
+        self.unassigned_rows = []
 
     def add(self, batch, outcome, detail, issue_code=None, system_alert=False, warnings=None, **_legacy):
         is_system = not str(batch.get('case_id') or '').strip()

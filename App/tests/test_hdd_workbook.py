@@ -56,6 +56,64 @@ class HddWorkbookTests(unittest.TestCase):
         self.assertEqual(sheet['A2'].alignment.vertical, 'top')
         book.close()
 
+    def test_hdd_only_uses_existing_row_and_preserves_the_hdd_when_recycling_is_uploaded(self):
+        path = self.paths[0]
+        fixtures.write_register(path, case_id='CLIENT1', cod='', status='N/A')
+        result = self.generate()
+        hdd_cod = result['certificate_no']
+        with closing(load_workbook(path)) as book:
+            sheet, _, cols = select_register(book)
+            self.assertEqual(sheet.max_row, 2)
+            self.assertEqual(sheet.cell(2, cols['cod_no'] + 1).value, hdd_cod)
+        before = read_batches(path)[0]
+        self.assertEqual((before['cod_no'], before['hdd_cod_no'], before['issued']), ('', hdd_cod, 'N/A'))
+        with WorkbookSession(path, self.root / 'backups') as session:
+            session.set_issued_status('CLIENT1', before['source_sheet'], 2, '', 'N/A', 'Generated Externally',
+                                      external={'cod': '0499', 'date': AS_OF, 'link': {'path': 'recycling.pdf'}})
+        after = read_batches(path)[0]
+        self.assertEqual((after['cod_no'], after['hdd_cod_no']), ('0499', hdd_cod))
+        with closing(load_workbook(path)) as book:
+            sheet, _, cols = select_register(book)
+            self.assertEqual(sheet.cell(3, cols['cod_no'] + 1).value, hdd_cod)
+
+    def test_existing_hdd_only_tracking_row_is_compacted_without_moving_next_clients_data(self):
+        from types import SimpleNamespace
+        from hdd_workbook import stage_hdd_tracking
+        path = self.paths[0]
+        fixtures.write_register(path, case_id='CLIENT1', cod='', status='Ready')
+        initial = stage_hdd_tracking(SimpleNamespace(data=path.read_bytes()), 'CLIENT1', '0303', AS_OF)
+        with closing(load_workbook(BytesIO(initial))) as book:
+            sheet, _, cols = select_register(book)
+            self.assertEqual(sheet.cell(3, cols['cod_no'] + 1).value, '0303')
+            sheet.cell(2, cols['issued'] + 1, 'N/A')
+            sheet.append([cell.value for cell in sheet[2]])
+            sheet['A4'] = 'NEXT'
+            sheet.cell(4, cols['issued'] + 1, 'Ready')
+            book.save(path)
+        before = read_batches(path)
+        migrated = stage_hdd_tracking(SimpleNamespace(data=path.read_bytes()), 'CLIENT1', '0303', AS_OF)
+        after = read_batches(BytesIO(migrated))
+        self.assertEqual(after[1]['source_row'], 3)
+        self.assertEqual(batch_content(after[1]), batch_content(before[1]))
+        self.assertEqual(len(after[0]['items']), 1)
+        self.assertEqual(after[0]['hdd_cod_no'], '0303')
+        self.assertTrue(after[0]['hdd_on_main_row'])
+
+        from hdd_workbook import recover_hdd_tracking_link
+        from inward_serials import links_from
+        from workbook_metadata import write_details
+        raw = write_details(path.read_bytes(), before[0]['source_sheet'], 'CLIENT1',
+                            {'_hdd_cod_no': '', '_hdd_cod_date': ''})
+        rows = read_batches(BytesIO(raw))
+        details = {key: rows[0][key] for key in ('supplier', 'form6', 'reference', 'inward_date')}
+        record = {'id': 'stale-hdd', 'details': dict(details, cod_no='0303')}
+        stale = SimpleNamespace(data=raw)
+        self.assertIsNone(recover_hdd_tracking_link(
+            stale, rows, {'id': 'stale-hdd', 'details': dict(record['details'], form6='Different')}, AS_OF))
+        restored = recover_hdd_tracking_link(stale, rows, record, AS_OF)
+        self.assertEqual(links_from(restored)['manual_sources']['stale-hdd'], 'CLIENT1')
+        self.assertTrue(read_batches(BytesIO(restored))[0]['hdd_on_main_row'])
+
     def test_hdd_correction_keeps_both_numbers_and_updates_its_date(self):
         result = self.generate(); before = read_batches(self.paths[0])[0]
         record = read_register(self.root)['records'][0]
@@ -223,6 +281,38 @@ class HddWorkbookTests(unittest.TestCase):
         self.assertEqual(run(self.paths, self.root, check_only=True, as_of=AS_OF, progress=None)[0], 0)
         self.assertEqual(read_batches(self.paths[0])[0]['hdd_cod_no'], result['certificate_no'])
         self.assertEqual({str(path): path.read_bytes() for path in (self.root / 'Certificates').rglob('*.pdf')}, before)
+
+    def test_refresh_does_not_attach_an_old_hdd_number_to_a_reused_serial(self):
+        from run_certificates import run
+        self.generate()
+        fixtures.write_register(self.paths[0], case_id='CLIENT1', cod='', status='N/A')
+        with closing(load_workbook(self.paths[0])) as book:
+            sheet, _, cols = select_register(book)
+            sheet.cell(2, cols['form6'] + 1, 'UNRELATED-FORM6')
+            sheet.cell(2, cols['supplier'] + 1, 'Unrelated inward')
+            book.save(self.paths[0])
+        report = {}
+        run(self.paths, self.root, check_only=True, as_of=AS_OF, progress=None, report_sink=report)
+        self.assertEqual(read_batches(self.paths[0])[0]['hdd_cod_no'], '')
+        self.assertTrue(any(note.get('kind') == 'hdd_tracking' and 'CLIENT1' in note['detail']
+                            for note in report['maintenance_notes']))
+
+    def test_hdd_update_keeps_unrelated_tracking_cells_intact(self):
+        from types import SimpleNamespace
+        from hdd_workbook import stage_hdd_tracking
+        result = self.generate()
+        path = self.paths[0]
+        for key, value in (('cod_no', 'UNRELATED-COD'), ('cod_date', date(2025, 12, 1))):
+            with closing(load_workbook(path)) as book:
+                sheet, _, cols = select_register(book)
+                sheet.cell(3, cols['cod_no'] + 1, result['certificate_no'])
+                sheet.cell(3, cols['cod_date'] + 1, AS_OF)
+                sheet.cell(3, cols[key] + 1, value)
+                book.save(path)
+            before = path.read_bytes()
+            with self.assertRaisesRegex(ValueError, 'already contains tracking data'):
+                stage_hdd_tracking(SimpleNamespace(data=before), 'CLIENT1', result['certificate_no'], AS_OF)
+            self.assertEqual(path.read_bytes(), before)
 
 
 if __name__ == '__main__': unittest.main()

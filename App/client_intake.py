@@ -169,7 +169,7 @@ def _copy_rules(xml, source_rows, destination_rows, status_column, width):
     return xml[:position] + ''.join(additions['conditionalFormatting']) + xml[position:]
 
 
-def stage_new_client(session, raw):
+def stage_new_client(session, raw, *, reserved_serials=()):
     details = intake_details(raw)
     source_data = add_tracking_column(session.data)
     original = read_batches(BytesIO(source_data))
@@ -234,7 +234,7 @@ def stage_new_client(session, raw):
         else:
             sequence = max([int(batch['case_id']) for batch in original
                             if re.fullmatch(r'\d{1,12}', batch['case_id'])] or [0]) + 1
-            while str(sequence).casefold() in ids:
+            while str(sequence) in ids or sequence in reserved_serials:
                 sequence += 1
             case_id = str(sequence)
         # Copy the register's real client separator and plain supplier style.

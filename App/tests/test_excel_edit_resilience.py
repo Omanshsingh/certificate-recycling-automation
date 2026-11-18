@@ -1,10 +1,12 @@
 """Exercise manual-Excel workflows with disposable workbooks and Windows handles."""
 from contextlib import contextmanager
 from datetime import date
+from io import BytesIO
 import os
 from pathlib import Path
 import shutil
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -65,6 +67,51 @@ class ExcelEditResilienceTests(unittest.TestCase):
         runner.run(self.paths, self.root, check_only=True, as_of=AS_OF, progress=None,
                    report_sink=report, **kwargs)
         return report
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows file sharing behavior')
+    def test_refresh_only_attempts_completion_repairs_that_need_writes_and_never_waits_for_excel(self):
+        make_workbook(self.paths[0], [
+            {'sn': '1001', 'status': 'Ready'}, {'sn': '1002', 'status': 'Generated'},
+            {'sn': '1003', 'status': 'Completed'},
+        ])
+        records = [{'status': 'draft', 'details': {'certificate_type': 'destruction',
+                    'destruction_source': {'plant': 'plant1', 'case_id': sn}}}
+                   for sn in ('1001', '1002', '1003')]
+        before = self.paths[0].read_bytes()
+        with saved_workbook_open_for_reading(self.paths[0]), \
+                patch.object(web_app, 'read_register', return_value={'records': records}), \
+                patch.object(web_app, 'WorkbookSession', wraps=WorkbookSession) as session:
+            self.assertFalse(web_app._reconcile_linked_completions())
+        session.assert_called_once_with(self.paths[0], web_app.BACKUP_DIR, lock_timeout=0)
+        self.assertEqual(self.paths[0].read_bytes(), before)
+
+    def test_active_excel_check_allows_browsing_and_declines_a_second_check(self):
+        lock = threading.RLock()
+        holding = threading.Event()
+        release = threading.Event()
+
+        def run_check():
+            with lock:
+                holding.set()
+                release.wait(5)
+
+        worker = threading.Thread(target=run_check)
+        worker.start()
+        self.addCleanup(worker.join)
+        self.addCleanup(release.set)
+        self.assertTrue(holding.wait(1))
+        with patch.object(web_app, 'OPERATION_LOCK', lock):
+            for path in ('/api/workbook-changes', '/api/templates'):
+                handler = object.__new__(web_app.Handler)
+                handler.path = path
+                handler.headers = {}
+                with patch.object(handler, 'send_json') as send:
+                    handler.do_GET()
+                response = send.call_args.args[0]
+                if path == '/api/workbook-changes':
+                    self.assertEqual(response, {'changed': False, 'check_pending': True})
+                else:
+                    self.assertIn('templates', response)
 
     def test_background_refresh_picks_up_saved_excel_edits_and_inserted_or_deleted_rows(self):
         with patch.object(web_app, 'WORKBOOK_CHECK_STAMPS', {}):
@@ -368,6 +415,14 @@ class ExcelEditResilienceTests(unittest.TestCase):
         self.assertEqual(web_app.target_row(result, ('plant1','1001'))['certificate_status'], 'completed')
         self.assertTrue(web_app.target_row(result, ('plant1','1001'))['pdf_filename'])
         self.assertTrue(any(row.get('record_id') == 'keep-manual-row' for row in result['rows']))
+
+    def test_workbook_completion_merge_keeps_one_current_row_per_hdd_request(self):
+        existing = {'source_kind':'manual', 'record_id':'pending-hdd', 'certificate_status':'ready'}
+        updated = dict(existing, certificate_status='alert')
+        other = dict(existing, record_id='other-hdd')
+        with patch.object(web_app, 'WORKSPACE_STATE_CACHE', ('revision', {'rows':[existing, other]})):
+            report = web_app.merge_workbook_report('revision', {'rows':[updated]})
+        self.assertEqual(report['rows'], [updated, other])
 
     def test_completion_refresh_failure_preserves_success_and_actual_completed_status(self):
         runner.run(self.paths, self.root, as_of=AS_OF, progress=None)

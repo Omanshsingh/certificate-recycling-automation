@@ -7,26 +7,37 @@ import json
 import re
 import uuid
 
-from certificate_core import batch_content, number, parse_date, status_value
+from certificate_core import batch_content, number, parse_date, read_batches, status_value
 from certificate_drafts import clean_details, current_record_pdf, read_register, register_path, write_register
 from certificate_inventory import (cod_conflicts, filename_cod, identity, issuance_paths,
                                    safe_certificate_path, scan_inventory, text_identifiers)
 from certificate_templates import TEMPLATE_NAMES, template_id
-from identifier_rules import workspace_batches
+from identifier_rules import require_unique, workspace_batches
 from inward_followup import FIELDS
 from issuance_safety import (IssuanceTransaction, audit_records, digest_bytes, file_digest, latest_issuance,
-                             recover_issuances)
+                             recover_issuances, workbook_receipt_conflict)
 from pdf_attachments import checked_reader
 from preview_store import cleanup_previews
 from run_certificates import (_safe_cod_name, certificate_filename, find_certificate,
                               workbook_cod_ownership_issue)
-from workbook_store import WorkbookSession
+from workbook_store import WorkbookSession, stage_certificate_details
 from workflow_support import load_settings, operation_error_message, run_lock
 from workspace_review import require_revision
 
 
 UPLOAD_LIMIT = 50_000_000
 EDITABLE_CERTIFICATE_FIELDS = {'supplier', 'location', 'inward_date', 'reference', 'form6', 'certificate_weight'}
+
+
+def _was_issued_before(root, digest):
+    try:
+        return any(record.get('pdf_sha256') == digest
+                   and record.get('state') in {'complete', 'source_committed'}
+                   for record in audit_records(root))
+    except (OSError, TypeError, ValueError):
+        # This is only a user-facing notice. A problem checking history must
+        # never turn the notice itself into an upload blocker.
+        return False
 
 
 def _valid_cod(cod):
@@ -71,7 +82,7 @@ def _image_pdf(payload):
         raise ValueError('This image could not be opened. Choose a readable PNG or JPEG.') from exc
 
 
-def stage_upload(root, payload, *, content_type='application/pdf'):
+def stage_upload(root, payload, *, content_type='application/pdf', filename=''):
     if not 0 < len(payload) <= UPLOAD_LIMIT:
         raise ValueError('Choose a certificate file under 50 MB.')
     if content_type in {'image/png', 'image/jpeg'}:
@@ -79,14 +90,36 @@ def stage_upload(root, payload, *, content_type='application/pdf'):
     if len(payload) > UPLOAD_LIMIT:
         raise ValueError('This image is too large to save as a PDF. Choose a smaller image.')
     cods, references = _inspect(root, payload)
+    named_cod = filename_cod(filename) if filename else None
+    if named_cod and not _valid_cod(named_cod):
+        named_cod = None
+    detected_cod = cods[0] if len(cods) == 1 else ''
+    cod_source = 'pdf' if detected_cod else ''
+    if not detected_cod and named_cod:
+        matching = next((value for value in cods if identity(value) == identity(named_cod)), None)
+        if matching:
+            detected_cod = matching
+            cod_source = 'pdf'
+        elif not cods:
+            detected_cod = named_cod
+            cod_source = 'filename'
+    digest = digest_bytes(payload)
+    try:
+        previously_used = any(entry.get('sha256') == digest
+                              for entry in scan_inventory(root).get('entries', []))
+    except (OSError, TypeError, ValueError):
+        previously_used = False
+    previously_used = previously_used or _was_issued_before(root, digest)
     cleanup_previews(root)
     token = uuid.uuid4().hex
     folder = Path(root) / 'Data' / 'Previews'
     folder.mkdir(parents=True, exist_ok=True)
     with (folder / f'{token}.pdf').open('xb') as stream:
         stream.write(payload)
-    return {'token':token, 'cod':cods[0] if len(cods) == 1 else '', 'changed':False,
-            'ambiguous_cod':len(cods) > 1,
+    return {'token':token, 'cod':detected_cod, 'cod_source':cod_source, 'printed_cods':cods,
+            'filename_cod':named_cod or '', 'changed':False,
+            'previously_used':previously_used,
+            'ambiguous_cod':len(cods) > 1 and not detected_cod,
             'reference':references[0] if len(references) == 1 else ''}
 
 
@@ -98,18 +131,14 @@ def stage_saved_upload(root, body):
     relative = path.relative_to((Path(root) / 'Certificates').resolve()).as_posix()
     entry = next((item for item in scan_inventory(root, force=True)['entries']
                   if item['path'] == f'Certificates/{relative}' and item.get('present')), None)
-    if not entry or not entry.get('linkable_external') or entry.get('sha256') != digest:
-        raise ValueError('This PDF changed or already belongs to a saved certificate. Refresh and choose the current file.')
+    if not entry or not (entry.get('linkable_external') or entry.get('external')) or entry.get('sha256') != digest:
+        raise ValueError('This PDF changed or is no longer available as an external certificate. Refresh Saved certificates and try again.')
     if not path.is_file() or path.stat().st_size > UPLOAD_LIMIT:
         raise ValueError('Choose an available certificate PDF under 50 MB.')
     payload = path.read_bytes()
     if digest_bytes(payload) != digest:
         raise ValueError('This PDF changed. Refresh Saved certificates and try again.')
-    staged = stage_upload(root, payload)
-    cod = filename_cod(path.name)
-    if not staged['cod'] and not staged['ambiguous_cod'] and cod and _valid_cod(cod):
-        staged['filename_cod'] = cod
-    return staged
+    return stage_upload(root, payload, filename=path.name)
 
 
 def _replacement_paths(root, inventory, current, cod, source_kind, plant, key):
@@ -139,6 +168,106 @@ def _replacement_paths(root, inventory, current, cod, source_kind, plant, key):
     return allowed, paths
 
 
+def _edited_upload_details(previous, submitted):
+    if not isinstance(submitted, dict):
+        raise ValueError('Enter the certificate details first.')
+    editable = EDITABLE_CERTIFICATE_FIELDS | {'item', 'quantity', 'per_piece_weight', 'weight', 'items', *FIELDS}
+    details = dict(previous, **{key:value for key, value in submitted.items() if key in editable})
+    fields = dict(previous.get('certificate_fields') or {})
+    edits = submitted.get('certificate_fields')
+    if isinstance(edits, dict):
+        fields.update({key:value for key, value in edits.items() if key != '_annexure'})
+    details['certificate_fields'] = fields
+    cleaned = clean_details(details)
+    if not cleaned['supplier']:
+        raise ValueError('Enter the company name.')
+    if cleaned['inward_date']:
+        received = parse_date(cleaned['inward_date'])
+        if not received:
+            raise ValueError('Enter a valid received date.')
+        cleaned['inward_date'] = received.isoformat()
+    if cleaned['certificate_weight'] and (number(cleaned['certificate_weight']) or 0) <= 0:
+        raise ValueError('Enter a positive certificate weight in kg.')
+    return cleaned
+
+
+def _check_uploaded_pdf(path, expected, current):
+    if (not isinstance(expected, str) or not re.fullmatch(r'[a-f0-9]{64}', expected)
+            or expected != current or not path or file_digest(path) != expected):
+        raise ValueError('The uploaded PDF changed or is missing. Refresh and reopen this certificate.')
+
+
+def save_uploaded_details(root, backup_dir, body):
+    """Edit the selected record's details while preserving its original PDF."""
+    root = Path(root).resolve()
+    revision = body.get('expected_revision')
+    expected_pdf = body.get('pdf_sha256')
+    supplied = body.get('details')
+    issued = {'generated', 'generated_manual', 'completed'}
+    with run_lock(root):
+        recover_issuances(root)
+        require_revision(root, revision)
+        register = read_register(root)
+        if body.get('source_kind') == 'manual':
+            record_id = body.get('record_id')
+            record = next((item for item in register['records'] if item['id'] == record_id), None)
+            if not record or status_value(record['status']) not in issued:
+                raise ValueError('Refresh and reopen the uploaded certificate.')
+            receipt = latest_issuance(root, 'manual', record['plant'], record_id)
+            if not receipt or not receipt.get('external_upload'):
+                raise ValueError('Refresh and reopen the uploaded certificate.')
+            pdf = current_record_pdf(root, record, receipt=receipt)
+            _check_uploaded_pdf(pdf, expected_pdf, receipt.get('pdf_sha256'))
+            previous = record['details']
+            details = _edited_upload_details(previous, supplied)
+            if not details.get('destruction_source') and details['form6'] != previous.get('form6', ''):
+                require_unique(details, record['plant'], 'manual', record_id, workspace_batches(root), register['records'])
+            require_revision(root, revision)
+            _check_uploaded_pdf(pdf, expected_pdf, receipt.get('pdf_sha256'))
+            record.update(details=details, updated_at=datetime.now().isoformat())
+            write_register(root, register)
+            return
+        plant, sn = body.get('source_plant'), body.get('source_sn')
+        if body.get('source_kind') != 'workbook' or plant not in ('plant1', 'plant2') or not isinstance(sn, str):
+            raise ValueError('Refresh and reopen the uploaded certificate.')
+        path = load_settings(root)['workbook_paths'][int(plant[-1]) - 1]
+        if not path:
+            raise ValueError('Connect the selected plant workbook in Settings.')
+        with WorkbookSession(Path(path).resolve(), backup_dir) as session:
+            overrides = {str(session.path.resolve()): session.data}
+            require_revision(root, revision, overrides)
+            matches = [row for row in read_batches(BytesIO(session.data)) if row['case_id'] == sn]
+            if len(matches) != 1 or matches[0].get('duplicate_serial_number'):
+                raise ValueError('This inward is missing or its SN is repeated. Check Excel and refresh.')
+            source = matches[0]
+            receipt = latest_issuance(root, 'workbook', plant, sn)
+            conflict = workbook_receipt_conflict(source, receipt)
+            if conflict:
+                raise ValueError(conflict)
+            link = source.get('external_pdf') or {}
+            recorded_pdf = receipt.get('pdf_sha256') if receipt and receipt.get('external_upload') else link.get('sha256')
+            if status_value(source['issued']) not in issued or not recorded_pdf:
+                raise ValueError('Refresh and reopen the uploaded certificate.')
+            pdf = find_certificate(root / 'Certificates', dict(source, source_id=plant), receipt=receipt)
+            _check_uploaded_pdf(pdf, expected_pdf, recorded_pdf)
+            previous = dict(batch_content(source), cod_no=source['cod_no'], cod_date=source['cod_date'],
+                            **{key:source.get(key, '') for key in FIELDS})
+            details = _edited_upload_details(previous, supplied)
+            updated, saved = stage_certificate_details(session, details, inward_status=source['issued'])
+            if any(saved.get(key) != source.get(key) for key in ('cod_no', 'cod_date', 'external_pdf', 'hdd_cod_no', 'hdd_cod_date')):
+                raise ValueError('The existing certificate tracking could not be preserved. No details were saved.')
+            if saved['form6'] != source['form6']:
+                require_unique(saved, plant, 'workbook', sn,
+                               workspace_batches(root, {str(session.path.resolve()):updated}), register['records'])
+
+            def check_before_save(_):
+                require_revision(root, revision, overrides)
+                _check_uploaded_pdf(pdf, expected_pdf, recorded_pdf)
+
+            session.before_persist = check_before_save
+            session._persist(updated)
+
+
 def save_upload(root, backup_dir, body):
     root = Path(root).resolve()
     if body.get('certificate_edits'):
@@ -162,10 +291,15 @@ def save_upload(root, backup_dir, body):
                 raise ValueError('Choose an existing certificate to replace.')
         else:
             target = replacement
+    selected_target = replacement if replacing else target
+    slot_type = selected_target.get('certificate_type') if isinstance(selected_target, dict) else None
+    if slot_type is not None and slot_type not in TEMPLATE_NAMES:
+        raise ValueError('Refresh the upload list and choose a valid certificate slot.')
     submitted = body.get('details')
     if replacing and isinstance(submitted, dict):
-        submitted = {'certificate_type':'standard', 'cod_no':submitted.get('cod_no'),
-                     'cod_date':submitted.get('cod_date')}
+        submitted = {'certificate_type':slot_type or 'standard', 'cod_date':submitted.get('cod_date')}
+    elif slot_type:
+        submitted = dict(submitted or {}, certificate_type=slot_type)
     kind = submitted.get('certificate_type') if isinstance(submitted, dict) else None
     if not isinstance(kind, str) or kind not in TEMPLATE_NAMES:
         raise ValueError('Choose the certificate type.')
@@ -197,7 +331,10 @@ def save_upload(root, backup_dir, body):
         payload = stage.read_bytes()
         if not 0 < len(payload) <= UPLOAD_LIMIT:
             raise ValueError('Choose a PDF smaller than 50 MB.')
-        printed, _ = _inspect(root, payload)
+        if replacing:
+            checked_reader(payload)
+        else:
+            printed, _ = _inspect(root, payload)
         digest = digest_bytes(payload)
         session = None
         source = None
@@ -291,15 +428,18 @@ def save_upload(root, backup_dir, body):
             details['destruction_source'] = link
             linked = [record for record in register['records']
                       if (candidate := record['details'].get('destruction_source'))
-                      and (candidate.get('record_id') == local_parent_id if local_parent_id else candidate == link)]
+                      and record['details'].get('certificate_type') == 'destruction'
+                      and (candidate.get('record_id') == local_parent_id if local_parent_id
+                           else not candidate.get('record_id') and candidate.get('plant') == plant
+                           and str(candidate.get('case_id', '')).strip().casefold() == source['case_id'].strip().casefold())]
             if len(linked) > 1 or (source and source.get('hdd_cod_no')):
                 raise ValueError('This inward already has a Data Destruction certificate. Open its record to review it.')
             existing = linked[0] if linked else None
             if existing and (existing['details'].get('cod_no') or status_value(existing.get('status')) == 'na'):
                 raise ValueError('Review the existing Data Destruction record before uploading a certificate.')
-            if existing:
-                details.update(existing['details'], cod_date=issued_date.isoformat())
-                details['case_id'] = link['case_id']
+            if not existing or existing.get('destruction_requested') is False:
+                raise ValueError('Add Data Destruction in the client’s Review & edit screen before attaching its PDF.')
+            details.update(existing['details'], cod_date=issued_date.isoformat(), case_id=link['case_id'])
         if not details['supplier']:
             raise ValueError('Enter the company name.')
         if workbook_record and not replacing:
@@ -308,14 +448,6 @@ def save_upload(root, backup_dir, body):
                     or latest_issuance(root, 'workbook', plant, source['case_id'])):
                 raise ValueError('This client already has a certificate. Select its current certificate in the client list to replace the PDF.')
         if replacing:
-            if reviewed_cod and identity(reviewed_cod) != identity(existing_cod):
-                raise ValueError(f'The replacement must keep COD {existing_cod}.')
-            printed_numbers = {identity(value) for value in printed}
-            if printed_numbers and identity(existing_cod) not in printed_numbers:
-                raise ValueError(
-                    f'The replacement PDF must match the number printed for existing COD {existing_cod}. '
-                    'Choose the correct PDF and try again.'
-                )
             cod = existing_cod
         else:
             printed_numbers = {identity(value) for value in printed}
@@ -342,22 +474,25 @@ def save_upload(root, backup_dir, body):
             raise ValueError(f'COD {cod} is already assigned to a Data Destruction certificate.')
         if inventory is None:
             inventory = scan_inventory(root, force=True)
-        duplicates = [entry for entry in inventory['entries'] if entry.get('present') and entry.get('sha256') == digest]
-        if any(not entry.get('linkable_external') for entry in duplicates) or any(
-                isinstance(row.get('external_pdf'), dict) and row['external_pdf'].get('sha256') == digest for row in batches):
-            raise ValueError('This PDF already belongs to a saved certificate. Open it in Saved certificates.')
-        allowed = [entry['path'] for entry in duplicates]
-        if cod_conflicts(inventory, cod, allowed_paths=allowed + permitted_paths):
+        duplicates = [] if replacing else [entry for entry in inventory['entries'] if entry.get('sha256') == digest]
+        previously_used = not replacing and (bool(duplicates) or _was_issued_before(root, digest))
+        if cod_conflicts(inventory, cod, allowed_paths=[entry['path'] for entry in duplicates]
+                         + permitted_paths):
             raise ValueError(f'COD {cod} is already used by another PDF. Check the certificate number.')
         require_revision(root, revision, overrides)
-        relative = allowed[0].removeprefix('Certificates/') if allowed else certificate_filename(details, cod=cod)
-        destination = safe_certificate_path(root, relative)
-        if destination in previous_paths:
+        destination = current if replacing else safe_certificate_path(root, certificate_filename(details, cod=cod))
+        if not replacing and destination.exists():
             stem = destination.stem.removesuffix('_HDD') if kind == 'destruction' else destination.stem
             suffix = '_HDD.pdf' if kind == 'destruction' else '.pdf'
-            destination = destination.with_name(f'{stem}_{uuid.uuid4().hex[:8]}{suffix}')
+            for _ in range(5):
+                candidate = destination.with_name(f'{stem}_{uuid.uuid4().hex[:8]}{suffix}')
+                if not candidate.exists():
+                    destination = candidate
+                    break
+            else:
+                raise ValueError('A unique filename could not be prepared. Refresh and try again.')
         destination.parent.mkdir(parents=True, exist_ok=True)
-        if not allowed and destination.exists():
+        if not replacing and destination.exists():
             raise ValueError('A PDF with that filename already exists. Refresh and check Saved certificates.')
         relative = destination.relative_to(root / 'Certificates').as_posix()
         source_path = session.path if session else register_path(root)
@@ -382,7 +517,7 @@ def save_upload(root, backup_dir, body):
             source_kind=source_kind, plant=plant, key=identifier,
             cod=cod, issued_date=issued_date, before=source if workbook_record else old_record,
             after=details, old_paths=previous_paths, companion_source=companion, external_upload=True,
-            retain_existing=bool(allowed))
+            external_replacement=replacing, retain_existing=replacing and previous_paths[current] == digest)
         try:
             if replacing and {root / item['path']: item['sha256'] for item in transaction.data['previous_pdfs']} != previous_paths:
                 raise ValueError('The current PDF changed during the upload. Refresh and review it again.')
@@ -415,4 +550,5 @@ def save_upload(root, backup_dir, body):
         except OSError:
             pass
     return {'saved':True, 'replaced':replacing, 'certificate_no':cod, 'relative_path':relative, 'recovery_note':note,
+            'previously_used':previously_used,
             'record_id':None if workbook_record else identifier}

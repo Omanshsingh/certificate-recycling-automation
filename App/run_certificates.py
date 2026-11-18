@@ -12,6 +12,7 @@ import re
 from pathlib import Path
 import shutil
 import sqlite3
+import time
 import uuid
 import json
 
@@ -106,10 +107,15 @@ def workbook_cod_ownership_issue(batch, batches, manual_records=()):
     owners = []
     for other in batches:
         key = (other.get('source_id'), str(other.get('case_id') or '').strip().casefold())
-        if key != own and cod_identity(other.get('cod_no')) == identity:
+        reserved_match = any(cod_identity(value) == identity
+                             for value in other.get('reserved_cod_numbers', ()))
+        if key != own and (cod_identity(other.get('cod_no')) == identity or reserved_match):
             plant = str(other.get('source_id') or '').replace('plant', 'Plant ')
-            owners.append(f'{plant}, sheet "{other.get("source_sheet")}", row {other.get("source_row")} '
-                          f'(Serial Number {other.get("case_id")})')
+            if other.get('_unassigned_excel_row'):
+                owners.append(f'{plant}, sheet "{other.get("source_sheet")}", row {other.get("source_row")} (no Serial Number)')
+            else:
+                owners.append(f'{plant}, sheet "{other.get("source_sheet")}", row {other.get("source_row")} '
+                              f'(Serial Number {other.get("case_id")})')
     for record in manual_records:
         details = record.get('details') or {}
         if cod_identity(details.get('cod_no')) == identity:
@@ -167,12 +173,27 @@ def _read_sources(paths, sessions, report):
         if sessions[index - 1] is None:
             continue
         try:
-            source_batches = list(read_batches(BytesIO(sessions[index - 1].data)))
+            parsed = read_batches(BytesIO(sessions[index - 1].data))
+            source_batches = list(parsed)
         except Exception as exc:
             report.add({"source_id": source_id, "source_path": str(path)}, "needs_review",
                        f"{path.name} could not be read: {exc}", issue_code="source_unavailable", system_alert=True)
             continue
         report.observed_sources.append(source_id)
+        for issue in getattr(parsed, 'row_issues', ()):
+            detail = f'Plant {index}: {issue["detail"]}'
+            report.add({'source_id': source_id, 'source_path': str(path),
+                        'source_sheet': issue.get('sheet'), 'source_row': issue.get('row')},
+                       'needs_review', detail, issue_code='excel_row_unassigned',
+                       warnings=[detail], system_alert=True)
+            report.reserved_cod_numbers.extend(issue.get('reserved_cod_numbers', ()))
+            if issue.get('reserved_cod_numbers'):
+                report.unassigned_rows.append({
+                    'case_id': '', 'source_id': source_id, 'source_sheet': issue.get('sheet'),
+                    'source_row': issue.get('row'),
+                    'reserved_cod_numbers': list(issue['reserved_cod_numbers']),
+                    '_unassigned_excel_row': True,
+                })
         for batch in source_batches:
             batch.update(source_id=source_id, source_path=str(path))
             if isinstance(sessions[index - 1], WorkbookSnapshot):
@@ -188,6 +209,8 @@ def _highest_sequence(batches, settings, output_folder, legacy_history=None, inv
         for key in ('cod_no', 'hdd_cod_no'):
             if batch.get(key):
                 highest = max(highest, certificate_sequence(batch[key], settings))
+        for value in batch.get('reserved_cod_numbers', ()):
+            highest = max(highest, certificate_sequence(value, settings))
     # Existing flat output PDFs are the durable numbering floor if an old
     # workbook row is archived or its COD cell is cleared by the user.
     output_folder = Path(output_folder).resolve()
@@ -401,7 +424,7 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
         plants=None, allow_warnings=False, overrides=None, details=None, update_excel=True,
         override_reason='', expected_revision=None, report_sink=None, read_only_preflight=False,
         starting_cod=None, selected_keys=None,
-        remove_inward=False, hdd_needed=None):
+        remove_inward=False, hdd_needed=None, check_timings=None):
     """Check both workbooks or generate PDFs for rows explicitly marked Ready."""
     root = Path(root)
     if remove_inward and (not selected or details is None or update_excel):
@@ -435,6 +458,15 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
     if details is not None and (not selected or str(details.get('case_id')) != str(selected[1])):
         raise ValueError("The selected Serial Number cannot be changed when editing its certificate.")
     mode = "Check plant files" if check_only else "Generate certificates"
+    stage_started = time.perf_counter()
+
+    def finish_stage(name):
+        nonlocal stage_started
+        if check_timings is not None:
+            now = time.perf_counter()
+            check_timings[name] = now - stage_started
+            stage_started = now
+
     with run_lock(root):
         if read_only_preflight:
             from backup_service import check_restore_health
@@ -448,6 +480,7 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
             require_revision(root, expected_revision)
         report = Report(root, as_of, mode, publish_latest=publish_latest and not read_only_preflight)
         report.result_sink = report_sink
+        finish_stage('recovery')
         try:
             paths = [Path(path).expanduser().resolve() for path in workbook_paths]
             if len(paths) != 2 or any(not str(path) for path in paths):
@@ -481,11 +514,15 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
                                    f'{path.name} is unavailable: {exc}', issue_code='source_unavailable', system_alert=True)
                 if expected_revision is not None:
                     require_revision(root, expected_revision, {str(session.path.resolve()): session.data for session in sessions if session is not None})
+                finish_stage('open_workbooks')
                 inventory = scan_inventory(root, persist=not read_only_preflight)
                 report.certificate_inventory = inventory
+                finish_stage('certificate_inventory')
                 if check_only and not read_only_preflight and details is None:
                     from certificate_drafts import read_register
-                    from hdd_workbook import stage_hdd_tracking
+                    from hdd_workbook import (hdd_repair_matches_inward, hdd_uses_main_row,
+                                              recover_hdd_tracking_link, stage_hdd_tracking)
+                    batches_by_plant = {}
                     for record in read_register(root)['records']:
                         hdd = record.get('details', {})
                         link = hdd.get('destruction_source') or {}
@@ -493,17 +530,56 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
                         if (hdd.get('certificate_type') != 'destruction' or not hdd.get('cod_no') or not issued_date
                                 or not link or link.get('record_id') or link.get('plant') not in {'plant1', 'plant2'}):
                             continue
-                        session = sessions[int(link['plant'][-1]) - 1]
+                        plant = link['plant']
+                        session = sessions[int(plant[-1]) - 1]
                         if session is None or isinstance(session, WorkbookSnapshot):
                             continue
                         try:
-                            source = next((b for b in read_batches(BytesIO(session.data))
-                                           if str(b['case_id']) == str(link.get('case_id'))), None)
-                            if source and (source.get('hdd_cod_no'), parse_date(source.get('hdd_cod_date'))) != (hdd['cod_no'], issued_date):
-                                session._persist(stage_hdd_tracking(session, link['case_id'], hdd['cod_no'], issued_date))
+                            if plant not in batches_by_plant:
+                                by_serial = {}
+                                for batch in read_batches(BytesIO(session.data)):
+                                    by_serial.setdefault(str(batch['case_id']).strip().casefold(), batch)
+                                batches_by_plant[plant] = by_serial
+                            source = batches_by_plant[plant].get(str(link.get('case_id')).strip().casefold())
+                            if source is None:
+                                repaired = recover_hdd_tracking_link(
+                                    session, list(batches_by_plant[plant].values()), record, issued_date)
+                                if repaired is not None:
+                                    batches_by_plant.pop(plant)
+                                    session._persist(repaired)
+                            elif (
+                                (source.get('hdd_cod_no'), parse_date(source.get('hdd_cod_date'))) != (hdd['cod_no'], issued_date)
+                                or source.get('hdd_tracking_displaced')
+                                or (hdd_uses_main_row(source) and not source.get('hdd_on_main_row'))
+                            ):
+                                if not hdd_repair_matches_inward(source, hdd):
+                                    raise ValueError('The inward details no longer match the HDD certificate. Check the linked client in Excel.')
+                                # A repair may insert a tracking row. Reparse only
+                                # after a real change to the workbook bytes.
+                                batches_by_plant.pop(plant)
+                                session._persist(stage_hdd_tracking(session, source['case_id'], hdd['cod_no'], issued_date))
                         except (OSError, ValueError) as exc:
-                            report.maintenance_notes.append({'plant': link['plant'], 'detail': f'HDD number could not be added to Excel: {exc}'})
+                            report.maintenance_notes.append({
+                                'plant': plant, 'kind': 'hdd_tracking',
+                                'detail': f'Data Destruction tracking at SN {link["case_id"]} needs review. {exc}',
+                            })
+                finish_stage('linked_hdd_tracking')
+                if check_only and not read_only_preflight:
+                    from inward_serials import assign_missing_serial_numbers
+                    for index, session in enumerate(sessions, 1):
+                        if session is None or isinstance(session, WorkbookSnapshot):
+                            continue
+                        try:
+                            updated, assignments = assign_missing_serial_numbers(
+                                session.data, root=root, plant=f'plant{index}')
+                            if assignments:
+                                session._persist(updated)
+                        except Exception:
+                            # Keep the saved workbook and let the normal
+                            # row-level warning explain what still needs attention.
+                            pass
                 batches = _read_sources(paths, sessions, report)
+                finish_stage('workbook_rows_and_serials')
                 if read_only_preflight:
                     for batch in batches:
                         batch.pop('_workbook_read_only', None)
@@ -513,12 +589,13 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
                            if entry.get('source_kind') == 'workbook' and entry.get('state') == 'complete'}
                 from certificate_drafts import read_register
                 manual_records = read_register(root)['records']
+                ownership_batches = [*batches, *report.unassigned_rows]
                 for batch in batches:
                     receipt = history.get((batch['source_id'], batch['case_id'].strip().casefold()))
                     conflict = workbook_receipt_conflict(batch, receipt)
                     if not conflict:
                         ownership_view = dict(batch, cod_no=batch.get('cod_no') or (receipt or {}).get('cod'))
-                        conflict = workbook_cod_ownership_issue(ownership_view, batches, manual_records)
+                        conflict = workbook_cod_ownership_issue(ownership_view, ownership_batches, manual_records)
                     if conflict:
                         batch['record_identity_conflict'] = conflict
                         batch['blocking_issues'].append(conflict)
@@ -534,6 +611,7 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
                         report.add(batch, 'source_check_incomplete',
                                    'This company was loaded. Certificate creation is paused until both plant files can be checked.',
                                    warnings=source_value_issues(batch, as_of))
+                    finish_stage('partial_queue')
                     return report.finish()
 
                 from identifier_rules import mark_conflicts
@@ -543,6 +621,8 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
                 staged_data = None
                 removed_data = None
                 numbering_batches = list(batches)
+                if report.reserved_cod_numbers:
+                    numbering_batches.append({'reserved_cod_numbers': list(report.reserved_cod_numbers)})
                 if details is not None:
                     session = sessions[int(selected[0][-1]) - 1]
                     matches = [batch for batch in batches if batch['source_id'] == selected[0]
@@ -578,6 +658,7 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
 
                 mark_conflicts(batches, manual_records)
                 renumbered = False
+                finish_stage('validation')
                 for index, batch in enumerate(batches):
                     if plants is not None and batch["source_id"] not in plants:
                         continue
@@ -601,6 +682,7 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
                                if entry.get('source_kind') == 'workbook' and entry.get('state') == 'complete'}
                     inventory = report.certificate_inventory = scan_inventory(root, persist=True)
 
+                finish_stage('workbook_status_and_formatting')
                 plan = numbering_plan(numbering_batches, settings, output_folder,
                                       inventory=inventory, starting_cod=start_sequence)
                 next_sequence = plan['sequence']
@@ -961,7 +1043,9 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
             # saved certificate a second time before returning.
             if not check_only:
                 report.certificate_inventory = scan_inventory(root, persist=not read_only_preflight)
+            finish_stage('numbering_and_queue')
             return report.finish()
         except Exception as exc:
+            finish_stage('interrupted_stage')
             report.add({}, "needs_review", operation_error_message(exc), issue_code="run_failure", system_alert=True)
             return report.finish()

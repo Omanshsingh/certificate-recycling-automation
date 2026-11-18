@@ -88,12 +88,13 @@
           <button type="button" data-filter-status="blank" aria-pressed="false">No status selected <span class="status-count" id="count-blank">—</span></button>
           <button type="button" data-filter-status="na" aria-pressed="false">N/A <span class="status-count" id="count-na">—</span></button>
           <button type="button" data-quick-status="details_to_finish" aria-pressed="false">Details to finish <span class="status-count" id="count-details-to-finish">—</span></button>
+          <button type="button" data-filter-status="excel_changed" aria-pressed="false">Excel changed <span class="status-count" id="count-excel-changed">—</span></button>
           <span id="count-overdue" hidden></span>
         </div>
         <label class="attention-only-filter" id="attention-status-filter" hidden><input type="checkbox" id="attention-only"><span>Only show rows with “Needs attention” in Status</span></label>
         <input type="hidden" id="status-filter" value="all">
         <div class="record-filter-popover" id="more-filters" popover="auto" role="region" aria-label="Company filters"><div class="record-filter-heading"><h3>Filters</h3><button type="button" class="icon-button" popovertarget="more-filters" popovertargetaction="hide" aria-label="Close filters">×</button></div><div class="filter-fields">
-          <label class="field"><span>Sort by</span><select id="company-sort"><option value="received-oldest">Received date: oldest first</option><option value="received-newest">Received date: newest first</option><option value="added-newest">Added: newest first (highest SN)</option><option value="added-oldest">Added: oldest first (lowest SN)</option><option value="company">Company A–Z</option></select></label>
+          <label class="field"><span>Sort by</span><select id="company-sort"><option value="received-oldest">Received date: oldest first</option><option value="received-newest">Received date: newest first</option><option value="added-newest">Added: newest first</option><option value="added-oldest">Added: oldest first</option><option value="serial-lowest">Serial number (lowest)</option><option value="serial-highest">Serial number (highest)</option><option value="company">Company A–Z</option></select></label>
           <label class="field"><span>Certificate type</span><select id="template-filter" aria-label="Certificate type"><option value="all">All types</option><option value="standard">Recycling</option><option value="destruction">Data Destruction</option><option value="siemens">Medical</option><option value="sita">International</option></select></label>
           <label class="field"><span>Find SN</span><input type="search" id="serial-filter" placeholder="Enter serial number"></label>
           <label class="field"><span>Received from</span><input type="text" data-date-input="true" inputmode="numeric" placeholder="DD/MM/YY" id="received-date-filter" aria-describedby="received-range-error"></label>
@@ -240,7 +241,7 @@
         </div>
       </section>
       <p class="form-hint" id="edit-items-hint" hidden></p>
-      <section class="annexure-section" aria-label="Additional certificate pages"><div><p>Add pages (optional)</p><p id="annexure-name" hidden></p></div><div class="annexure-actions"><button type="button" class="button button-quiet" id="pick-annexure">Add pages</button><button type="button" class="button button-quiet" id="remove-annexure" hidden>Remove pages</button></div></section>
+      <section class="annexure-section" id="certificate-annexure" aria-label="Additional certificate pages"><div><p>Add pages (optional)</p><p id="annexure-name" hidden></p></div><div class="annexure-actions"><button type="button" class="button button-quiet" id="pick-annexure">Add pages</button><button type="button" class="button button-quiet" id="remove-annexure" hidden>Remove pages</button></div></section>
       <p class="form-hint" id="template-status" role="status" hidden></p>
       <p class="autosave-note" id="working-draft-status" role="status" hidden></p><details class="form-disclosure" id="draft-options" hidden><summary>Save for later</summary><p>Find the saved draft in Companies.</p><div class="draft-actions"><button type="button" class="button button-quiet" id="keep-working-draft" hidden>Keep these edits</button><button type="button" class="button button-quiet" id="save-draft" hidden>Save draft</button></div></details>
       </section>
@@ -328,8 +329,6 @@
         <p id="entry-delete-shown" role="status" aria-live="polite"></p>
         <div id="entry-delete-choices" class="bulk-choices" aria-label="Choose mistaken entries"></div>
         <p id="entry-delete-empty" hidden>No entries found. Try another company, SN or COD.</p>
-        <label class="remove-inward-check"><input type="checkbox" id="entry-delete-hdd"><span>Also delete linked HDD requests that have not been generated.</span></label>
-        <p class="dialog-note">Unselected linked HDD records are kept.</p>
       </div>
       <div id="entry-delete-review" hidden><h3 id="entry-delete-review-title">Review selected entries</h3><div id="entry-delete-review-list"></div><p id="entry-delete-kept-hdd" hidden></p><p class="dialog-note">The listed records and any PDFs will be removed. You can undo this deletion afterward.</p><label class="remove-inward-check"><input type="checkbox" id="entry-delete-checked"><span>I reviewed this list and want to delete these records.</span></label></div>
       <p id="entry-delete-error" class="form-error" role="alert" hidden></p>
@@ -402,19 +401,20 @@
 
   <dialog class="modal upload-certificate-modal" id="upload-certificate-modal" aria-labelledby="upload-certificate-title">
     <form id="upload-certificate-form">
-      <div class="modal-header"><div><h2 id="upload-certificate-title">Save an external certificate</h2><p>Choose a file and where to save it.</p></div><button type="button" class="icon-button" data-close="upload-certificate-modal" aria-label="Close">×</button></div>
+      <div class="modal-header"><div><h2 id="upload-certificate-title">Save an external certificate</h2><p>Choose a file and where to save it.</p></div><div class="modal-header-actions"><button type="button" class="issued-details-alert" id="upload-duplicate-alert" aria-label="This PDF was used before. Review details." title="Review the duplicate PDF notice" hidden>⚠ PDF used before · Review</button><button type="button" class="icon-button" data-close="upload-certificate-modal" aria-label="Close">×</button></div></div>
       <div class="form-grid">
         <label class="field" id="upload-file-field"><span>Certificate file</span><input type="file" id="external-upload-file" accept=".pdf,.png,.jpg,.jpeg,application/pdf,image/png,image/jpeg" required><small>PDF, PNG or JPEG</small></label>
         <p class="field" id="upload-saved-filename" hidden></p>
         <label class="field"><span>Save to</span><select id="external-upload-target"><option value="workbook">Attach to a client</option><option value="local">Save as an app-only certificate</option></select></label>
-        <label class="field field-half"><span>Certificate type</span><select name="certificate_type" required><option value="">Choose a type</option><option value="standard">Recycling</option><option value="destruction">Data Destruction (HDD)</option><option value="siemens">Medical</option><option value="sita">International</option></select></label>
-        <label class="field field-half"><span>COD printed on certificate</span><textarea id="upload-cod" rows="1" readonly maxlength="80" placeholder="Read from PDF" aria-describedby="upload-cod-hint"></textarea><small id="upload-cod-hint" role="status"></small></label>
+        <label class="field field-half" id="upload-type-field"><span>Certificate type</span><select name="certificate_type" required><option value="">Choose a type</option><option value="standard">Recycling</option><option value="destruction">Data Destruction (HDD)</option><option value="siemens">Medical</option><option value="sita">International</option></select></label>
+        <label class="field field-half" id="upload-cod-field"><span>COD printed on certificate</span><textarea id="upload-cod" rows="1" readonly maxlength="80" placeholder="Read from PDF" aria-describedby="upload-cod-hint"></textarea><small id="upload-cod-hint" role="status"></small></label>
         <div class="field inward-picker" id="upload-inward-field">
           <label id="upload-inward-label" for="upload-inward">Client</label>
           <input id="upload-inward" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="upload-inward-options" autocomplete="off" placeholder="Search company, SN or plant" required>
           <div id="upload-inward-options" class="inward-options" role="listbox" aria-label="Matching Excel inwards" hidden></div>
           <small id="upload-inward-results" role="status" hidden></small>
         </div>
+        <p class="field" id="upload-attached-auto-note" role="status" hidden>Certificate type comes from the selected slot. COD is read from the PDF.</p>
         <p class="field" id="upload-replacement-note" hidden>The replacement keeps the existing COD and archives the previous PDF. The revised certificate is marked Generated Externally so it can be sent again.</p>
         <label class="field field-half"><span>Certificate issue date</span><input name="cod_date" data-date-input="true" required></label>
         <fieldset class="upload-company-fields field" id="upload-company-fields" hidden disabled>
@@ -434,6 +434,23 @@
       </div>
       <div class="modal-footer"><div><button type="button" class="button button-quiet" data-close="upload-certificate-modal">Cancel</button><button type="submit" class="button button-primary" id="save-uploaded-certificate">Save certificate</button></div></div>
     </form>
+  </dialog>
+
+  <dialog class="modal issued-change-review-modal upload-duplicate-review-modal" id="upload-duplicate-review-modal" aria-labelledby="upload-duplicate-title">
+    <div class="modal-header"><div><h2 id="upload-duplicate-title">This PDF was used before</h2><p>The file matches a certificate already used in this workspace.</p></div><button type="button" class="icon-button" data-close="upload-duplicate-review-modal" aria-label="Close">×</button></div>
+    <div class="issued-change-content">
+      <div class="issued-change-preview">
+        <section class="issued-change-card">
+          <div class="issued-change-heading"><h3 class="issued-change-field">PDF match</h3><span class="issued-change-badge">Same file</span></div>
+          <div class="issued-change-values">
+            <div class="issued-change-value-panel issued-change-value-issued"><span class="issued-change-value-label">Used before</span><div class="issued-change-value" id="upload-duplicate-previous"></div></div>
+            <div class="issued-change-value-panel issued-change-value-current"><span class="issued-change-value-label">This upload</span><div class="issued-change-value" id="upload-duplicate-current"></div></div>
+          </div>
+        </section>
+        <section class="issued-change-card"><div class="issued-change-heading"><h3 class="issued-change-field">You can continue</h3></div><p class="issued-change-note" id="upload-duplicate-next-step"></p></section>
+      </div>
+    </div>
+    <div class="modal-footer"><span class="required-note">This is only a notice. It does not stop the upload.</span><button type="button" class="button button-quiet" data-close="upload-duplicate-review-modal">Back to upload</button></div>
   </dialog>
 
   <div class="toast" id="toast" popover="manual" role="status" aria-live="polite"><span id="toast-message"></span><button type="button" id="undo-deletion-toast" hidden>Undo deletion</button><button type="button" id="dismiss-toast" aria-label="Dismiss notification" hidden>×</button></div>

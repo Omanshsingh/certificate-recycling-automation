@@ -15,6 +15,10 @@ LINK_KEY = '__EcorecoInwardNumberLinks__'
 _LOCAL = threading.local()
 
 
+class UnsafeSerialResequence(ValueError):
+    """A proposed number change would put earlier certificate history at risk."""
+
+
 def links_from(source):
     if isinstance(source, (str, Path)):
         from file_fingerprints import file_signature
@@ -43,6 +47,79 @@ def bind_workbook(path, data):
 
 def unbind_workbook(path):
     getattr(_LOCAL, 'workbooks', {}).pop(str(Path(path).resolve()), None)
+
+
+def reserved_workbook_serials(root, plant):
+    from issuance_safety import audit_records
+    return {
+        int(key) for receipt in audit_records(root)
+        if receipt.get('state') == 'complete' and receipt.get('source_kind') == 'workbook'
+        and receipt.get('plant') == plant
+        and re.fullmatch(r'\d{1,12}', key := str(receipt.get('key', '')).strip())
+    }
+
+
+def assign_missing_serial_numbers(data, *, root=None, plant=None):
+    """Fill blank SNs only on rows the parser can identify as new inwards."""
+    from certificate_core import read_batches, select_register, text
+    from openpyxl import load_workbook
+    from openpyxl.utils import get_column_letter
+    from workbook_store import _set_cell, _sheet_member
+
+    parsed = read_batches(BytesIO(data))
+    candidates = sorted((issue for issue in getattr(parsed, 'row_issues', ())
+                         if issue.get('auto_assign_sn')),
+                       key=lambda issue: issue.get('row', 0))
+    if not candidates:
+        return data, []
+    reserved = reserved_workbook_serials(root, plant) if root is not None else set()
+
+    book = load_workbook(BytesIO(data), data_only=False)
+    try:
+        sheet, _, cols = select_register(book)
+        if externally_protected(sheet):
+            return data, []
+        sn_column = cols['sn'] + 1
+        occupied = {str(batch['case_id']).strip().casefold() for batch in parsed if batch.get('case_id')}
+        numeric = [int(batch['case_id']) for batch in parsed
+                   if re.fullmatch(r'\d{1,12}', str(batch.get('case_id') or ''))]
+        sequence = max(numeric or [0]) + 1
+        merged = [area for area in sheet.merged_cells.ranges
+                  if area.min_col <= sn_column <= area.max_col]
+        assignments = []
+        for issue in candidates:
+            row = int(issue['row'])
+            cell = sheet.cell(row, sn_column)
+            if (text(cell.value) or cell.data_type == 'f'
+                    or any(area.min_row <= row <= area.max_row for area in merged)):
+                continue
+            while str(sequence) in occupied or sequence in reserved:
+                sequence += 1
+            serial = str(sequence)
+            assignments.append((row, serial))
+            occupied.add(serial.casefold())
+            sequence += 1
+        if not assignments:
+            return data, []
+        with ZipFile(BytesIO(data)) as archive:
+            member = _sheet_member(archive, sheet.title)
+            xml = archive.read(member).decode('utf-8')
+            for row, serial in assignments:
+                xml = _set_cell(xml, f'{get_column_letter(sn_column)}{row}', serial, 'inlineStr')
+            output = BytesIO()
+            with ZipFile(output, 'w') as target:
+                target.comment = archive.comment
+                for info in archive.infolist():
+                    target.writestr(info, xml.encode('utf-8') if info.filename == member else archive.read(info.filename))
+        updated = output.getvalue()
+    finally:
+        book.close()
+
+    verified = read_batches(BytesIO(updated))
+    for row, serial in assignments:
+        if not any(batch['source_row'] == row and batch['case_id'] == serial for batch in verified):
+            return data, []
+    return updated, assignments
 
 
 def workspace_links(root):
@@ -154,13 +231,32 @@ def resequence_added_inward(data, added, original_data, *, root, plant, request_
     for field in ('receipts', 'manual_sources', 'additions'):
         links.setdefault(field, {})
     original_by_sn = {row['case_id'].strip().casefold():row for row in original}
+    moves_by_key = {old.strip().casefold(): new for old, new in changes.items()}
+    moving_receipts = {}
+    receipts_by_key = {}
     for receipt in audit_records(root):
-        old = str(receipt.get('key', ''))
-        if receipt.get('state') == 'complete' and receipt.get('source_kind') == 'workbook' and receipt.get('plant') == plant and old in changes:
-            conflict = workbook_receipt_conflict(original_by_sn[old.strip().casefold()], receipt)
+        if not (receipt.get('state') == 'complete' and receipt.get('source_kind') == 'workbook'
+                and receipt.get('plant') == plant):
+            continue
+        key = str(receipt.get('key', '')).strip().casefold()
+        receipts_by_key.setdefault(key, []).append(receipt)
+        if key in moves_by_key:
+            conflict = workbook_receipt_conflict(original_by_sn[key], receipt)
             if conflict:
-                raise ValueError(conflict)
-            links['receipts'][receipt['id']] = changes[old]
+                raise UnsafeSerialResequence(conflict)
+            moving_receipts[receipt['id']] = moves_by_key[key]
+    # A destination is free when its existing receipt is moving with its
+    # verified inward in this save. Receipts with no verified move still
+    # reserve their number, including a number proposed for the new inward.
+    for old, new in renumber.items():
+        source = original_by_sn.get(old.strip().casefold())
+        for receipt in receipts_by_key.get(str(new).strip().casefold(), ()):
+            if receipt['id'] in moving_receipts:
+                continue
+            conflict = workbook_receipt_conflict(source or {}, receipt)
+            if conflict:
+                raise UnsafeSerialResequence(conflict)
+    links['receipts'].update(moving_receipts)
     for record in read_register(root)['records']:
         link = record['details'].get('destruction_source')
         if isinstance(link, dict) and not link.get('record_id') and link.get('plant') == plant and link.get('case_id') in changes:
@@ -231,12 +327,15 @@ def resequence_added_inward(data, added, original_data, *, root, plant, request_
 
 
 def resequence_date_ordered_inwards(data, original_data, *, root, plant):
-    """Reassign numeric SNs when their date order no longer matches their number order."""
+    """Reconcile numeric SNs with the app's contiguous, date-ordered sequence."""
     from certificate_core import read_batches
     rows = read_batches(BytesIO(data))
     numeric = [row for row in rows if re.fullmatch(r'\d{1,12}', row['case_id'])]
     numbers = [int(row['case_id']) for row in numeric]
-    if numbers == sorted(numbers):
+    if not numbers:
+        return data, {}
+    expected = list(range(min(numbers), min(numbers) + len(numbers)))
+    if numbers == expected:
         return data, {}
     updated, _, changes = resequence_added_inward(
         data, numeric[0], original_data, root=root, plant=plant, request_id=None)
@@ -269,6 +368,10 @@ def resequence_removed_inwards(data, original_data, *, root, plant):
         data = _replace_details(data, saved)
     if not remaining:
         return data, {}
-    updated, _, changes = resequence_added_inward(
-        data, remaining[0], original_data, root=root, plant=plant, request_id=None)
+    try:
+        updated, _, changes = resequence_added_inward(
+            data, remaining[0], original_data, root=root, plant=plant, request_id=None)
+    except UnsafeSerialResequence:
+        # The removal can still be saved, including its retry metadata.
+        return data, {}
     return updated, changes

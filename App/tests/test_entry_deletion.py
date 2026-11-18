@@ -9,7 +9,7 @@ from unittest.mock import patch
 import uuid
 
 from certificate_core import read_batches
-from certificate_drafts import read_register, generate_draft, complete_draft, current_record_pdf
+from certificate_drafts import read_register, save_draft, generate_draft, complete_draft, current_record_pdf
 from entry_deletion import delete_entries
 from issuance_safety import latest_issuance, audit_records, recover_issuances
 from workbook_store import WorkbookSession
@@ -41,13 +41,17 @@ class EntryDeletionTests(unittest.TestCase):
                 as_of=date(2026,10,30),expected_revision=workspace_revision(self.root))['created'],1)
         return latest_issuance(self.root,'workbook','plant1','1001')
 
-    def payload(self, *, include=False, selected=None):
+    def payload(self, *, selected=None):
         if selected is None:
             source = self.source()
             selected = [dict(source_kind='workbook',plant='plant1',sn=source['case_id'],
                              sheet=source['source_sheet'],row=source['source_row'])]
-        return dict(selected=selected,include_linked_hdd=include,request_id=uuid.uuid4().hex,
+        return dict(selected=selected, request_id=uuid.uuid4().hex,
                     expected_revision=workspace_revision(self.root))
+
+    def linked_choices(self):
+        identifier = self.pending_hdd()
+        return [*self.payload()['selected'], {'source_kind':'manual', 'plant':'plant1', 'record_id':identifier}]
 
     def reviewed(self, **options):
         payload = self.payload(**options)
@@ -89,12 +93,24 @@ class EntryDeletionTests(unittest.TestCase):
         self.assertEqual(self.snapshot(),before)
 
     def test_pending_hdd_can_be_deleted_with_its_unissued_inward(self):
-        self.pending_hdd()
-        payload,review=self.reviewed(include=True)
+        payload,review=self.reviewed(selected=self.linked_choices())
         self.assertEqual(len(review['entries']),2);self.assertEqual(review['pdfs'],[])
         self.assertTrue(delete_entries(self.root,payload,commit=True)['deleted'])
         self.assertEqual(read_batches(self.paths[0]),[])
         self.assertEqual(read_register(self.root)['records'],[])
+
+    def test_linked_and_standalone_hdd_can_be_selected_without_deleting_excel(self):
+        linked = self.pending_hdd()
+        standalone = save_draft(self.root, None, {'certificate_type':'destruction', 'supplier':'Standalone HDD'})
+        before = self.paths[0].read_bytes()
+        for identifier, plant in ((linked, 'plant1'), (standalone, None)):
+            with self.subTest(identifier=identifier):
+                selected = [{'source_kind':'manual', 'plant':plant, 'record_id':identifier}]
+                payload, review = self.reviewed(selected=selected)
+                self.assertEqual([entry['record_id'] for entry in review['entries']], [identifier])
+                self.assertTrue(delete_entries(self.root, payload, commit=True)['deleted'])
+                self.assertEqual(self.paths[0].read_bytes(), before)
+        self.assertEqual(read_register(self.root)['records'], [])
 
     def test_pending_hdd_can_be_kept_standalone(self):
         identifier=self.pending_hdd()
@@ -111,17 +127,23 @@ class EntryDeletionTests(unittest.TestCase):
             'device_receipts':'[{"date":"2026-09-01","count":"2"}]'})
         generate_draft(self.root,'plant1',details,identifier,starting_cod='0001')
         before=self.snapshot()
-        for include in (False,True):
-            with self.assertRaisesRegex(ValueError,'cannot be deleted'):
-                delete_entries(self.root,self.payload(include=include))
-            self.assertEqual(self.snapshot(),before)
+        with self.assertRaisesRegex(ValueError,'cannot be deleted'):
+            delete_entries(self.root,self.payload())
+        self.assertEqual(self.snapshot(),before)
 
-    def test_deletion_requires_checked_review_and_binds_hdd_option(self):
+    def test_deletion_requires_checked_review_and_rejects_legacy_hdd_option(self):
         payload,_=self.reviewed();before=self.snapshot()
         for change in ({'checked':False},{'checked':'yes'},{'review_token':'forged'},{'include_linked_hdd':True}):
             with self.subTest(change=change),self.assertRaises(ValueError):
                 delete_entries(self.root,dict(payload,**change),commit=True)
         self.assertEqual(self.snapshot(),before)
+
+    def test_old_automatic_hdd_option_cannot_expand_a_new_review(self):
+        self.pending_hdd()
+        before = self.snapshot()
+        with self.assertRaisesRegex(ValueError, 'Select each Data Destruction entry'):
+            delete_entries(self.root, dict(self.payload(), include_linked_hdd=True))
+        self.assertEqual(self.snapshot(), before)
 
     def test_external_change_invalidates_review(self):
         payload,_=self.reviewed()
@@ -160,7 +182,7 @@ class EntryDeletionTests(unittest.TestCase):
         self.assertEqual(pdf.read_bytes(),pdf_before)
 
     def test_failed_workbook_save_keeps_entry_and_local_request(self):
-        self.pending_hdd();payload,_=self.reviewed(include=True);before=self.snapshot()
+        payload,_=self.reviewed(selected=self.linked_choices());before=self.snapshot()
         with patch.object(WorkbookSession,'_persist',side_effect=OSError('Excel is busy')):
             with self.assertRaisesRegex(OSError,'Excel is busy'):
                 delete_entries(self.root,payload,commit=True)
@@ -169,7 +191,7 @@ class EntryDeletionTests(unittest.TestCase):
 
     def test_interrupted_multi_source_delete_is_restored_on_recovery(self):
         class Interrupted(BaseException): pass
-        self.pending_hdd();payload,_=self.reviewed(include=True)
+        payload,_=self.reviewed(selected=self.linked_choices())
         before=self.paths[0].read_bytes(),(self.root/'Data'/'Custom Certificates.json').read_bytes()
         persist=WorkbookSession._persist
         def interrupt(session,data,**options):

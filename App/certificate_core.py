@@ -197,7 +197,9 @@ def register_header(sheet):
     if not candidates:
         return None
     if len(candidates) != 1:
-        raise ValueError(f'Worksheet "{sheet.title}" has more than one heading row. Keep one register header; remove repeated headers from the data.')
+        signatures = [tuple(norm(cell.value) for cell in sheet[row]) for row in candidates]
+        if len(set(signatures)) != 1:
+            raise ValueError(f'Worksheet "{sheet.title}" has more than one different heading row. Keep one register header so client columns stay unambiguous.')
     row_number = candidates[0]
     return row_number, columns([cell.value for cell in sheet[row_number]])
 
@@ -272,6 +274,14 @@ def _snapshot_batches(data):
     return _read_batches(BytesIO(data))
 
 
+class ParsedBatches(list):
+    """Client rows plus non-client Excel row issues that must remain visible."""
+
+    def __init__(self, batches=(), row_issues=()):
+        super().__init__(batches)
+        self.row_issues = list(row_issues)
+
+
 def _read_batches(path):
     from workbook_metadata import read_details, lookup_details
     saved_details = read_details(path)
@@ -308,6 +318,10 @@ def _read_batches(path):
             key: {row_number: sheet.cell(row_number, header_columns[key] + 1).number_format
                   for row_number in range(header_row + 1, sheet.max_row + 1)}
             for key in ('sn', 'cod_no') if key in header_columns}
+        sn_column = header_columns['sn'] + 1
+        merged_sn_rows = {row for area in sheet.merged_cells.ranges
+                          if area.min_col <= sn_column <= area.max_col
+                          for row in range(area.min_row, area.max_row + 1)}
     finally:
         workbook.close()
     if not rows:
@@ -327,10 +341,32 @@ def _read_batches(path):
                 return f"{int(value):0{len(number_format)}d}"
         return text(value)
 
+    def safe_to_assign_missing_sn(raw):
+        if ('cod_no' in cols and text(raw[cols['cod_no']])) or ('cod_date' in cols and text(raw[cols['cod_date']])):
+            return False
+        state = status_value(raw[cols['issued']]) if 'issued' in cols else 'blank'
+        return state in {'blank', 'ready', 'alert', 'na'}
+
     batches = []
+    row_issues = []
     current = None
     summary_labels = {'total', 'subtotal', 'grandtotal', 'totalweight', 'totalweightkg', 'totalweightinkg'}
+    header_signature = tuple(norm(value) for value in rows[0])
+
+    def note_unassigned_row(excel_row, raw, message, *, auto_assign=False):
+        reserved = []
+        if 'cod_no' in cols:
+            cod = read_cell_text('cod_no', raw[cols['cod_no']], excel_row)
+            if cod and not cod.startswith('='):
+                reserved.append(cod)
+        row_issues.append({'sheet': sheet_name, 'row': excel_row, 'detail': message,
+                           'reserved_cod_numbers': reserved, 'auto_assign_sn': auto_assign})
+
     for excel_row, raw in enumerate(rows[1:], header_row + 1):
+        if tuple(norm(value) for value in raw) == header_signature:
+            note_unassigned_row(excel_row, raw,
+                f'Excel row {excel_row} repeats the register headings. The row was ignored; other clients remain available.')
+            continue
         case_id = read_cell_text('sn', raw[cols['sn']], excel_row)
         item_label = text(raw[cols['item']])
         # Notes with no certificate/material data are not new company records.
@@ -345,7 +381,9 @@ def _read_batches(path):
             text(raw[cols[key]]) for key in ('supplier', 'inward_date') if key in cols)
         if summary_label and not starts_primary:
             if current is None:
-                raise ValueError(f'Row {excel_row} is a total without an inward. Place totals after their material rows.')
+                note_unassigned_row(excel_row, raw,
+                    f'Excel row {excel_row} is a total without an inward. The row was ignored; other clients remain available.')
+                continue
             raw_total = raw[cols['weight']] if 'weight' in cols else None
             summary_weight = weight_number(raw_total, number)
             expected_total = sum(material['weight'] or 0 for material in current['items'])
@@ -368,6 +406,22 @@ def _read_batches(path):
                 current['issues'].append(issue)
                 current['blocking_issues'].append(issue)
             continue
+        if not case_id and current is not None and excel_row not in merged_sn_rows:
+            row_supplier = text(raw[cols['supplier']])
+            row_date = excel_date(raw[cols['inward_date']], epoch, parse_date)
+            has_material = any(text(raw[cols[key]]) for key in ('item', 'quantity', 'per_piece_weight', 'weight') if key in cols)
+            clearly_new_inward = (row_supplier and row_date and has_material
+                and (row_supplier.casefold() != text(current.get('supplier')).casefold()
+                     or row_date != current.get('inward_date')))
+            if clearly_new_inward:
+                can_assign = safe_to_assign_missing_sn(raw)
+                note_unassigned_row(excel_row, raw,
+                    (f'Excel row {excel_row} looks like a new inward but has no Serial Number. The app will assign the next number when the workbook can be updated safely.'
+                     if can_assign else
+                     f'Excel row {excel_row} looks like a new inward but has no Serial Number. Add the correct number in Excel; the row has certificate details that must stay linked.'),
+                    auto_assign=can_assign)
+                current = None
+                continue
         if case_id:
             saved_issues = []
             try:
@@ -413,6 +467,12 @@ def _read_batches(path):
                 "items": [],
                 "issues": [*header_issues, *saved_issues],
             }
+            if saved.get('_hdd_primary') and current['hdd_cod_no']:
+                if current['cod_no'] == current['hdd_cod_no']:
+                    current['hdd_on_main_row'] = True
+                    current['cod_no'], current['cod_date'] = '', None
+                else:
+                    current['hdd_tracking_displaced'] = True
             from certificate_templates import template_id
             try:
                 current["certificate_type"] = template_id(current["certificate_type"])
@@ -429,7 +489,16 @@ def _read_batches(path):
             batches.append(current)
         if current is None:
             if any(text(raw[index]) for index in cols.values()):
-                raise ValueError(f"Row {excel_row} has data but no preceding Serial Number; enter its Serial Number or place it under the correct inward before issuing.")
+                has_material = any(text(raw[cols[key]]) for key in ('item', 'quantity', 'per_piece_weight', 'weight') if key in cols)
+                can_assign = (excel_row not in merged_sn_rows
+                    and bool(text(raw[cols['supplier']]))
+                    and excel_date(raw[cols['inward_date']], epoch, parse_date) is not None
+                    and has_material and safe_to_assign_missing_sn(raw))
+                note_unassigned_row(excel_row, raw,
+                    (f'Excel row {excel_row} looks like a new inward but has no Serial Number. The app will assign the next number when the workbook can be updated safely.'
+                     if can_assign else
+                     f'Excel row {excel_row} has data but no Serial Number or preceding inward. Add the correct Serial Number or remove the stray row, then refresh. Other clients remain available.'),
+                    auto_assign=can_assign)
             continue
         if not case_id:
             for key in ("inward_date", "supplier", "location", "form6", "reference", "cod_no", "cod_date", "issued"):
@@ -449,8 +518,21 @@ def _read_batches(path):
                     same = read_cell_text(key, actual, excel_row) == text(expected)
                 if not same:
                     if key == "cod_no":
-                        raise ValueError(f"COD No on continuation row {excel_row} differs from its inward; correct the missing Serial Number or misplaced COD before assigning new numbers.")
-                    current["issues"].append(f"conflicting {key} on continuation row {excel_row}; check the missing Serial Number")
+                        # A malformed continuation row must not make the whole
+                        # workbook unreadable. Keep the inward visible, block
+                        # issuing this ambiguous inward, and reserve the COD
+                        # so automatic numbering cannot reuse it while the
+                        # operator corrects the row in Excel.
+                        issue = (f"Excel row {excel_row}: COD {read_cell_text(key, actual, excel_row)} is on a row "
+                                 "without a Serial Number and does not match this inward. Add the correct Serial "
+                                 "Number to that row or clear the misplaced COD, then refresh. Other clients remain available.")
+                        current["issues"].append(issue)
+                        current["blocking_issues"].append(issue)
+                        misplaced_cod = read_cell_text(key, actual, excel_row)
+                        if misplaced_cod and not misplaced_cod.startswith("="):
+                            current.setdefault("reserved_cod_numbers", []).append(misplaced_cod)
+                    else:
+                        current["issues"].append(f"conflicting {key} on continuation row {excel_row}; check the missing Serial Number")
         for key in ("sn", "inward_date", "supplier", "location", "form6", "reference", "issued"):
             if key in cols and text(raw[cols[key]]).startswith("="):
                 current["issues"].append(f"formula in {key} on row {excel_row}; enter a confirmed value")
@@ -549,7 +631,7 @@ def _read_batches(path):
             issue = f'Form 6 number {batch["form6"]} is repeated on more than one inward. Correct the duplicate in Excel before creating a certificate.'
             batch['issues'].append(issue)
             batch['blocking_issues'].append(issue)
-    return batches
+    return ParsedBatches(batches, row_issues)
 
 
 def inward_details_complete(batch, as_of=None):

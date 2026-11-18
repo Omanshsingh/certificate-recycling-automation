@@ -342,7 +342,8 @@ class ReviewAndEditTests(unittest.TestCase):
             self.assertEqual(current[field], original[field])
 
     def test_replacement_upload_keeps_cod_archives_previous_versions_and_reopens_completed(self):
-        from external_certificate_upload import save_upload, stage_upload
+        from certificate_inventory import scan_inventory
+        from external_certificate_upload import save_upload, save_uploaded_details, stage_upload
         from tests.test_certificate_inventory import external_pdf
         from workbook_store import WorkbookSession
 
@@ -358,32 +359,35 @@ class ReviewAndEditTests(unittest.TestCase):
         before = self.paths[0].read_bytes()
         other = self.paths[1].read_bytes()
         body = {'replacement':{'plant':'plant1', 'sn':'1001'},
-                'details':{'cod_no':cod, 'cod_date':'2026-10-14'}}
-        for index, number in enumerate(('0428', cod, cod, cod)):
+                'details':{'cod_no':'IGNORED-123', 'cod_date':'2026-10-14'}}
+        loose = self.root / 'Certificates' / '0428.pdf'
+        for index, number in enumerate(('0428', '0429', cod)):
             payload = external_pdf(self.root / f'replacement-{index}.pdf', cod=number,
                                    reference=f'Revision {index}').read_bytes()
-            body.update(token=stage_upload(self.root, payload)['token'],
-                        expected_revision=workspace_revision(self.root))
             if index == 0:
-                with self.assertRaisesRegex(ValueError, 'match the number printed'):
-                    save_upload(self.root, web_app.BACKUP_DIR, body)
-                self.assertEqual(self.paths[0].read_bytes(), before)
-                self.assertEqual(old_path.read_bytes(), old_pdf)
-                continue
-            if index == 1:
+                loose.write_bytes(payload)
+            staged = stage_upload(self.root, payload)
+            self.assertEqual(staged['printed_cods'], [number])
+            body.update(token=staged['token'],
+                        expected_revision=workspace_revision(self.root))
+            if index < 2:
                 with patch.object(WorkbookSession, '_persist', side_effect=OSError('Excel is busy')):
                     with self.assertRaisesRegex(OSError, 'Excel is busy'):
                         save_upload(self.root, web_app.BACKUP_DIR, body)
                 self.assertEqual(self.paths[0].read_bytes(), before)
                 self.assertEqual(old_path.read_bytes(), old_pdf)
-                self.assertEqual(list((self.root / 'Certificates').rglob('*.pdf')), [old_path])
+                self.assertEqual(set((self.root / 'Certificates').rglob('*.pdf')), {old_path, loose})
             result = save_upload(self.root, web_app.BACKUP_DIR, body)
             self.assertTrue(result['replaced'])
             self.assertEqual(result['certificate_no'], cod)
             current = self.root / 'Certificates' / result['relative_path']
+            self.assertEqual(current, old_path)
             self.assertEqual(current.read_bytes(), payload)
-            self.assertEqual(list((self.root / 'Certificates').rglob('*.pdf')), [current])
-            self.assertFalse(old_path.exists())
+            self.assertEqual(set((self.root / 'Certificates').rglob('*.pdf')), {current, loose})
+            loose_entry = next(entry for entry in scan_inventory(self.root, force=True)['entries']
+                               if entry['path'] == 'Certificates/0428.pdf')
+            self.assertEqual(loose_entry['current_cods'], ['0428'])
+            self.assertIsNone(loose_entry.get('managed_owner'))
             receipt = latest_issuance(self.root, 'workbook', 'plant1', '1001')
             self.assertEqual((self.root / receipt['previous_pdfs'][0]['archive']).read_bytes(), old_pdf)
             self.assertEqual(receipt['after']['supplier'], 'Name used on the certificate')
@@ -391,17 +395,37 @@ class ReviewAndEditTests(unittest.TestCase):
             self.assertEqual((row['cod_no'], row['issued'], row['supplier']),
                              (cod, 'Generated Externally', original['supplier']))
             old_path, old_pdf = current, payload
+            before = self.paths[0].read_bytes()
         self.assertEqual(self.paths[1].read_bytes(), other)
+        with WorkbookSession(self.paths[0], web_app.BACKUP_DIR) as session:
+            session.set_issued_status('1001', row['source_sheet'], row['source_row'],
+                                      cod, row['issued'], 'Completed')
+        source = self.source()
+        history = latest_issuance(self.root, 'workbook', 'plant1', '1001')
+        body = {'source_kind':'workbook', 'source_plant':'plant1', 'source_sn':'1001',
+                'pdf_sha256':history['pdf_sha256'], 'expected_revision':workspace_revision(self.root),
+                'details':{'location':'Updated location', 'cod_no':'9999'}}
+        save_uploaded_details(self.root, web_app.BACKUP_DIR, body)
+        saved = self.source()
+        self.assertEqual(saved['location'], 'Updated location')
+        self.assertEqual((saved['cod_no'], saved['cod_date'], saved['issued'], saved['external_pdf']),
+                         (cod, source['cod_date'], 'Completed', source['external_pdf']))
+        self.assertEqual(old_path.read_bytes(), old_pdf)
+        self.assertEqual(latest_issuance(self.root, 'workbook', 'plant1', '1001'), history)
 
     def test_replace_app_only_and_linked_hdd_pdfs(self):
         from certificate_drafts import current_record_pdf
-        from external_certificate_upload import save_upload, stage_upload
+        from certificate_inventory import scan_inventory
+        from external_certificate_upload import save_upload, save_uploaded_details, stage_upload
         from tests.test_certificate_inventory import external_pdf
 
         for cod, kind, inward in (
             ('0431', 'standard', None),
             ('0432', 'destruction', {'plant':'plant1', 'sn':'1001'}),
         ):
+            if inward:
+                from destruction_certificate import request_for_inward
+                request_for_inward(self.root, inward['plant'], inward['sn'])
             first = external_pdf(self.root / 'first.pdf', cod=cod).read_bytes()
             issued = save_upload(self.root, web_app.BACKUP_DIR, {
                 'token':stage_upload(self.root, first)['token'], 'inward':inward,
@@ -411,35 +435,86 @@ class ReviewAndEditTests(unittest.TestCase):
             })
             identifier = issued['record_id']
             old_path = self.root / 'Certificates' / issued['relative_path']
-            revised = external_pdf(self.root / 'revised.pdf', cod=cod, reference='New design').read_bytes()
+            if not inward:
+                revised = external_pdf(self.root / 'revised.pdf', cod=cod, reference='New design').read_bytes()
+            upload = stage_upload(self.root, revised, filename='9999.pdf')
+            self.assertEqual(upload['previously_used'], bool(inward))
             result = save_upload(self.root, web_app.BACKUP_DIR, {
-                'token':stage_upload(self.root, revised)['token'], 'replacement':{'record_id':identifier},
+                'token':upload['token'], 'replacement':{'record_id':identifier},
                 'expected_revision':workspace_revision(self.root), 'details':{'cod_date':'2026-10-15'},
             })
             record = next(record for record in read_register(self.root)['records'] if record['id'] == identifier)
             self.assertEqual(result['record_id'], identifier)
             self.assertEqual(record['details']['certificate_type'], kind)
-            self.assertEqual(current_record_pdf(self.root, record).read_bytes(), revised)
-            self.assertFalse(old_path.exists())
+            self.assertEqual(record['details']['cod_no'], cod)
+            self.assertEqual(current_record_pdf(self.root, record), old_path)
+            self.assertEqual(old_path.read_bytes(), revised)
+            self.assertFalse(result['previously_used'])
             if inward:
                 workbook = self.source()
                 self.assertEqual((workbook['cod_no'], workbook['hdd_cod_no']), ('', cod))
                 self.assertEqual(workbook['hdd_cod_date'], '2026-10-15')
+                relative = old_path.relative_to(self.root).as_posix()
+                entry = next(entry for entry in scan_inventory(self.root, force=True)['entries']
+                             if entry['path'] == relative)
+                self.assertEqual(entry['current_cods'], ['0432'])
+                self.assertEqual(entry['certificate_cods'], ['0432'])
+                self.assertIn('0431', entry['cods'])
+                self.assertEqual(entry['warnings'], [])
+
+                ledger_path = self.root / 'Data' / 'Certificate Inventory.json'
+                ledger = json.loads(ledger_path.read_text(encoding='utf-8'))
+                cached = next(item for item in ledger['entries'] if item['path'] == relative)
+                cached['warnings'] = ['Printed COD differs from the recorded certificate number. Check this PDF.']
+                ledger_path.write_text(json.dumps(ledger), encoding='utf-8')
+                with patch('certificate_inventory._inspect_pdf', side_effect=AssertionError('Expected cache hit')):
+                    refreshed = scan_inventory(self.root)
+                self.assertEqual(refreshed['warnings'], [])
+
+                saved_pdf = latest_issuance(self.root, 'manual', record['plant'], identifier)
+                before = self.paths[0].read_bytes()
+                submitted = {'source_kind':'manual', 'record_id':identifier,
+                             'pdf_sha256':saved_pdf['pdf_sha256'], 'expected_revision':workspace_revision(self.root),
+                             'details':{'supplier':'Client updated in review', 'certificate_type':'standard',
+                                        'cod_no':'9999', 'certificate_fields':{'destruction_date':'2026-10-14'}}}
+                save_uploaded_details(self.root, web_app.BACKUP_DIR, submitted)
+                updated = next(item for item in read_register(self.root)['records'] if item['id'] == identifier)
+                self.assertEqual(updated['details']['supplier'], 'Client updated in review')
+                self.assertEqual(updated['details']['certificate_type'], 'destruction')
+                self.assertEqual(updated['details']['cod_no'], cod)
+                self.assertEqual(updated['details']['destruction_source'], record['details']['destruction_source'])
+                self.assertEqual(current_record_pdf(self.root, updated).read_bytes(), revised)
+                self.assertEqual(self.paths[0].read_bytes(), before)
+                old_path.write_bytes(external_pdf(self.root / 'outside-edit.pdf', cod='0439').read_bytes())
+                self.assertTrue(any('differ' in warning for warning in scan_inventory(self.root, force=True)['warnings']))
+                submitted['expected_revision'] = workspace_revision(self.root)
+                with self.assertRaisesRegex(ValueError, 'uploaded PDF changed'):
+                    save_uploaded_details(self.root, web_app.BACKUP_DIR, submitted)
 
     def test_uploaded_hdd_preserves_the_existing_recycling_certificate(self):
         from external_certificate_upload import save_upload, stage_upload
         from tests.test_certificate_inventory import external_pdf
         from certificate_drafts import current_record_pdf
+        from destruction_certificate import request_for_inward
 
         self.assertEqual(self.create(self.reviewed())['created'], 1)
         original = self.source()
         payload = external_pdf(self.root/'operator.pdf', cod='0423').read_bytes()
         staged = stage_upload(self.root, payload)
-        result = save_upload(self.root, web_app.BACKUP_DIR, {
+        body = {
             'token':staged['token'], 'inward':{'plant':'plant1','sn':'1001'},
             'expected_revision':workspace_revision(self.root),
             'details':{'certificate_type':'destruction', 'cod_no':'0423', 'cod_date':'2026-10-14'},
-        })
+        }
+        with self.assertRaisesRegex(ValueError, 'Add Data Destruction'):
+            save_upload(self.root, web_app.BACKUP_DIR, body)
+        request_id = request_for_inward(self.root, 'plant1', '1001')
+        request_for_inward(self.root, 'plant1', '1001', needed=False)
+        with self.assertRaisesRegex(ValueError, 'Add Data Destruction'):
+            save_upload(self.root, web_app.BACKUP_DIR, dict(body, expected_revision=workspace_revision(self.root)))
+        request_for_inward(self.root, 'plant1', '1001')
+        result = save_upload(self.root, web_app.BACKUP_DIR, dict(body, expected_revision=workspace_revision(self.root)))
+        self.assertEqual(result['record_id'], request_id)
         saved = self.source()
         self.assertEqual((saved['cod_no'], saved['issued'], saved['certificate_type']),
                          (original['cod_no'], original['issued'], original['certificate_type']))

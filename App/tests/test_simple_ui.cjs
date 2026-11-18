@@ -78,7 +78,7 @@ function harness(options = {}) {
   let timerId = 0;
   window.location = {href:'http://127.0.0.1:8000/',origin:'http://127.0.0.1:8000'};
   window.confirm = () => { throw new Error('Native confirmations are unavailable in the in-app browser.'); };
-  const context = vm.createContext({document, console, FormData, URL, window, setTimeout: (fn, delay) => {const id = ++timerId; timers.set(id, {fn,delay}); return id;}, clearTimeout:id => timers.delete(id),
+  const context = vm.createContext({document, console, FormData, URL, window, AbortController, setTimeout: (fn, delay) => {const id = ++timerId; timers.set(id, {fn,delay}); return id;}, clearTimeout:id => timers.delete(id),
     MutationObserver: class { constructor(callback) { this.callback = callback; } observe() {} },
     localStorage: {getItem:key => storage.get(key) || null, setItem:(key,value) => storage.set(key,value), removeItem:key => storage.delete(key)},
     fetch: async (endpoint, init) => {
@@ -210,6 +210,138 @@ function uploadForm(h) {
   Object.defineProperty(form, 'values', {get:() => Object.fromEntries(Object.entries(fields).map(([name, field]) => [name, field.value]))});
   return {form, fields};
 }
+
+test('Replacement accepts a used PDF and leaves the selected filename and COD to the server', async () => {
+  const h = harness({fetch:async () => ({ok:false, status:400, json:async () => ({error:'Test response'})})});
+  const {form} = uploadForm(h);
+  h.controls.get('#upload-company-fields').querySelector = () => new Node('legend');
+  const {updateUploadTarget, updateUploadCod, saveUploadedCertificate} = vm.runInContext(
+    '({updateUploadTarget, updateUploadCod, saveUploadedCertificate})', h.context);
+  h.ui.app.state.rows = [
+    {supplier:'Client', source_kind:'manual', record_id:'hdd', certificate_type:'destruction',
+      certificate_status:'generated', certificate_no:'0788', pdf_relative_path:'0788_Client_hdd.pdf'},
+  ];
+  h.controls.get('#external-upload-target').value = 'workbook';
+  updateUploadTarget(true);
+  const input = h.controls.get('#upload-inward');
+  input.value = '0788';
+  input.dispatch('input');
+  h.controls.get('#upload-inward-options').children[0].dispatch('click');
+  const file = {};
+  h.controls.get('#external-upload-file').files = [file];
+  const submit = h.controls.get('#save-uploaded-certificate');
+  const note = h.controls.get('#upload-attached-auto-note');
+  const event = {currentTarget:form, preventDefault() {}};
+  for (const detection of [{cod:'009', cod_source:'pdf', printed_cods:['009']},
+    {cod:'9999', cod_source:'filename', printed_cods:[]}]) {
+    h.ui.app.uploadedFile = {token:'uploaded', file, previously_used:true, ...detection};
+    updateUploadCod();
+    assert.equal(note.textContent, detection.cod_source === 'pdf' ? 'COD on the uploaded PDF · 009' : '');
+    assert.equal(note.hidden, detection.cod_source !== 'pdf');
+    assert.match(h.controls.get('#upload-replacement-note').textContent, /keeps its filename and COD 0788/);
+    assert.equal(h.controls.get('#upload-duplicate-alert').hidden, true);
+    assert.equal(submit.disabled, false);
+    await saveUploadedCertificate(event);
+    assert.equal(h.requests.at(-1).payload.details.cod_no, undefined);
+    assert.equal(h.requests.at(-1).payload.replacement.record_id, 'hdd');
+  }
+});
+
+test('Starting COD is a generation input and not an inward Excel change', () => {
+  const h = harness();
+  const excelFieldDifferences = vm.runInContext('excelFieldDifferences', h.context);
+  const before = {plant:'plant1', source_kind:'workbook', details:{supplier:'Harbor Labs'}};
+  const after = {...before, starting_cod:'0800'};
+  assert.equal(excelFieldDifferences(before, after).length, 0);
+  assert.deepEqual(Array.from(excelFieldDifferences(before,
+    {...after, details:{supplier:'Harbor Labs Annex'}}), change => change.key), ['supplier']);
+});
+
+test('Upload offers Data Destruction for a saved request and submits its Excel serial number', async () => {
+  const h = harness({fetch:async () => ({ok:false, status:400, json:async () => ({error:'Check the PDF.'})})});
+  const {form, fields} = uploadForm(h);
+  const legend = new Node('legend');
+  h.controls.get('#upload-company-fields').querySelector = () => legend;
+  const {updateUploadTarget, saveUploadedCertificate, uploadCandidates} = vm.runInContext(
+    '({updateUploadTarget, saveUploadedCertificate, uploadCandidates})', h.context);
+  const inward = {supplier:'Amazon', plant:'plant1', sn:35, certificate_status:'ready'};
+  const request = {supplier:'Amazon HDD', plant:'plant1', record_id:'a'.repeat(32), source_kind:'manual',
+    certificate_type:'destruction', certificate_status:'blank', destruction_requested:true,
+    destruction_source:{plant:'plant1', case_id:'35'}, raw_details:{location:'HDD site'}};
+  const types = () => Array.from(uploadCandidates(), row => row.upload_certificate_type);
+  h.ui.app.state.rows = [inward];
+  assert.deepEqual(types(), ['standard']);
+  h.ui.app.state.rows = [inward, {...request, destruction_requested:false}];
+  assert.deepEqual(types(), ['standard']);
+  h.ui.app.state.rows = [inward, {...request, certificate_status:'na'}];
+  assert.deepEqual(types(), ['standard']);
+  h.ui.app.state.rows = [inward, request];
+  assert.deepEqual(types(), ['standard', 'destruction']);
+
+  h.controls.get('#external-upload-target').value = 'workbook';
+  updateUploadTarget(true);
+  h.controls.get('#upload-inward').dispatch('focus');
+  h.controls.get('#upload-inward-options').children[1].dispatch('click');
+  assert.equal(fields.location.value, 'HDD site');
+  const file = {};
+  h.controls.get('#external-upload-file').files = [file];
+  h.ui.app.uploadedFile = {token:'uploaded', file, cod:'0006'};
+  fields.cod_date.value = '17/11/26';
+  await saveUploadedCertificate({currentTarget:form, preventDefault() {}});
+  assert.deepEqual(h.requests.at(-1).payload.inward, {plant:'plant1', sn:'35', certificate_type:'destruction'});
+
+  h.ui.app.state.rows = [inward, {...request, certificate_status:'generated_manual',
+    certificate_no:'0006', pdf_relative_path:'0006.pdf'}];
+  const existing = uploadCandidates().filter(row => row.upload_certificate_type === 'destruction');
+  assert.equal(existing.length, 1);
+  assert.equal(existing[0].upload_replacement, true);
+  assert.equal(existing[0].upload_target.record_id, request.record_id);
+});
+
+test('Upload finds existing CODs and uses the inward COD for a scan without readable text', async () => {
+  const h = harness({fetch:async () => ({ok:false, status:400, json:async () => ({error:'Check the PDF.'})})});
+  const {form, fields} = uploadForm(h);
+  h.controls.get('#upload-company-fields').querySelector = () => new Node('legend');
+  const {updateUploadTarget, saveUploadedCertificate} = vm.runInContext(
+    '({updateUploadTarget, saveUploadedCertificate})', h.context);
+  h.ui.app.state.rows = [
+    {supplier:'Same client', plant:'plant1', sn:'10', certificate_status:'generated_manual', certificate_no:'0456'},
+    {supplier:'Same client', plant:'plant2', sn:'11', certificate_status:'completed', certificate_no:'0457',
+      pdf_relative_path:'0457.pdf'},
+    {supplier:'Missing PDF', plant:'plant2', sn:'12', certificate_status:'ready', certificate_no:'0458',
+      has_issued_certificate:true},
+  ];
+  h.controls.get('#external-upload-target').value = 'workbook';
+  updateUploadTarget(true);
+  const input = h.controls.get('#upload-inward');
+  const options = h.controls.get('#upload-inward-options');
+  input.value = '0458'; input.dispatch('input');
+  assert.equal(options.children.length, 0);
+  input.value = '0457'; input.dispatch('input');
+  assert.equal(options.children.length, 1);
+  assert.match(text(options.children[0]), /Replace existing PDF.*COD 0457/);
+  input.value = '0456'; input.dispatch('input');
+  options.children[0].dispatch('click');
+  const file = {};
+  h.controls.get('#external-upload-file').files = [file];
+  fields.cod_date.value = '17/11/26';
+  for (const detection of [{}, {cod:'2026', cod_source:'filename'}, {cod:'0999', cod_source:'pdf'}]) {
+    h.ui.app.uploadedFile = {token:'uploaded', file, ...detection};
+    await saveUploadedCertificate({currentTarget:form, preventDefault() {}});
+    assert.equal(h.requests.at(-1).payload.details.cod_no, detection.cod_source === 'pdf' ? '0999' : '0456');
+  }
+});
+
+test('An HDD tracking warning is shown as a tracking issue rather than a sorting issue', () => {
+  const h = harness();
+  h.ui.app.state.maintenance_notes = [{plant:'plant2', kind:'hdd_tracking',
+    detail:'Data Destruction tracking at SN 17 needs review.'}];
+  h.ui.renderWorkbookIssues();
+  const output = h.controls.get('#workbook-maintenance-note');
+  assert.equal(output.hidden, false);
+  assert.match(output.textContent, /Plant 2.*SN 17/);
+  assert.doesNotMatch(output.textContent, /sort dates/i);
+});
 
 test('Attach to a client replaces the matching issued certificate and keeps its COD', async () => {
   const h = harness({fetch:async () => ({ok:false, status:400, json:async () => ({error:'Check the PDF.'})})});
@@ -385,11 +517,12 @@ test('Changing an issued certificate type never offers inward deletion', async (
 
 const removalRow = {source_kind:'workbook',plant:'plant1',sn:'25',supplier:'ABC Company',sheet:'Inward Register',row:3,certificate_status:'ready'};
 
-test('Startup checks saved Excel changes before enabling actions and loads the dashboard only once', async () => {
+test('Startup shows the saved company list while the Excel check is still running', async () => {
   for (const changed of [false,true]) {
     let finishCheck;
     const h=harness({fetch:async endpoint=>{
-      if(endpoint==='/api/state')return {ok:true,json:async()=>({state:{rows:[],scan_complete:true},workspace_revision:'initial',settings:{workbook_paths:['plant1.xlsx','plant2.xlsx']}})};
+      if(endpoint==='/api/state')return {ok:true,json:async()=>({state:{rows:[removalRow],scan_complete:false,
+        startup_snapshot:true,startup_scan_complete:true,workspace_revision:'initial'},settings:{workbook_paths:['plant1.xlsx','plant2.xlsx']}})};
       if(endpoint==='/api/workbook-changes')return new Promise(resolve=>{
         finishCheck=()=>resolve({ok:true,json:async()=>changed
           ? {changed:true,state:{rows:[],scan_complete:true,workspace_revision:'checked'}} : {changed:false}});
@@ -397,15 +530,34 @@ test('Startup checks saved Excel changes before enabling actions and loads the d
       throw new Error(`Unexpected startup request: ${endpoint}`);
     }});
     h.window.setInterval=()=>{};
+    h.controls.get('#busy-overlay').hidden = true;
+    h.controls.get('#offline-screen').hidden = true;
     const loads=[];h.window.CertificateAnalytics={load:()=>loads.push(h.ui.app.workspaceRevision)};
     vm.runInContext('document.addEventListener=()=>{}; loadTemplates=async()=>true; pollReminderReview=()=>{};',h.context);
-    const startup=h.ui.init();await new Promise(resolve=>setImmediate(resolve));
-    assert.equal(h.ui.app.loadingWorkspace,true);assert.equal(h.controls.get('#new-button').disabled,true);
-    assert.equal(loads.length,0);finishCheck();await startup;
-    assert.equal(h.ui.app.loadingWorkspace,false);assert.equal(h.controls.get('#new-button').disabled,false);
-    assert.deepEqual(loads,[changed?'checked':'initial']);
+    await h.ui.init();
+    assert.equal(h.ui.app.loadingWorkspace,false);
+    assert.equal(h.ui.app.state.rows[0].supplier, removalRow.supplier);
+    assert.equal(h.ui.app.state.scan_complete,false);
+    assert.deepEqual(loads,['initial']);
+    finishCheck();await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(h.ui.app.state.scan_complete,true);
+    assert.equal(h.ui.app.workspaceRevision,changed?'checked':'initial');
     assert.deepEqual(h.requests.map(request=>request.endpoint),['/api/state','/api/workbook-changes']);
   }
+});
+
+test('Refresh keeps the saved list visible while another Excel check finishes', async () => {
+  const h = harness({fetch:async () => ({ok:true,json:async () => ({changed:false,check_pending:true})})});
+  h.controls.get('#busy-overlay').hidden = true;
+  h.controls.get('#offline-screen').hidden = true;
+  h.ui.app.state = {rows:[removalRow], workspace_revision:'initial', run_id:'last-report',
+    scan_complete:false, startup_snapshot:true, startup_scan_complete:true};
+  h.ui.app.workspaceRevision = 'initial';
+  await h.ui.syncWorkbookChanges({requested:true});
+  assert.equal(h.controls.get('#busy-overlay').hidden, true);
+  assert.equal(h.ui.app.state.rows[0].supplier, removalRow.supplier);
+  assert.equal(h.ui.app.state.scan_complete, false);
+  assert.equal(h.requests[0].headers['X-Workbook-Report'], 'last-report');
 });
 test('Several warning messages for one certificate never appear as several certificates', () => {
   const h=harness();
@@ -586,7 +738,7 @@ test('Ungenerated-entry deletion is inside collapsed Settings Advanced and uses 
   assert.equal(h.ui.app.entryDeletion.rows.length,3);
   assert.equal(h.ui.app.entryDeletion.checked.size,0);
   assert.equal(h.controls.get('#entry-delete-preview').disabled,true);
-  assert.equal(h.controls.get('#entry-delete-hdd').checked,false);
+  assert.doesNotMatch(html, /id="entry-delete-hdd"/);
   assert.equal(h.controls.get('#entry-delete-search').focused,true);
   for(const query of ['acme','17','0212','REF-ALPHA','F6-OLD','mumbai','ready acme']){
     h.controls.get('#entry-delete-search').value=query;h.ui.filterEntryDeletion();
@@ -626,6 +778,28 @@ test('Inward deletion keeps the Advanced checklist hidden until its review is re
   assert.equal(h.controls.get('#entry-deletion-modal').open,true);
   assert.equal(h.controls.get('#entry-delete-selection').hidden,true);
   assert.equal(h.controls.get('#entry-delete-review').hidden,false);
+});
+
+test('Deletion lists HDD separately and the inward shortcut reviews only that inward', async () => {
+  const review={entries:[], pdfs:[], kept_hdd:[{supplier:'Acme Medical'}]};
+  const h=harness({fetch:async()=>({ok:true,json:async()=>({review,review_token:'token'})})});
+  h.ui.app.state={rows:[deletionSearchRows[0],
+    {source_kind:'manual',plant:'plant1',record_id:'linked-hdd',supplier:'Acme Medical',certificate_type:'destruction',
+      destruction_source:{plant:'plant1',case_id:'17'},certificate_status:'alert'},
+    {source_kind:'manual',plant:null,record_id:'standalone-hdd',supplier:'Standalone',certificate_type:'destruction',
+      certificate_status:'ready'}],workspace_revision:'search-review'};
+  h.ui.openEntryDeletion();
+  assert.match(text(h.ui.app.entryDeletion.labels[0]), /Recycling/);
+  assert.match(text(h.ui.app.entryDeletion.labels[1]), /Data Destruction.*SN 17/);
+  assert.match(text(h.ui.app.entryDeletion.labels[2]), /Data Destruction.*Local record/);
+  h.controls.get('#entry-delete-search').value='acme data destruction';
+  h.ui.filterEntryDeletion();
+  assert.deepEqual(Array.from(h.ui.app.entryDeletion.labels, label=>label.hidden), [true,false,true]);
+  h.controls.get('#entry-deletion-modal').close();
+  await h.ui.handleAction({dataset:{action:'remove-inward',index:'0'}});
+  assert.deepEqual(h.requests[0].payload.selected,
+    [{source_kind:'workbook',plant:'plant1',sn:'17',sheet:'Inward Register',row:2}]);
+  assert.equal(Object.hasOwn(h.requests[0].payload, 'include_linked_hdd'), false);
 });
 
 test('Deletion search keeps checked entries across searches and shows hidden selection counts', () => {
@@ -4366,6 +4540,43 @@ test('Opening linked certificates resets warnings and loads each record’s own 
     assert.equal(h.controls.get('#details-error').hidden,true);assert.equal(h.controls.get('#preview-warnings').hidden,true);
     assert.match(h.controls.get('#certificate-selection-status').textContent,new RegExp(row.cod_no));
     if(row===linkedHdd)assert.equal(h.ui.app.editor.fields.destruction.device_receipts,linkedHdd.certificate_fields.device_receipts);
+  }
+});
+
+test('Review & edit directly edits uploaded records and keeps the saved PDF preview', async () => {
+  for (const kind of ['manual', 'workbook']) {
+    const h = harness({fetch:async () => ({ok:true,json:async () => ({state:{rows:[]}})})});
+    const form = editing(h);
+    h.context.URLSearchParams = URLSearchParams;
+    h.controls.get('#details-modal').open = false;
+    vm.runInContext(`updateSourceControls = () => {}; renderTemplateEditor = () => {};
+      setState = () => {}; confirmAction = async () => true;
+      previewDetails = async () => {throw new Error('Unexpected template preview')};`, h.context);
+    const digest = 'a'.repeat(64);
+    const row = {source_kind:kind, record_id:kind === 'manual' ? 'hdd' : null,
+      plant:'plant1', sn:'35', supplier:'Test client', certificate_status:'generated_manual',
+      certificate_type:kind === 'manual' ? 'destruction' : 'standard', certificate_no:'0788',
+      pdf_filename:'0788_client.pdf', pdf_relative_path:'0788_client.pdf', uploaded_pdf_sha256:digest};
+    h.ui.app.templates.push({id:'destruction',fields:[]});
+    await h.ui.openDetails(row);
+    assert.equal(h.controls.get('#excel-detail-fields').hidden, false);
+    assert.equal(h.controls.get('#edit-pdf-details').hidden, true);
+    assert.equal(h.controls.get('#replace-uploaded-pdf').hidden, false);
+    assert.equal(h.controls.get('#save-details').textContent, 'Save details');
+    assert.equal(form.elements.namedItem('supplier').readOnly, false);
+    const preview = h.controls.get('#preview-image').src;
+    assert.match(preview, new RegExp(`certificate-preview-image.*sha256=${digest}`));
+    form.values.supplier = 'Updated client';
+    h.ui.invalidatePreview();
+    h.ui.schedulePreview();
+    assert.equal(h.controls.get('#preview-image').src, preview);
+    assert.equal(h.controls.get('#preview-status').textContent, 'Saved PDF');
+    assert.equal(h.timers.has(h.ui.app.previewTimer), false);
+    await h.ui.saveDetails({preventDefault(){}, currentTarget:form});
+    assert.deepEqual(h.requests.map(request => request.endpoint), ['/api/certificates/save-upload-details']);
+    assert.equal(h.requests[0].payload.pdf_sha256, digest);
+    assert.equal(h.requests[0].payload.details.supplier, 'Updated client');
+    assert.equal(h.controls.get('#details-modal').open, false);
   }
 });
 

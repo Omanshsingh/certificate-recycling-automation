@@ -877,6 +877,14 @@ td { height: 76px; }
 .client-copy .row-alert-note { color: #85500e; }
 .field small.field-error { color: var(--red); }
 .file-warning-note { color: #85500e; }
+.upload-duplicate-review-modal { max-width: min(760px, calc(100vw - 30px)); }
+.upload-duplicate-review-modal .issued-change-content { padding-bottom: 18px; }
+.upload-duplicate-review-modal .issued-change-card > .issued-change-note { margin: 0; }
+.upload-certificate-modal .modal-header-actions { flex-wrap: wrap; justify-content: flex-end; }
+@media (max-width: 700px) {
+  .upload-certificate-modal .modal-header-actions { align-items: flex-start; }
+  .upload-certificate-modal .issued-details-alert { white-space: normal; }
+}
 .age-note { font-size: 12px; }
 th:first-child { width: 31%; }
 th:nth-child(4) { width: 16%; }
@@ -1046,7 +1054,7 @@ th:last-child { width: 30%; }
 .record-filter-heading .icon-button { width:34px; height:34px; font-size:24px; }
 #more-filters .filter-fields { display:grid; grid-template-columns:1fr 1fr; gap:18px 16px; padding:0; }
 #more-filters .field { min-width:0; width:100%; grid-column:auto; }
-#more-filters .field:has(#record-followup-filter), #more-filters .field:last-child, .record-filter-error { grid-column:1 / -1; }
+#more-filters .field:has(#company-sort), #more-filters .field:has(#record-followup-filter), .record-filter-error { grid-column:1 / -1; }
 .record-filter-error { margin:0; color:#a1332e; font-size:14px; }
 .record-filter-footer { display:flex; align-items:center; justify-content:space-between; margin-top:24px; padding-top:18px; border-top:1px solid var(--line); }
 .bulk-choices { max-height:360px; overflow:auto; border:1px solid var(--line); border-radius:8px; margin:16px 24px; }

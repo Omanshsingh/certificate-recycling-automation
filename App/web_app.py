@@ -56,13 +56,103 @@ WEB_ROOT = Path(__file__).resolve().parent / "web"
 BACKUP_DIR = ROOT / "Data" / "Workbook Backups"
 RESULTS_PATH = ROOT / "Data" / "Reports" / "Latest Results.json"
 CERTIFICATE_TYPE_CHOICES_PATH = ROOT / 'Data' / 'Certificate Type Choices.json'
+CLIENT_ADDED_TIMES_PATH = ROOT / 'Data' / 'Client Added Times.json'
 SERVER: ThreadingHTTPServer | None = None
 OPERATION_LOCK = threading.RLock()
+PDF_RENDER_LOCK = threading.Lock()
+WORKBOOK_CHECK_ACTIVE = threading.Event()
+CLIENT_ADDED_TIMES_LOCK = threading.RLock()
 STOPPING = False
 WORKBOOK_CHECK_STAMPS = {}
 WORKSPACE_STATE_CACHE = None
 PREVIEW_CACHE = OrderedDict()
 DASHBOARD_REVIEW = DashboardReview()
+
+
+def _added_time_key(plant, sn, source_path=''):
+    try:
+        source_path = str(Path(source_path).expanduser().resolve()).casefold() if source_path else ''
+    except OSError:
+        source_path = str(source_path).strip().casefold()
+    return json.dumps([str(plant).strip().casefold(), str(sn).strip().casefold(), source_path], separators=(',', ':'))
+
+
+def _read_client_added_times():
+    try:
+        value = json.loads(CLIENT_ADDED_TIMES_PATH.read_text(encoding='utf-8'))
+    except FileNotFoundError:
+        value = {}
+    except (OSError, ValueError):
+        value = {}
+    records = value.get('records') if isinstance(value, dict) else None
+    return {
+        'version': 1,
+        'baseline_initialized': bool(value.get('baseline_initialized')) if isinstance(value, dict) else False,
+        'records': {key: stamp for key, stamp in records.items()
+                    if isinstance(key, str) and (isinstance(stamp, str) or stamp is None)}
+                   if isinstance(records, dict) else {},
+    }
+
+
+def remember_workbook_added_at(plant, sn, stamp=None, source_path=''):
+    """Persist the time an app-added client was committed, without touching Excel."""
+    key = _added_time_key(plant, sn, source_path)
+    with CLIENT_ADDED_TIMES_LOCK:
+        data = _read_client_added_times()
+        existing = data['records'].get(key)
+        value = existing or stamp or datetime.now().astimezone().isoformat(timespec='milliseconds')
+        data['records'][key] = value
+        try:
+            save_json(CLIENT_ADDED_TIMES_PATH, data)
+        except OSError:
+            pass  # Sorting metadata must never block a successfully added client.
+    return value
+
+
+def attach_client_added_times(rows, *, scan_complete=False):
+    """Attach saved add times; mark legacy workbook rows as unknown on first scan."""
+    workbook_rows = []
+    for row in rows:
+        if row.get('source_kind') == 'manual':
+            stamp = row.get('created_at') or row.get('added_at') or ''
+            row['added_at'] = stamp if isinstance(stamp, str) else ''
+        elif row.get('source_kind') == 'workbook':
+            plant, sn = row.get('plant'), row.get('sn')
+            if plant in {'plant1', 'plant2'} and str(sn or '').strip():
+                workbook_rows.append((row, _added_time_key(plant, sn, row.get('file', ''))))
+
+    if not workbook_rows and not scan_complete:
+        return rows
+    with CLIENT_ADDED_TIMES_LOCK:
+        data = _read_client_added_times()
+        records = data['records']
+        changed = False
+        now = datetime.now().astimezone().isoformat(timespec='milliseconds')
+        baseline_initialized = data['baseline_initialized']
+        for row, key in workbook_rows:
+            if key not in records:
+                # The first scan cannot recover dates for existing Excel rows.
+                # New rows discovered after that scan receive a first-seen time.
+                records[key] = now if baseline_initialized else ''
+                changed = True
+            stamp = records[key]
+            row['added_at'] = stamp if isinstance(stamp, str) else ''
+        if scan_complete and not baseline_initialized:
+            data['baseline_initialized'] = True
+            changed = True
+        if scan_complete:
+            present = {key for _, key in workbook_rows}
+            stale = [key for key in records if key not in present]
+            if stale:
+                for key in stale:
+                    del records[key]
+                changed = True
+        if changed:
+            try:
+                save_json(CLIENT_ADDED_TIMES_PATH, data)
+            except OSError:
+                pass  # Keep the app usable if local sort metadata cannot be written.
+    return rows
 
 
 def cached_workspace_state(expected_revision):
@@ -82,12 +172,19 @@ def merge_workbook_report(expected_revision, report, *, preserve_unmentioned=Fal
     previous = {(row.get('plant'), str(row.get('sn')).strip().casefold()): row
                 for row in previous_rows if row.get('source_kind') != 'manual'}
     merged = []
+    manual_ids = set()
     for incoming in report['rows']:
         row = dict(incoming)
-        if row.get('source_kind') != 'manual':
+        if row.get('source_kind') == 'manual':
+            identifier = row.get('record_id')
+            if identifier:
+                if identifier in manual_ids:
+                    continue
+                manual_ids.add(identifier)
+        else:
             old = previous.get((row.get('plant'), str(row.get('sn')).strip().casefold()))
             if old:
-                for key in ('has_issued_certificate', 'last_certificate_details'):
+                for key in ('has_issued_certificate', 'last_certificate_details', 'added_at'):
                     if key in old and key not in row:
                         row[key] = copy.deepcopy(old[key])
         merged.append(row)
@@ -96,7 +193,11 @@ def merge_workbook_report(expected_revision, report, *, preserve_unmentioned=Fal
                          if row.get('source_kind') != 'manual'}
         merged.extend(copy.deepcopy(row) for row in previous_rows if row.get('source_kind') == 'workbook'
                       and (row.get('plant'), str(row.get('sn')).strip().casefold()) not in incoming_keys)
-    merged.extend(copy.deepcopy(row) for row in previous_rows if row.get('source_kind') == 'manual')
+    for row in previous_rows:
+        if row.get('source_kind') == 'manual' and row.get('record_id') not in manual_ids:
+            merged.append(copy.deepcopy(row))
+            if row.get('record_id'):
+                manual_ids.add(row['record_id'])
     state['rows'] = merged
     for key in ('refresh_pending', 'recovery_note'):
         state.pop(key, None)
@@ -171,6 +272,7 @@ def merge_manual_record_state(expected_revision, record_id, state=None):
         weight = sum(item.get('weight') or 0 for item in materials) if materials else number(details.get('weight'))
     row = {
         'source_kind':'manual', 'record_id':record_id, 'plant':record.get('plant'),
+        'added_at':record.get('created_at', ''),
         'destruction_source':details.get('destruction_source'),
         'destruction_requested':record.get('destruction_requested', True),
         'destruction_pending':record.get('destruction_requested', True) and details.get('certificate_type') == 'destruction' and status != 'completed',
@@ -344,6 +446,7 @@ def add_client(body):
     path = paths[int(plant[-1]) - 1]
     serial_changes = {}
     ordering_warning = ''
+    serial_order_kept = False
     with run_lock(ROOT):
         recover_issuances(ROOT)
         journal = json.loads(journal_path.read_text(encoding='utf-8')) if journal_path.is_file() else None
@@ -351,6 +454,8 @@ def add_client(body):
             raise ClientAddRequestEnded(
                 'This add request belongs to different details. Check Companies for the previous client. '
                 'Use Review & edit to correct it, or choose Add to Excel again to add this as a new entry.')
+        if journal and not journal.get('created_at'):
+            journal['created_at'] = datetime.now().astimezone().isoformat(timespec='milliseconds')
         if not journal:
             require_revision(ROOT, expected)
         with WorkbookSession(path, BACKUP_DIR) as session:
@@ -380,17 +485,25 @@ def add_client(body):
                         'The workbook changed after this interrupted add. Check Companies for the client, '
                         'then choose Add to Excel again if a new entry is needed.')
                 require_revision(ROOT, expected, overrides)
-                updated, batch = stage_new_client(session, details)
-                if not details.get('sn'):
-                    from inward_serials import resequence_added_inward
-                    updated, batch, serial_changes = resequence_added_inward(
-                        updated, batch, session.data, root=ROOT, plant=plant, request_id=request_id,
-                        on_order_warning=lambda warning: setattr(session, 'order_warning', warning))
+                from inward_serials import UnsafeSerialResequence, reserved_workbook_serials, resequence_added_inward
+                automatic_sn = not details.get('sn')
+                reserved_serials = reserved_workbook_serials(ROOT, plant) if automatic_sn else ()
+                updated, batch = stage_new_client(session, details, reserved_serials=reserved_serials)
+                if automatic_sn:
+                    try:
+                        updated, batch, serial_changes = resequence_added_inward(
+                            updated, batch, session.data, root=ROOT, plant=plant, request_id=request_id,
+                            on_order_warning=lambda warning: setattr(session, 'order_warning', warning))
+                    except UnsafeSerialResequence:
+                        # Keep the staged unused number and all existing SNs
+                        # when resequencing would touch unresolved history.
+                        serial_order_kept = True
                 from identifier_rules import require_unique, workspace_batches
                 staged_overrides = {str(path.resolve()):updated}
                 require_unique(batch, plant, 'workbook', batch['case_id'], workspace_batches(ROOT, staged_overrides), read_register(ROOT)['records'])
                 journal = {'plant':plant, 'path':str(path), 'input':signature, 'sn':batch['case_id'],
                            'snapshot':json.loads(json.dumps(batch_content(batch), default=str)),
+                           'created_at':datetime.now().astimezone().isoformat(timespec='milliseconds'),
                            'expected_revision':expected, 'before_sha256':digest_bytes(session.data), 'saved':False}
                 session.before_persist = lambda _: require_revision(ROOT, expected, overrides)
                 save_json(journal_path, journal)
@@ -402,14 +515,16 @@ def add_client(body):
                     pass  # The prepared record verifies a committed add if its response is lost.
             saved_batches = read_batches(BytesIO(session.data))
             ordering_warning = session.order_warning or ''
+    added_at = remember_workbook_added_at(plant, batch['case_id'], journal.get('created_at'), path)
+    row_batch = dict(batch, source_id=plant, source_path=str(path),
+                     _effective_certificate_status=batch.get('issued', ''), added_at=added_at)
+    report = Report(ROOT, date.today(), 'Add client', publish_latest=False)
+    report.add_saved_inward(row_batch, 'ready' if status_value(batch.get('issued')) == 'ready' else 'needs_review',
+                           'Client added to Excel.')
+    report.rows[0]['added_at'] = added_at
     state = cached_workspace_state(expected)
     if state is not None:
         apply_inward_number_changes(state, plant, serial_changes, saved_batches)
-        row_batch = dict(batch, source_id=plant, source_path=str(path),
-                         _effective_certificate_status=batch.get('issued', ''))
-        report = Report(ROOT, date.today(), 'Add client', publish_latest=False)
-        report.add_saved_inward(row_batch, 'ready' if status_value(batch.get('issued')) == 'ready' else 'needs_review',
-                               'Client added to Excel.')
         state = merge_added_workbook_row(expected, report.rows[0], state)
         try:
             latest = latest_result()
@@ -438,7 +553,7 @@ def add_client(body):
             state = dict(state, setup_warning=f'Client added to Excel, but the dashboard could not refresh: {exc}. Refresh before adding it again.')
     return {'client_added':True, 'client':{'plant':plant, 'sn':batch['case_id'],
             'supplier':batch['supplier'], 'status':status_value(batch['issued'])},
-            'order_warning':ordering_warning, 'state':state}
+            'order_warning':ordering_warning, 'serial_order_kept':serial_order_kept, 'state':state}
 
 
 def latest_result():
@@ -450,6 +565,56 @@ def latest_result():
     return value
 
 
+def startup_state_snapshot():
+    """Return the last usable queue immediately while a fresh Excel check runs."""
+    settings = load_settings(ROOT)
+    if not all(value.strip() for value in settings['workbook_paths']):
+        return None
+    revision = None
+    if WORKSPACE_STATE_CACHE is not None:
+        revision, cached_state = WORKSPACE_STATE_CACHE
+        if isinstance(cached_state, dict) and isinstance(cached_state.get('rows'), list):
+            try:
+                state = copy.deepcopy(cached_state)
+            except (RuntimeError, TypeError, ValueError):
+                state = None
+        else:
+            state = None
+    else:
+        state = None
+    if state is None:
+        try:
+            state = latest_result()
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return None
+    if not isinstance(state, dict) or not isinstance(state.get('rows'), list):
+        return None
+
+    # This may be an older snapshot if Excel changed while the dashboard was
+    # closed. Keep it visible while the background check gets the live rows.
+    state['startup_snapshot'] = True
+    state['startup_scan_complete'] = state.get('scan_complete') is True
+    state['scan_complete'] = False
+    if isinstance(revision, str):
+        state['workspace_revision'] = revision
+    # A disk report has no content revision proving the workbook is still
+    # unchanged, so it is safe to browse but not to issue from that copy.
+    return {
+        'state': state,
+        'settings': {
+            'workbook_paths': settings['workbook_paths'],
+            'reminders_enabled': settings['reminders_enabled'],
+            'reminder_time': settings['reminder_time'],
+            'backup_destination': settings.get('backup_destination', ''),
+            **({'next_cod': settings['next_cod']} if settings.get('next_cod') is not None else {}),
+        },
+        'workspace_revision': revision,
+        'certificate_folder': str(ROOT / 'Certificates'),
+        'server_time': datetime.now().isoformat(timespec='minutes'),
+        'changed': False,
+    }
+
+
 def reusable_workbook_report(report):
     # A failed save or reminder can replace the report without changing the
     # workbooks. A file can also become writable again without a timestamp change.
@@ -459,6 +624,8 @@ def reusable_workbook_report(report):
 
 
 def refresh(paths=None, *, force=False):
+    started = time.perf_counter()
+    timings = {}
     settings = load_settings(ROOT)
     if not any(value.strip() for value in settings['workbook_paths']):
         with run_lock(ROOT):
@@ -478,9 +645,12 @@ def refresh(paths=None, *, force=False):
                 "review": 0, "setup_warning": str(exc), 'certificate_inventory': add_certificate_type_choices(inventory)}
     try:
         stamp = workbook_check_stamp(paths)
+        timings['file_change_check'] = time.perf_counter() - started
         if force or WORKBOOK_CHECK_STAMPS.get(str(ROOT)) != stamp:
+            reconcile_started = time.perf_counter()
             if _reconcile_linked_completions():
                 stamp = workbook_check_stamp(paths)
+            timings['linked_completion_reconciliation'] = time.perf_counter() - reconcile_started
         if (not force and WORKBOOK_CHECK_STAMPS.get(str(ROOT)) == stamp and RESULTS_PATH.is_file()):
             previous = latest_result()
             if reusable_workbook_report(previous) and isinstance(previous.get('certificate_inventory'), dict):
@@ -491,8 +661,22 @@ def refresh(paths=None, *, force=False):
         # Fall through to the full check whenever file metadata is uncertain.
         pass
     checked = {}
-    run(paths, ROOT, check_only=True, progress=None, report_sink=checked)
-    state = workspace_state(recheck_obsolete=False, inventory=checked.get('certificate_inventory'))
+    state = None
+    try:
+        run(paths, ROOT, check_only=True, progress=None, report_sink=checked, check_timings=timings)
+        dashboard_started = time.perf_counter()
+        state = workspace_state(recheck_obsolete=False, inventory=checked.get('certificate_inventory'))
+        timings['dashboard'] = time.perf_counter() - dashboard_started
+    finally:
+        try:
+            save_json(ROOT / 'Data' / 'Reports' / 'Latest Excel Check Timing.json', {
+                'recorded_at': datetime.now().isoformat(timespec='seconds'),
+                'scan_complete': bool(state and state.get('scan_complete')),
+                'total_seconds': round(time.perf_counter() - started, 3),
+                'stage_seconds': {name: round(seconds, 3) for name, seconds in timings.items()},
+            })
+        except OSError:
+            pass  # Timing diagnostics must never interrupt a refresh.
     if reusable_workbook_report(state):
         try:
             WORKBOOK_CHECK_STAMPS[str(ROOT)] = workbook_check_stamp(paths)
@@ -509,7 +693,9 @@ def disconnected_workbook_state(inventory=None):
     from run_certificates import numbering_plan
     reset_path = ROOT / 'Data' / 'History Reset.json'
     inventory = inventory if inventory is not None else scan_inventory(ROOT)
-    return {'rows': current_pdf_rows(manual_rows(ROOT)), 'scan_complete': False,
+    rows = current_pdf_rows(manual_rows(ROOT))
+    attach_client_added_times(rows, scan_complete=False)
+    return {'rows': rows, 'scan_complete': False,
             'numbering': numbering_plan([], load_settings(ROOT), ROOT / 'Certificates', inventory=inventory),
             'workbooks_disconnected': True, 'created': 0, 'review': 0,
             'certificate_inventory': add_certificate_type_choices(inventory),
@@ -563,6 +749,7 @@ def workspace_state(recheck_obsolete=True, inventory=None):
     report['rows'] = rows
     if refresh_pending:
         report['refresh_pending'] = True
+    attach_client_added_times(rows, scan_complete=report.get('scan_complete') is True and not refresh_pending)
     return report
 
 
@@ -703,12 +890,25 @@ def issued_workbook_cod_issue(source, plant, paths, target_batches, receipt=None
     if not receipt and status_value(source.get('issued')) not in {'generated', 'generated_manual', 'completed'}:
         return ''
     batches = [dict(batch, source_id=plant) for batch in target_batches]
+    for issue in getattr(target_batches, 'row_issues', ()):
+        if issue.get('reserved_cod_numbers'):
+            batches.append({'case_id': '', 'source_id': plant,
+                            'source_sheet': issue.get('sheet'), 'source_row': issue.get('row'),
+                            'reserved_cod_numbers': list(issue['reserved_cod_numbers']),
+                            '_unassigned_excel_row': True})
     for index, path in enumerate(paths, 1):
         other_plant = f'plant{index}'
         if other_plant == plant:
             continue
         try:
-            batches.extend(dict(batch, source_id=other_plant) for batch in read_batches(path))
+            parsed = read_batches(path)
+            batches.extend(dict(batch, source_id=other_plant) for batch in parsed)
+            for issue in getattr(parsed, 'row_issues', ()):
+                if issue.get('reserved_cod_numbers'):
+                    batches.append({'case_id': '', 'source_id': other_plant,
+                                    'source_sheet': issue.get('sheet'), 'source_row': issue.get('row'),
+                                    'reserved_cod_numbers': list(issue['reserved_cod_numbers']),
+                                    '_unassigned_excel_row': True})
         except (OSError, ValueError, BadZipFile, InvalidFileException):
             # Actual issuance still requires both numbering sources. Completion
             # can verify its existing receipt while another file is unavailable.
@@ -948,7 +1148,7 @@ def preview_page_image(identifier, page_number):
     if destination.is_file():
         return destination
     import pypdfium2 as pdfium
-    with pdfium.PdfDocument(str(source)) as document:
+    with PDF_RENDER_LOCK, pdfium.PdfDocument(str(source)) as document:
         if page_number > len(document):
             raise ValueError('This preview page was not found.')
         _render_preview_image(document, page_number - 1, destination)
@@ -1027,7 +1227,7 @@ def preview_certificate(body):
     import pypdfium2 as pdfium
     detail_images = []
     attached_preview = None
-    with pdfium.PdfDocument(str(destination)) as document:
+    with PDF_RENDER_LOCK, pdfium.PdfDocument(str(destination)) as document:
         preview_pages = 1
         if batch['certificate_type'] == 'destruction':
             from destruction_certificate import receipts
@@ -1140,10 +1340,12 @@ def open_selected_workbook_record(plant, case_id, source_sheet=None, source_row=
                              preferred_row=source_row)
 
 
-def _linked_hdd_pending(plant, sn, source):
+def _linked_hdd_pending(plant, sn, source, records=None):
     """Whether this Excel inward still has a requested, unfinished HDD certificate."""
     key = str(sn).strip().casefold()
-    records = [record for record in read_register(ROOT).get('records', [])
+    if records is None:
+        records = read_register(ROOT).get('records', [])
+    records = [record for record in records
                if (link := record.get('details', {}).get('destruction_source'))
                and link.get('plant') == plant
                and str(link.get('case_id', '')).strip().casefold() == key]
@@ -1161,7 +1363,21 @@ def _linked_hdd_pending(plant, sn, source):
     return False
 
 
-def _sync_workbook_recycling_completion(plant, sn):
+def _recycling_completion_update(source, pending, receipt=None):
+    current = status_value(source.get('issued'))
+    recycling_done = bool(source.get('recycling_completed'))
+    if pending and (recycling_done or current == 'completed'):
+        target = ('Generated Externally'
+                  if source.get('external_pdf') or (receipt or {}).get('external_upload')
+                  else 'Generated')
+        if not recycling_done or status_value(target) != current:
+            return target, True
+    elif recycling_done:
+        return 'Completed', False
+    return None
+
+
+def _sync_workbook_recycling_completion(plant, sn, *, lock_timeout=5):
     """Keep Excel's inward status aligned with the two linked certificates."""
     try:
         if plant not in {'plant1', 'plant2'} or not str(sn or '').strip():
@@ -1171,28 +1387,16 @@ def _sync_workbook_recycling_completion(plant, sn):
             return False
         with run_lock(ROOT):
             recover_issuances(ROOT)
-            with WorkbookSession(path, BACKUP_DIR) as session:
+            with WorkbookSession(path, BACKUP_DIR, lock_timeout=lock_timeout) as session:
                 source = _selected_inward(session, sn)
-                current = status_value(source.get('issued'))
                 pending = _linked_hdd_pending(plant, sn, source)
-                recycling_done = bool(source.get('recycling_completed'))
-                target = source.get('issued')
-                if current == 'completed' and pending:
-                    receipt = latest_issuance(ROOT, 'workbook', plant, str(sn))
-                    target = ('Generated Externally'
-                              if source.get('external_pdf') or (receipt or {}).get('external_upload')
-                              else 'Generated')
-                    recycling_done = True  # Repair a completion saved before this coordination existed.
-                elif recycling_done and not pending:
-                    target = 'Completed'
-                    recycling_done = False
-                elif recycling_done and pending:
-                    receipt = latest_issuance(ROOT, 'workbook', plant, str(sn))
-                    target = ('Generated Externally'
-                              if source.get('external_pdf') or (receipt or {}).get('external_upload')
-                              else 'Generated')
-                else:
+                receipt = (latest_issuance(ROOT, 'workbook', plant, str(sn))
+                           if pending and (source.get('recycling_completed')
+                                           or status_value(source.get('issued')) == 'completed') else None)
+                update = _recycling_completion_update(source, pending, receipt)
+                if update is None:
                     return False
+                target, recycling_done = update
                 session.set_issued_status(source['case_id'], source['source_sheet'], source['source_row'],
                     source['cod_no'], source['issued'], target,
                     metadata={'_recycling_completed': recycling_done})
@@ -1229,22 +1433,33 @@ def _reconcile_linked_completions():
         details = record.get('details', {})
         link = details.get('destruction_source') or {}
         if details.get('certificate_type') == 'destruction' and link.get('plant') in {'plant1', 'plant2'}:
-            targets.add((link['plant'], str(link.get('case_id', '')).strip()))
+            targets.add((link['plant'], str(link.get('case_id', '')).strip().casefold()))
     # A user may delete an unissued request from Settings. The workbook marker
     # still records that Recycling was sent, so revisit those rows even though
     # the now-deleted HDD record can no longer lead us back to them.
-    try:
-        for index, path in enumerate(configured_paths(allow_unavailable=True), 1):
-            if not path.is_file():
-                continue
-            for batch in read_batches(BytesIO(path.read_bytes())):
-                if batch.get('recycling_completed'):
-                    targets.add((f'plant{index}', str(batch.get('case_id', '')).strip()))
-    except (OSError, ValueError, InvalidFileException):
-        pass
     changed = False
-    for plant, sn in targets:
-        changed = _sync_workbook_recycling_completion(plant, sn) or changed
+    receipts = None
+    for index, path in enumerate(configured_paths(allow_unavailable=True), 1):
+        plant = f'plant{index}'
+        try:
+            for batch in read_batches(BytesIO(path.read_bytes())):
+                sn = str(batch.get('case_id', '')).strip()
+                key = (plant, sn.casefold())
+                if not batch.get('recycling_completed') and not (
+                    status_value(batch.get('issued')) == 'completed' and key in targets
+                ):
+                    continue
+                pending = _linked_hdd_pending(plant, sn, batch, records)
+                if pending and receipts is None:
+                    receipts = {(entry.get('plant'), str(entry.get('key')).strip().casefold()): entry
+                                for entry in audit_records(ROOT)
+                                if entry.get('source_kind') == 'workbook' and entry.get('state') == 'complete'}
+                if _recycling_completion_update(batch, pending, (receipts or {}).get(key)):
+                    # A refresh can read a workbook Excel has open. Retry the
+                    # repair on a later check instead of waiting per linked row.
+                    changed = _sync_workbook_recycling_completion(plant, sn, lock_timeout=0) or changed
+        except (OSError, ValueError, InvalidFileException):
+            continue
     return changed
 
 
@@ -1641,9 +1856,14 @@ def save_inward_changes(body):
             require_unique(saved, plant, 'workbook', sn,
                 workspace_batches(ROOT, {str(path.resolve()): updated}), read_register(ROOT)['records'])
             serial_changes = {}
+            serial_order_kept = False
             if saved['inward_date'] != source['inward_date']:
-                from inward_serials import resequence_date_ordered_inwards
-                updated, serial_changes = resequence_date_ordered_inwards(updated, session.data, root=ROOT, plant=plant)
+                from inward_serials import UnsafeSerialResequence, resequence_date_ordered_inwards
+                try:
+                    updated, serial_changes = resequence_date_ordered_inwards(
+                        updated, session.data, root=ROOT, plant=plant)
+                except UnsafeSerialResequence:
+                    serial_order_kept = True
             saved_batches = read_batches(BytesIO(updated))
             saved = next(row for row in saved_batches if row['case_id'] == serial_changes.get(sn, sn))
             session.before_persist = lambda _: require_revision(ROOT, body.get('expected_revision'), overrides)
@@ -1668,7 +1888,8 @@ def save_inward_changes(body):
         saved_message='Changes saved to Excel', fallback_state={'rows': report.rows, 'scan_complete': False})
     state = save_requested_destruction(dict(body, source_sn=saved['case_id']), state)
     remember_workbook_stamp()
-    return {'saved': True, 'created': 0, 'state': state, 'sn': saved['case_id']}
+    return {'saved': True, 'created': 0, 'state': state, 'sn': saved['case_id'],
+            'serial_order_kept': serial_order_kept}
 
 
 def update_inward_status(body):
@@ -2198,6 +2419,13 @@ class Handler(BaseHTTPRequestHandler):
     def send_error_json(self, exc, status=400):
         self.send_json({"error": operation_error_message(exc)}, status)
 
+    def serve_workbook_check(self, handler):
+        WORKBOOK_CHECK_ACTIVE.set()
+        try:
+            handler()
+        finally:
+            WORKBOOK_CHECK_ACTIVE.clear()
+
     def do_GET(self):
         path = urlsplit(self.path).path
         if path == '/api/dashboard-review':
@@ -2206,8 +2434,34 @@ class Handler(BaseHTTPRequestHandler):
         if path in self.ASSETS:
             self.send_asset(*self.ASSETS[path])
             return
-        with OPERATION_LOCK:
+        if path == '/api/state':
+            try:
+                snapshot = startup_state_snapshot()
+            except (OSError, ValueError, TypeError):
+                snapshot = None
+            if snapshot is not None:
+                self.send_json(snapshot)
+                return
+        if (path in {'/api/templates', '/api/history', '/api/analytics', '/api/certificate-preview-image'}
+                or path.startswith(('/api/certificates/', '/previews/'))):
             self._do_get()
+            return
+        if path == '/api/workbook-changes':
+            if STOPPING or not OPERATION_LOCK.acquire(blocking=False):
+                self.send_json({'changed': False, 'check_pending': True})
+                return
+            try:
+                self.serve_workbook_check(self._do_get)
+            finally:
+                OPERATION_LOCK.release()
+            return
+        if not OPERATION_LOCK.acquire(timeout=1 if WORKBOOK_CHECK_ACTIVE.is_set() else 30):
+            self.send_error_json('Another app action is still finishing. Your saved company list is available; try Refresh again shortly.', 503)
+            return
+        try:
+            self._do_get()
+        finally:
+            OPERATION_LOCK.release()
 
     def send_asset(self, name, mime):
         try:
@@ -2226,7 +2480,18 @@ class Handler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path == "/api/workbook-changes":
             try:
-                self.send_json(check_workbook_changes())
+                result = check_workbook_changes()
+                # A tab may have missed the latest result while editing or when
+                # another tab led the check. Return the checked rows on its next poll.
+                known_revision = self.headers.get('X-Workspace-Revision')
+                known_report = self.headers.get('X-Workbook-Report')
+                cached = WORKSPACE_STATE_CACHE
+                if result.get('changed') is False and known_revision is not None and cached:
+                    revision, state = cached
+                    if revision and reusable_workbook_report(state) and (
+                            known_revision != revision or known_report != (state.get('run_id') or '-')):
+                        result.update(state=state, workspace_revision=revision)
+                self.send_json(result)
             except Exception as exc:
                 self.send_error_json(exc, 500)
             return
@@ -2258,7 +2523,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == '/api/history':
             try:
-                self.send_json({'history': audit_records(ROOT)[-50:]})
+                self.send_json({'history': audit_records(ROOT)[-50:], 'changed': False})
             except (OSError, ValueError) as exc:
                 self.send_error_json(exc)
             return
@@ -2276,9 +2541,10 @@ class Handler(BaseHTTPRequestHandler):
                          if row.get('certificate_date') and row.get('certificate_status') in {'generated', 'generated_manual', 'completed'}]
                 known.extend(record.get('cod') for record in history if record.get('state') == 'complete')
                 saved = folder_events(ROOT, scan_inventory(ROOT), known)
-                self.send_json(build_analytics(rows, history, period=query.get('period', ['month'])[0],
-                                               plant=query.get('plant', ['all'])[0], scan_complete=report.get('scan_complete', False),
-                                               saved_pdfs=saved))
+                result = build_analytics(rows, history, period=query.get('period', ['month'])[0],
+                                         plant=query.get('plant', ['all'])[0], scan_complete=report.get('scan_complete', False),
+                                         saved_pdfs=saved)
+                self.send_json(dict(result, changed=False))
             except (OSError, ValueError) as exc:
                 self.send_error_json(exc)
             return
@@ -2288,7 +2554,7 @@ class Handler(BaseHTTPRequestHandler):
                 payload = uploaded_pdf_bytes(query.get('path', [''])[0], query.get('sha256', [''])[0])
                 import pypdfium2 as pdfium
                 rendered = BytesIO()
-                with OPERATION_LOCK, pdfium.PdfDocument(payload) as document:
+                with PDF_RENDER_LOCK, pdfium.PdfDocument(payload) as document:
                     _write_preview_image(document, 0, rendered)
                 image = rendered.getvalue()
             except (ValueError, OSError, RuntimeError, IndexError):
@@ -2365,17 +2631,34 @@ class Handler(BaseHTTPRequestHandler):
         self.send_error(404)
 
     def do_POST(self):
-        if urlsplit(self.path).path in {'/api/dashboard-presence', '/api/dashboard-review'}:
+        path = urlsplit(self.path).path
+        if path in {'/api/dashboard-presence', '/api/dashboard-review', '/api/open-certificate'}:
             if STOPPING:
                 self.send_error_json('The dashboard is closing.', 503)
             else:
                 self._do_post()
             return
-        with OPERATION_LOCK:
+        if STOPPING:
+            self.send_error_json('The dashboard is closing. Reopen it before starting another action.', 503)
+            return
+        checking_workbooks = WORKBOOK_CHECK_ACTIVE.is_set() or path == '/api/check'
+        if not OPERATION_LOCK.acquire(timeout=1 if checking_workbooks and path != '/api/stop' else 30):
+            self.close_connection = True
+            message = ('Excel is still being checked. Try again when the check finishes.'
+                       if WORKBOOK_CHECK_ACTIVE.is_set()
+                       else 'Another app action is still finishing. This request was not started; try again shortly.')
+            self.send_error_json(message, 503)
+            return
+        try:
             if STOPPING:
                 self.send_error_json('The dashboard is closing. Reopen it before starting another action.', 503)
                 return
-            self._do_post()
+            if path == '/api/check':
+                self.serve_workbook_check(self._do_post)
+            else:
+                self._do_post()
+        finally:
+            OPERATION_LOCK.release()
 
     def _do_post(self):
         global SERVER
@@ -2394,7 +2677,8 @@ class Handler(BaseHTTPRequestHandler):
                 payload = self.rfile.read(length)
                 if len(payload) != length:
                     raise ValueError('The upload was interrupted. Choose the file again.')
-                self.send_json(stage_upload(ROOT, payload, content_type=content_type))
+                filename = unquote(self.headers.get('X-Certificate-Filename', ''))[:255]
+                self.send_json(stage_upload(ROOT, payload, content_type=content_type, filename=filename))
                 return
             if length < 0 or length > 1_000_000:
                 raise ValueError("The request is too large.")
@@ -2440,6 +2724,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(stage_saved_upload(ROOT, body))
             elif parsed.path == '/api/certificates/save-upload':
                 self.send_json(save_uploaded_certificate(body))
+            elif parsed.path == '/api/certificates/save-upload-details':
+                from external_certificate_upload import save_uploaded_details
+                save_uploaded_details(ROOT, BACKUP_DIR, body)
+                self.send_json({'saved':True, 'state':post_commit_state(
+                    refresh, saved_message='Certificate details saved')})
             elif parsed.path == '/api/clients/followup':
                 self.send_json(save_inward_followup(body))
             elif parsed.path in {'/api/entries/delete-preview', '/api/entries/delete'}:
@@ -2573,7 +2862,7 @@ class Handler(BaseHTTPRequestHandler):
                                                        open_document=open_document)
                 self.send_json({"ok": True, 'pdf_path': str(destination),
                                 'folder': str(destination.parent), 'selected': True,
-                                'opened': open_document})
+                                'opened': open_document, 'changed': False})
             elif parsed.path == "/api/open-workbook":
                 path, sheet, row = open_selected_workbook_record(body.get("plant"), body.get("sn"),
                                                                   body.get('sheet'), body.get('row'))
