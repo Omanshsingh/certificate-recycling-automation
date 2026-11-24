@@ -247,7 +247,8 @@ class ClientIntakeTests(unittest.TestCase):
         self.assertIsNone(sheet.cell(4, headers['Weight Slip/Weight Scale']).value)
         self.assertIsNone(sheet.cell(4, headers['Comments']).value)
         self.assertEqual(copy(sheet['C4'].fill), copy(sheet['C2'].fill))
-        self.assertEqual(sheet.row_dimensions[4].height, 32)
+        height = sheet.row_dimensions[4].height or sheet.sheet_format.defaultRowHeight
+        self.assertLess(height, 32)
         self.assertTrue(any('D4' in rule for rule in sheet.data_validations.dataValidation))
         status_letter = get_column_letter(headers['Certificate Issued'])
         self.assertTrue(any(f'{status_letter}6' in rule for rule in sheet.data_validations.dataValidation))

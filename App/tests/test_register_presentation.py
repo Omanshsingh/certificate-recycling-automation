@@ -99,5 +99,67 @@ class RegisterPresentationTests(unittest.TestCase):
         self.assertGreater(sheet.row_dimensions[2].height, 15)
         self.assertEqual(sheet.row_dimensions[3].height, 15)
 
+    def test_refit_shrinks_replaced_text_and_preserves_current_wrapping(self):
+        book = load_workbook(BytesIO(self.source()))
+        sheet = book.active
+        sheet['C2'] = 'Short client name'
+        sheet['C2'].alignment = Alignment(wrap_text=True)
+        sheet.column_dimensions['C'].width = 28
+        sheet['J2'] = 'Generated Externally'
+        sheet['J2'].alignment = Alignment(wrap_text=True)
+        sheet.column_dimensions['J'].width = 13
+        sheet.row_dimensions[1].height = 55
+        sheet.row_dimensions[2].height = 80
+        other = book.create_sheet('Other')
+        other['A2'] = 'Leave this sheet as authored'
+        other.row_dimensions[2].height = 80
+
+        def fit():
+            buffer = BytesIO()
+            book.save(buffer)
+            return normalize_register_presentation(buffer.getvalue(), wrap_only=True, fit_register=True)
+
+        wrapped = fit()
+        with_height = load_workbook(BytesIO(wrapped))
+        self.assertGreater(with_height.active.row_dimensions[2].height, 15)
+        self.assertLess(with_height.active.row_dimensions[2].height, 40)
+        with_height.close()
+        sheet['J2'] = 'Completed'
+        shortened = fit()
+        book.close()
+        result = load_workbook(BytesIO(shortened))
+        self.addCleanup(result.close)
+        self.assertIsNone(result.active.row_dimensions[2].height)
+        self.assertEqual(result.active.row_dimensions[1].height, 55)
+        self.assertEqual(result['Other'].row_dimensions[2].height, 80)
+        self.assertEqual(normalize_register_presentation(shortened, wrap_only=True, fit_register=True), shortened)
+
+    def test_refit_recomputes_the_combined_height_of_merged_cells(self):
+        book = load_workbook(BytesIO(self.source()))
+        sheet = book.active
+        sheet['E3'] = 'Printer'
+        sheet['F3'] = 5
+        sheet.merge_cells('C2:C3')
+        sheet['C2'] = 'First line\nSecond line\nThird line'
+        sheet['C2'].alignment = Alignment(wrap_text=True)
+        sheet.column_dimensions['C'].width = 24
+        for row in (2, 3):
+            sheet.row_dimensions[row].height = 70
+        buffer = BytesIO()
+        book.save(buffer)
+        book.close()
+        fitted = normalize_register_presentation(buffer.getvalue(), fit_inward=('Sheet', '1'))
+        book = load_workbook(BytesIO(fitted))
+        self.assertGreaterEqual(sum(book.active.row_dimensions[row].height for row in (2, 3)), 45)
+        book.active['C2'] = 'Company'
+        buffer = BytesIO()
+        book.save(buffer)
+        book.close()
+        shortened = normalize_register_presentation(buffer.getvalue(), fit_inward=('Sheet', '1'))
+        resized = load_workbook(BytesIO(shortened))
+        self.addCleanup(resized.close)
+        self.assertIn('C2:C3', resized.active.merged_cells)
+        self.assertTrue(all(resized.active.row_dimensions[row].height is None for row in (2, 3)))
+
 
 if __name__=='__main__':unittest.main()

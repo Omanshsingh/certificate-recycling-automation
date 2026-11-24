@@ -16,7 +16,7 @@ from openpyxl.utils.datetime import to_excel
 
 from register_protection import externally_protected
 from certificate_core import parse_date, read_batches, select_register
-from workbook_store import (_attributes, _date_style, _element, _ensure_status_validation,
+from workbook_store import (_attributes, _date_style, _element, _ensure_status_validation, _inward_blocks,
                             _patch_cell_styles, _set_cell, _sheet_member)
 
 DATE_FORMAT = 'dd/mm/yy'
@@ -98,8 +98,8 @@ def _wrapped_lines(value, width, measure):
     return lines
 
 
-def _fit_wrapped_rows(xml, sheet, text_cells, normal_font, fit_rows):
-    if not fit_rows or not text_cells:
+def _fit_wrapped_rows(xml, sheet, display_cells, normal_font, fit_rows, bold_columns):
+    if not fit_rows:
         return xml
     default_height = sheet.sheet_format.defaultRowHeight or 15
     measure_digit = _font_measure(normal_font.name or 'Calibri', normal_font.sz or 11)
@@ -113,24 +113,35 @@ def _fit_wrapped_rows(xml, sheet, text_cells, normal_font, fit_rows):
 
     merges = {(area.min_row, area.min_col): area for area in sheet.merged_cells.ranges}
     current = sheet.row_dimensions
-    heights = {}
+    heights = {row: default_height for row in fit_rows
+               if not (row in current and current[row].hidden)}
+    # A merge crossing the area being fitted may depend on rows outside it.
+    for area in merges.values():
+        affected = heights.keys() & range(area.min_row, area.max_row + 1)
+        if affected and (area.min_row not in fit_rows or area.max_row not in fit_rows):
+            for row in affected:
+                heights.pop(row)
     requirements = []
-    for cell, value in text_cells:
-        if (cell.row not in fit_rows or not cell.alignment.wrap_text
-                or cell.alignment.text_rotation):
-            continue
+    for cell, value in display_cells:
         area = merges.get((cell.row, cell.column))
         last_col = area.max_col if area else cell.column
+        last_row = area.max_row if area else cell.row
         width = sum(widths.get(col, default_width) for col in range(cell.column, last_col + 1))
         if width <= 0:
             continue
+        if cell.alignment.text_rotation:
+            for row in range(cell.row, last_row + 1):
+                heights.pop(row, None)
+            continue
         size = cell.font.sz or 11
-        measure = _font_measure(cell.font.name or 'Calibri', size, bool(cell.font.b), bool(cell.font.i))
-        indent = (cell.alignment.indent or 0) * measure('   ')
-        lines = _wrapped_lines(value, max(1, width * digit_width - 6 - indent), measure)
-        if lines > 1:
-            height = math.ceil((max(default_height, size * 1.35) * lines + 2) * 2) / 2
-            requirements.append((cell.row, area.max_row if area else cell.row, height))
+        lines = 1
+        if isinstance(value, str) and cell.alignment.wrap_text:
+            measure = _font_measure(cell.font.name or 'Calibri', size,
+                                    bool(cell.font.b) or cell.column in bold_columns, bool(cell.font.i))
+            indent = (cell.alignment.indent or 0) * measure('   ')
+            lines = _wrapped_lines(value.rstrip(), max(1, width * digit_width - 6 - indent), measure)
+        height = math.ceil((max(default_height, size * 1.35) * lines + (2 if lines > 1 else 0)) * 2) / 2
+        requirements.append((cell.row, last_row, height))
 
     def existing_height(row):
         dimension = current.get(row)
@@ -143,16 +154,18 @@ def _fit_wrapped_rows(xml, sheet, text_cells, normal_font, fit_rows):
                 if not (row in current and current[row].hidden)]
         if not rows:
             continue
-        available = [heights.get(row, existing_height(row)) for row in rows]
-        deficit = required - sum(available)
-        for index, (row, height) in enumerate(zip(rows, available)):
+        adjustable = [row for row in rows if row in heights]
+        deficit = required - sum(heights.get(row, existing_height(row)) for row in rows)
+        for index, row in enumerate(adjustable):
             if deficit <= 0:
                 break
-            target = min(MAX_ROW_HEIGHT, height + math.ceil(deficit * 2 / (len(rows) - index)) / 2)
+            height = heights[row]
+            target = min(MAX_ROW_HEIGHT, height + math.ceil(deficit * 2 / (len(adjustable) - index)) / 2)
             if target > height:
                 heights[row] = target
                 deficit -= target - height
 
+    heights = {row: height for row, height in heights.items() if height != existing_height(row)}
     if not heights:
         return xml
 
@@ -160,6 +173,10 @@ def _fit_wrapped_rows(xml, sheet, text_cells, normal_font, fit_rows):
         fragment = match.group()
         row = int(_attributes(fragment)['r'])
         if row in heights:
+            if heights[row] == default_height:
+                end = fragment.index('>')
+                opening = re.sub(r'\s(?:ht|customHeight)=(["\x27]).*?\1', '', fragment[:end])
+                return opening + fragment[end:]
             fragment = _set_attribute(fragment, 'ht', f'{heights[row]:g}')
             fragment = _set_attribute(fragment, 'customHeight', 1)
         return fragment
@@ -188,22 +205,26 @@ def _fit_wrapped_rows(xml, sheet, text_cells, normal_font, fit_rows):
     return xml[:section.start()] + ''.join(pieces) + xml[section.end():]
 
 
-def normalize_register_presentation(data, *, wrap_only=False, include_validation=False, fit_inward=None):
+def normalize_register_presentation(data, *, wrap_only=False, include_validation=False, fit_inward=None,
+                                    fit_register=False):
     book = load_workbook(BytesIO(data), data_only=False)
     try:
         sheet, header, cols = select_register(book)
         if externally_protected(sheet):
             return data
         fit_rows = set()
-        if isinstance(fit_inward, (tuple, list)) and len(fit_inward) == 2:
-            fit_sheet, fit_case_id = fit_inward
-            matches = [batch for batch in read_batches(BytesIO(data))
-                       if batch.get('source_sheet') == fit_sheet
-                       and str(batch.get('case_id', '')).casefold() == str(fit_case_id).casefold()]
-            if len(matches) == 1:
-                first = int(matches[0]['source_row'])
-                count = max(1, len(matches[0].get('items') or []))
-                fit_rows = set(range(first, first + count))
+        fit_one = isinstance(fit_inward, (tuple, list)) and len(fit_inward) == 2
+        if fit_register or fit_one:
+            batches = read_batches(BytesIO(data))
+            records = [batch for batch in batches if batch['source_sheet'] == sheet.title]
+            blocks = _inward_blocks(sheet, records)
+            if not fit_register:
+                fit_sheet, fit_case_id = fit_inward
+                matches = [batch['source_row'] for batch in records if fit_sheet == sheet.title
+                           and str(batch['case_id']).casefold() == str(fit_case_id).casefold()]
+                blocks = [block for block in blocks if len(matches) == 1 and block[0] == matches[0]]
+            fit_rows = {row for first, last in blocks for row in range(first, last + 1)}
+            fit_rows.difference_update(issue['row'] for issue in batches.row_issues)
         with ZipFile(BytesIO(data)) as archive:
             member = _sheet_member(archive, sheet.title)
             xml = archive.read(member).decode('utf-8')
@@ -221,7 +242,7 @@ def normalize_register_presentation(data, *, wrap_only=False, include_validation
             known = {value: index for index, value in enumerate(definitions)}
             ids = {}
             date_cols = {cols[key] + 1 for key in ('inward_date', 'cod_date') if key in cols}
-            text_cells = []
+            display_cells = []
             style_ids = {}
             for match in _element(xml, 'c').finditer(xml):
                 attrs = _attributes(match.group())
@@ -242,8 +263,8 @@ def normalize_register_presentation(data, *, wrap_only=False, include_validation
                         # Parse the cached text, including numeric character references.
                         inner = cached.group().partition('>')[2].rpartition('<')[0]
                         value = ET.fromstring(f'<v>{inner}</v>').text
-                if isinstance(value, str) and value and cell.row in fit_rows:
-                    text_cells.append((cell, value))
+                if cell.row in fit_rows and value is not None and value != '':
+                    display_cells.append((cell, value))
                 style_key = (int(attrs.get('s', 0)), is_date)
                 if style_key in style_ids:
                     ids[cell.coordinate] = style_ids[style_key]
@@ -257,7 +278,9 @@ def normalize_register_presentation(data, *, wrap_only=False, include_validation
                     definitions.append(definition)
                 ids[cell.coordinate] = style_ids[style_key] = known[definition]
             xml = _patch_cell_styles(xml, ids)
-            xml = _fit_wrapped_rows(xml, sheet, text_cells, book._fonts[0], fit_rows)
+            # The register's status and overdue rules can display bold text.
+            bold_columns = {cols[key] + 1 for key in ('issued', 'supplier') if key in cols}
+            xml = _fit_wrapped_rows(xml, sheet, display_cells, book._fonts[0], fit_rows, bold_columns)
             if include_validation and 'issued' in cols:
                 status = get_column_letter(cols['issued'] + 1)
                 xml = _ensure_status_validation(xml, status, max(10000, sheet.max_row + 2000), header + 1)

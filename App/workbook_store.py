@@ -1733,19 +1733,21 @@ class WorkbookSession:
                 overdue_dxf_id=red_dxf, attention_dxf_id=date_attention_dxf,
                 row_limit=row_limit, first_row=first_row,
             )
-            if updated_styles == styles_xml and updated_sheet == original_sheet_xml:
-                unprotected = remove_issued_inward_protection(self.data)
-                return self._persist(unprotected, exact=True) if unprotected != self.data else self.backup_path
-            ET.fromstring(updated_styles)
-            ET.fromstring(updated_sheet)
-            changed = {"xl/styles.xml": updated_styles.encode("utf-8"),
-                       member: updated_sheet.encode("utf-8")}
-            buffer = BytesIO()
-            with ZipFile(buffer, "w") as target:
-                target.comment = source.comment
-                for info in source.infolist():
-                    target.writestr(info, changed.get(info.filename, source.read(info.filename)))
-        backup = self._persist(buffer.getvalue())
+            updated = self.data
+            if updated_styles != styles_xml or updated_sheet != original_sheet_xml:
+                ET.fromstring(updated_styles)
+                ET.fromstring(updated_sheet)
+                changed = {"xl/styles.xml": updated_styles.encode("utf-8"),
+                           member: updated_sheet.encode("utf-8")}
+                buffer = BytesIO()
+                with ZipFile(buffer, "w") as target:
+                    target.comment = source.comment
+                    for info in source.infolist():
+                        target.writestr(info, changed.get(info.filename, source.read(info.filename)))
+                updated = buffer.getvalue()
+        fitted = normalize_register_presentation(updated, wrap_only=True, fit_register=True)
+        fitted = remove_issued_inward_protection(fitted)
+        backup = self._persist(fitted, exact=True) if fitted != self.data else self.backup_path
         for coordinate, canonical in status_updates:
             batch = sheet_batches.get(int(re.search(r"\d+$", coordinate).group()))
             if batch is not None:
@@ -1926,7 +1928,7 @@ class WorkbookSession:
             metadata['_external_pdf'] = None
         updated = write_details(updated, current['source_sheet'], current['case_id'], metadata)
         updated = self._move_primary_hdd_after_recycling_write(updated, current)
-        updated = order_register_for_save(updated, self)
+        updated = order_register_for_save(updated, self, fit_inward=(current['source_sheet'], current['case_id']))
 
         verified_matches = [b for b in read_batches(BytesIO(updated))
                             if b["case_id"] == current["case_id"]
@@ -2055,6 +2057,8 @@ class WorkbookSession:
                 or (external and verified['external_pdf'] != external['link'])
                 or (external_type and verified['certificate_type'] != external_type)):
             raise ValueError("The workbook status update could not be verified; the original file was kept.")
+        from register_presentation import normalize_register_presentation
+        updated = normalize_register_presentation(updated, wrap_only=True, fit_inward=(source_sheet, current['case_id']))
         return self._persist(updated)
 
     def _move_primary_hdd_after_recycling_write(self, data, previous):
@@ -2511,8 +2515,7 @@ def stage_certificate_details(session, details, validate_cells=True, *, inward_s
             except ValueError:
                 shrink_warning = ('The material change was saved, but Excel kept an extra blank row because its layout '
                                   'could not be safely compacted automatically. Review the workbook before reusing that row.')
-        updated = order_register_for_save(
-            updated, session, fit_inward=(sheet.title, case_id) if is_new_record else None)
+        updated = order_register_for_save(updated, session, fit_inward=(sheet.title, case_id))
         if shrink_warning:
             session.order_warning = ' '.join(filter(None, (session.order_warning, shrink_warning)))
 

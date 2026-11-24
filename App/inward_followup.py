@@ -79,4 +79,6 @@ def stage_followup(data, sn, values):
     saved = next(row for row in verified if row['case_id'] == sn)
     if any(saved.get(key) != value for key, value in values.items()):
         raise ValueError('The inward details could not be checked. Excel was kept unchanged.')
+    from register_presentation import normalize_register_presentation
+    updated = normalize_register_presentation(updated, wrap_only=True, fit_inward=(sheet.title, sn))
     return updated, saved
