@@ -2,6 +2,7 @@
 from copy import copy
 from datetime import datetime
 from io import BytesIO
+import json
 import math
 import re
 import xml.etree.ElementTree as ET
@@ -38,7 +39,7 @@ OPTIONAL_LABELS = {
 }
 
 
-def intake_details(raw):
+def intake_details(raw, *, certificate_type='standard', restoring=False):
     if not isinstance(raw, dict):
         raise ValueError('Enter the new client details.')
     details = {}
@@ -57,7 +58,19 @@ def intake_details(raw):
             raise ValueError(f'The {OPTIONAL_LABELS[key]} value is too long.')
     if not details['supplier']:
         raise ValueError('Enter the company name.')
-    details['certificate_type'] = 'standard'
+    details['certificate_type'] = certificate_type
+    if not restoring:
+        from certificate_templates import validate_fields
+        fields = {key: value for key, value in validate_fields(certificate_type, raw.get('certificate_fields')).items()
+                  if value.strip()}
+        if fields:
+            details['certificate_fields'] = fields
+        entered_weight = text(raw.get('certificate_weight'))
+        if entered_weight:
+            weight = number(entered_weight)
+            if weight is None or not math.isfinite(weight) or weight <= 0:
+                raise ValueError('Enter a positive certificate weight in kg, or leave it blank.')
+            details['certificate_weight'] = weight
     received = checked_excel_text(text(raw.get('inward_date')), 'Inward Date', normalize_paste=True)
     details['inward_date'] = parse_date(received)
     if received and details['inward_date'] is None:
@@ -169,8 +182,13 @@ def _copy_rules(xml, source_rows, destination_rows, status_column, width):
     return xml[:position] + ''.join(additions['conditionalFormatting']) + xml[position:]
 
 
-def stage_new_client(session, raw, *, reserved_serials=()):
-    details = intake_details(raw)
+def stage_new_client(session, raw, *, reserved_serials=(), recycling_needed=True,
+                     certificate_type='standard', restoring=False):
+    details = intake_details(raw, certificate_type=certificate_type, restoring=restoring)
+    if restoring:
+        details['certificate_type'] = text(raw.get('certificate_type')) or 'standard'
+    certificate_values = {key: (raw if restoring else details).get(key)
+                          for key in ('certificate_weight', 'certificate_fields')}
     source_data = add_tracking_column(session.data)
     original = read_batches(BytesIO(source_data))
     book = load_workbook(BytesIO(source_data), data_only=False)
@@ -221,6 +239,12 @@ def stage_new_client(session, raw, *, reserved_serials=()):
                 next_column = checked_register_column(next_column + 1)
                 cols[key] = next_column - 1
                 added_optional[key] = label
+        if restoring:
+            for key in ('cod_no', 'cod_date'):
+                if raw.get(key) and key not in cols:
+                    next_column = checked_register_column(next_column + 1)
+                    cols[key] = next_column - 1
+                    added_optional[key] = LABELS[key]
         ids = {batch['case_id'].strip().casefold() for batch in original}
         if details.get('form6') and any(batch.get('form6', '').strip().casefold() == details['form6'].strip().casefold() for batch in original):
             raise ValueError(f'Form 6 number {details["form6"]} is already used. Enter a different Form 6 number.')
@@ -308,6 +332,16 @@ def stage_new_client(session, raw, *, reserved_serials=()):
                     xml = _set_cell(xml, f'{get_column_letter(cols[key] + 1)}{first}', details[key], 'inlineStr' if details[key] else 'blank')
             if 'certificate_type' in cols:
                 xml = _set_cell(xml, f'{get_column_letter(cols["certificate_type"] + 1)}{first}', details['certificate_type'], 'inlineStr')
+            certificate_cells = dict(certificate_values)
+            if restoring:
+                certificate_cells.update(cod_no=text(raw.get('cod_no')), cod_date=text(raw.get('cod_date')))
+            for key, value in certificate_cells.items():
+                if key not in cols or value is None or value == '' or value == {}:
+                    continue
+                if key == 'certificate_fields':
+                    value = json.dumps(value, ensure_ascii=False)
+                xml = _set_cell(xml, f'{get_column_letter(cols[key] + 1)}{first}', value,
+                                'n' if key == 'certificate_weight' else 'inlineStr')
             xml = _set_cell(xml, f'{get_column_letter(cols["sn"] + 1)}{first}', case_id, 'inlineStr')
             if details['inward_date']:
                 source_cell = sheet.cell(template, cols['inward_date'] + 1)
@@ -346,24 +380,6 @@ def stage_new_client(session, raw, *, reserved_serials=()):
                     fragment = fragment[:-2] + f'></{prefix}c>'
                 fragment = fragment.replace(f'</{prefix}c>', f'<{prefix}f>SUM({weight_col}{first}:{weight_col}{last})</{prefix}f></{prefix}c>')
                 xml = xml[:cell.start()] + fragment + xml[cell.end():]
-            merges = []
-            if len(destinations) > 1:
-                material_columns = {cols[key] + 1 for key in
-                                    ('item', 'quantity', 'per_piece_weight', 'weight') if key in cols}
-                template_merges = [area.min_col for area in sheet.merged_cells.ranges
-                                   if area.min_row == template and area.min_col == area.max_col
-                                   and area.max_row > template and area.min_col not in material_columns]
-                if empty_template and template_end == template:
-                    # A clean template has one fully ruled entry row, so add
-                    # the batch-level merges when it expands into material rows.
-                    client_columns = [column for column in range(1, width + 1)
-                                      if column not in material_columns]
-                else:
-                    client_columns = template_merges
-                for column in client_columns:
-                    letter = get_column_letter(column)
-                    merges.append(f'<{prefix}mergeCell ref="{letter}{first}:{letter}{last}"/>')
-            xml = _append_block(xml, 'mergeCells', merges, ('phoneticPr','conditionalFormatting','dataValidations','hyperlinks','printOptions','pageMargins','pageSetup','drawing','extLst'))
             xml = _copy_rules(xml, source_rows, destinations, cols['issued'] + 1, width)
             xml = _ensure_status_validation(xml, get_column_letter(cols['issued'] + 1), max(10000,last), header_row + 1)
             dimension = _element(xml, 'dimension').search(xml)
@@ -416,12 +432,16 @@ def stage_new_client(session, raw, *, reserved_serials=()):
                 changes['xl/workbook.xml'] = workbook_xml.encode('utf-8')
             metadata = {key:details[key] for key in ('form6','reference','certificate_type')
                         if key not in cols and details[key] and (key != 'certificate_type' or details[key] != 'standard')}
+            metadata.update({key:value for key, value in certificate_values.items()
+                             if key not in cols and value is not None})
             updated = write_details(_package(archive, changes), sheet.title, case_id, metadata)
             batches = read_batches(BytesIO(updated))
             added = next(batch for batch in batches if batch['case_id'] == case_id)
             ready = inward_details_complete(added)
-            status = ('N/A' if supplier_is_always_not_applicable(details['supplier'])
+            status = ('N/A' if not recycling_needed or supplier_is_always_not_applicable(details['supplier'])
                       else 'Ready' if ready else '')
+            if restoring:
+                status = text(raw.get('issued'))
             xml = _set_cell(xml, f'{get_column_letter(cols["issued"] + 1)}{first}', status,
                             'inlineStr' if status else 'blank')
             changes[member] = xml.encode('utf-8')
@@ -433,12 +453,25 @@ def stage_new_client(session, raw, *, reserved_serials=()):
             if len(checked) != len(original) + 1 or len(matches) != 1:
                 raise ValueError('The new Excel entry could not be verified. The original workbook was kept.')
             added = matches[0]
+            if added['issued'] != status:
+                raise ValueError('The certificate status could not be verified in Excel. The original workbook was kept.')
+            if not restoring and added['certificate_type'] != certificate_type:
+                raise ValueError('The certificate type could not be verified. The original workbook was kept.')
+            if not restoring and any(added.get(key) != details[key] for key in certificate_values if key in details):
+                raise ValueError('The certificate details could not be verified. The original workbook was kept.')
             # Dates can move complete inward sections. Compare contents as a
             # multiset so existing rows (including manual duplicate numbers)
             # are preserved without depending on their former row positions.
-            remaining = [batch_content(batch) for batch in checked if batch is not added]
+            def record_facts(batch):
+                content = batch_content(batch)
+                if restoring:
+                    content.update({key:batch.get(key) for key in ('issued', 'cod_no', 'cod_date', 'hdd_cod_no',
+                                    'hdd_cod_date', 'external_pdf', 'pdf_recovery_pending', 'recycling_completed',
+                                    *OPTIONAL_LABELS)})
+                return content
+            remaining = [record_facts(batch) for batch in checked if batch is not added]
             for previous in original:
-                content = batch_content(previous)
+                content = record_facts(previous)
                 if content not in remaining:
                     raise ValueError('The new Excel entry could not be verified. The original workbook was kept.')
                 remaining.remove(content)

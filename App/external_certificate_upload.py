@@ -18,7 +18,7 @@ from issuance_safety import (IssuanceTransaction, audit_records, digest_bytes, f
                              recover_issuances, workbook_receipt_conflict)
 from pdf_attachments import checked_reader
 from preview_store import cleanup_previews
-from run_certificates import (_safe_cod_name, certificate_filename, find_certificate,
+from run_certificates import (_safe_cod_name, certificate_filename, find_certificate, numbering_plan,
                               workbook_cod_ownership_issue)
 from workbook_store import WorkbookSession, stage_certificate_details
 from workflow_support import load_settings, operation_error_message, run_lock
@@ -325,13 +325,14 @@ def save_upload(root, backup_dir, body):
     elif target is not None and (not isinstance(target, dict) or target.get('plant') not in ('plant1', 'plant2')
                                  or not isinstance(target.get('sn'), str) or not target['sn'].strip()):
         raise ValueError('Choose an Excel inward.')
+    app_only = not replacing and target is None and local_parent_id is None
     with run_lock(root), ExitStack() as stack:
         recover_issuances(root)
         require_revision(root, revision)
         payload = stage.read_bytes()
         if not 0 < len(payload) <= UPLOAD_LIMIT:
             raise ValueError('Choose a PDF smaller than 50 MB.')
-        if replacing:
+        if replacing or app_only:
             checked_reader(payload)
         else:
             printed, _ = _inspect(root, payload)
@@ -449,6 +450,10 @@ def save_upload(root, backup_dir, body):
                 raise ValueError('This client already has a certificate. Select its current certificate in the client list to replace the PDF.')
         if replacing:
             cod = existing_cod
+        elif app_only:
+            inventory = scan_inventory(root, force=True)
+            cod = numbering_plan(batches, load_settings(root), root / 'Certificates',
+                                 inventory=inventory)['next_cod']
         else:
             printed_numbers = {identity(value) for value in printed}
             cod = reviewed_cod or existing_cod or (printed[0] if len(printed) == 1 else '')
@@ -517,7 +522,8 @@ def save_upload(root, backup_dir, body):
             source_kind=source_kind, plant=plant, key=identifier,
             cod=cod, issued_date=issued_date, before=source if workbook_record else old_record,
             after=details, old_paths=previous_paths, companion_source=companion, external_upload=True,
-            external_replacement=replacing, retain_existing=replacing and previous_paths[current] == digest)
+            external_replacement=replacing, retain_existing=replacing and previous_paths[current] == digest,
+            assigned_upload_cod=app_only or (replacing and bool(receipt and receipt.get('assigned_upload_cod'))))
         try:
             if replacing and {root / item['path']: item['sha256'] for item in transaction.data['previous_pdfs']} != previous_paths:
                 raise ValueError('The current PDF changed during the upload. Refresh and review it again.')

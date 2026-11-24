@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('Install', 'Setup', 'Desktop', 'Daily', 'Diagnose', 'Reschedule', 'Disable', 'Snooze', 'CancelSnooze')]
+    [ValidateSet('Install', 'Setup', 'Desktop', 'Recovery', 'Daily', 'Diagnose', 'Reschedule', 'Disable', 'Snooze', 'CancelSnooze')]
     [string]$Mode = 'Install',
     [string]$ReminderTime = '',
     [string]$SnoozeAt = ''
@@ -202,7 +202,7 @@ try {
         Write-Host "One-hour reminder scheduled for $($runAt.ToString('HH:mm')). It will wait until this user is signed in and the computer is awake; it will not wake the computer."
         exit 0
     }
-    if (-not $ReminderTime) {
+    if ($Mode -ne 'Recovery' -and -not $ReminderTime) {
         $settingsPath = Join-Path $certificateRoot 'settings.local.json'
         if (Test-Path -LiteralPath $settingsPath -PathType Leaf) {
             try {
@@ -214,7 +214,7 @@ try {
         }
         if (-not $ReminderTime) { $ReminderTime = '11:00' }
     }
-    if ($ReminderTime -notmatch '^(?:[01][0-9]|2[0-3]):[0-5][0-9]$') {
+    if ($Mode -ne 'Recovery' -and $ReminderTime -notmatch '^(?:[01][0-9]|2[0-3]):[0-5][0-9]$') {
         throw 'Reminder time must use 24-hour format, for example 11:00 or 17:30.'
     }
     if ($Mode -eq 'Reschedule') {
@@ -269,6 +269,10 @@ try {
         if ($LASTEXITCODE -ne 0) { throw 'Setup is incomplete. Ask IT to repair this Python installation.' }
         Write-Host 'Setup complete. Double-click Prepare Certificates.bat.'
         exit 0
+    }
+    if ($Mode -eq 'Recovery') {
+        & $certificatePython (Join-Path $PSScriptRoot 'recover_workspace.py')
+        exit $LASTEXITCODE
     }
     if ($Mode -eq 'Desktop') {
         $certificatePythonw = Join-Path (Split-Path $certificatePython) 'pythonw.exe'

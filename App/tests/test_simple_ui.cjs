@@ -88,10 +88,10 @@ function harness(options = {}) {
   const ui = vm.runInContext(`${source}\n({app, stateLabel, statusClass, nextStep, matches, makeActions, makeClientCell, makeDetailRow, renderFolderInventory, simpleWarning, readableNumber, detailsBody, materialWeightTotal, updateMaterialWeightTotal, renderMaterialRows, visiblePage, pastCertificateNumbers, certificateFileTitle, showSavedFile, renderPastNumbers, api, fieldDifferences, renderChangeSummary, editorDirty, saveWorkingDraft, saveDraft, readWorkingDraft, clearWorkingDraft, offerDraftRecovery, restoreWorkingDraft, requestDetailsClose, finishDraftClose, certificateUrl, showGenerationSuccess, submitGeneration, bulkGenerationPayload, openBulkGeneration, startBulkGeneration, renderEditorSummary, setEditorMode, validateEditor, finishEditing, openDetails, beginIssuedCertificateCorrection, renderIssuedChangeReview, openIssuedChangeReview, resolveIssuedExcelChanges, saveDetails, showWarnings, confirmWarnings, pickAnnexure, previewDetails, toggleFullPdfPreview, backupAction, openBackupRestore, restoreBackup, historyDifferences, loadHistory, showHistoryDetail, invalidatePreview, confirmAction, settleActionConfirmation, handleAction, wire, stopApp, summarize})`, context);
   Object.assign(ui, vm.runInContext('({savedFilePlant, savedFileUrl, savedFileMatches, setWorkspaceView, resetRecordFilters, nextWorkbookId, suggestWorkbookId, printedWeight, updatePrintedWeight, schedulePreview, saveSettings, settingsValues, openSettings, requestSettingsClose, returnFromWarnings, toast, makeStatus, reconnectDashboard, saveExcelChoice, renderTemplateEditor})',context));
   Object.assign(ui, vm.runInContext('({startInlineEdit, finishInlineEdit, syncWorkbookChanges, setState, renderWorkbookIssues, refreshState, pollReminderReview})',context));
-  Object.assign(ui, vm.runInContext('({openAddClient, renderClientMaterials, clientMaterialValues, saveClient, validateClientSerialNumber, duplicateSerialNumber, compareRows})',context));
+  Object.assign(ui, vm.runInContext('({saveClient, materialValues, duplicateSerialNumber, compareRows})',context));
   Object.assign(ui, vm.runInContext('({excelTarget, openClientInExcel})',context));
-  Object.assign(ui, vm.runInContext('({openInwardRemoval, confirmInwardRemoval, rememberDeletion, undoLastDeletion})',context));
-  Object.assign(ui, vm.runInContext('({openEntryDeletion,filterEntryDeletion,reviewEntryDeletion,confirmEntryDeletion})',context));
+  Object.assign(ui, vm.runInContext('({openInwardRemoval, confirmInwardRemoval})',context));
+  Object.assign(ui, vm.runInContext('({openEntryDeletion,openEntryRestore,filterEntryDeletion,reviewEntryDeletion,confirmEntryDeletion})',context));
   Object.assign(ui, vm.runInContext('({changeDisplay})',context));
   Object.assign(ui, vm.runInContext('({saveInwardDetails, openCompanionCertificate, updateDestructionChoice, showExcelSaveChoice})',context));
   Object.assign(ui, vm.runInContext('({noticeText, showDetailsError, warningInfo, renderWarningList, hasWarnings, needsAttention})',context));
@@ -100,32 +100,45 @@ function harness(options = {}) {
   Object.assign(ui, vm.runInContext('({updateRecordFilterButton, positionRecordFilters})',context));
   Object.assign(ui, vm.runInContext('({init})',context));
   Object.assign(ui, vm.runInContext('({changeDestructionChoice})',context));
-  Object.assign(ui, vm.runInContext('({dateLabel,normalizeDate,configureDateInput,canDeleteEntry,clientEntryPayload})',context));
+  Object.assign(ui, vm.runInContext('({dateLabel,normalizeDate,configureDateInput,canDeleteEntry})',context));
   return {ui, controls, storage, requests, window, context, closeButtons, timers, settingsInputs};
 }
 
-test('Undo deletion stays available in Settings and retries after a failed restore', async () => {
-  let attempts = 0;
-  const h = harness({fetch: async () => ({
-    ok: ++attempts > 1, status: attempts > 1 ? 200 : 400,
-    json: async () => attempts > 1 ? {undone:true} : {error:'Close the workbook in Excel and try again.'},
-  })});
-  h.ui.app.workspaceRevision = 'reviewed-revision';
-  h.ui.rememberDeletion({kind:'entries', request_id:'b'.repeat(32)});
-  h.ui.rememberDeletion({kind:'inward', request_id:'a'.repeat(32)});
-  h.ui.toast('Inward removed.', false, true);
-  assert.equal(h.controls.get('#undo-deletion-toast').hidden, false);
-  assert.equal(h.controls.get('#undo-last-deletion').hidden, false);
-  await h.ui.undoLastDeletion();
-  assert.equal(h.controls.get('#undo-last-deletion').hidden, false);
-  await h.ui.undoLastDeletion();
-  assert.equal(h.requests[1].endpoint, '/api/entries/undo-delete');
-  assert.equal(h.requests[1].payload.request_id, 'a'.repeat(32));
-  assert.equal(h.controls.get('#undo-last-deletion').hidden, false);
-  await h.ui.undoLastDeletion();
-  assert.equal(h.requests[2].payload.request_id, 'b'.repeat(32));
-  assert.equal(h.controls.get('#undo-last-deletion').hidden, true);
-  assert.equal(h.storage.has('ecoreco-last-deletion'), false);
+test('Restore uses the searchable entry checklist and requires review and confirmation', async () => {
+  const at = '2026-01-01T12:00:00+00:00';
+  const restore_until = '2026-01-31T12:00:00+00:00';
+  const acme = {supplier:'Acme', source_kind:'workbook', plant:'plant1', sn:'17', materials:1};
+  const companion = {supplier:'Companion', source_kind:'manual', plant:null, certificate_type:'destruction'};
+  const history = [{kind:'inward', request_id:'a'.repeat(32), at, restore_until, entries:[{...acme, supplier:'Other'}],
+    restore_blocked:'The workbook has changed.'},
+    {kind:'entries', request_id:'b'.repeat(32), at, restore_until, entries:[acme, companion], restore_blocked:''}];
+  const h = harness({fetch:async endpoint => {
+    if (endpoint.endsWith('restore-choices')) return {ok:true,json:async () => ({rows:history})};
+    if (endpoint.endsWith('restore-preview')) {
+      return {ok:true,json:async () => ({review:{entries:[acme, companion]}, review_token:'restore-token'})};
+    }
+    return {ok:true,json:async () => ({restored:2, remaining:0})};
+  }});
+  await h.ui.openEntryRestore();
+  assert.equal(h.controls.get('#entry-deletion-title').textContent, 'Restore deleted entries');
+  assert.equal(deletionChoices(h)[0].children[0].disabled, true);
+  assert.match(text(deletionChoices(h)[1]), /Restore by/);
+  h.controls.get('#entry-delete-search').value = 'companion';
+  h.ui.filterEntryDeletion();
+  assert.equal(deletionChoices(h).length, 1);
+  const input = deletionChoices(h)[0].children[0];
+  input.checked = true;
+  input.dispatch('change');
+  await h.ui.reviewEntryDeletion();
+  assert.match(text(h.controls.get('#entry-delete-review-list')), /Acme.*Companion/);
+  assert.deepEqual(h.requests[1].payload.selected, [{kind:'entries', request_id:'b'.repeat(32)}]);
+  await h.ui.confirmEntryDeletion();
+  assert.equal(h.requests.length, 2);
+  h.controls.get('#entry-delete-checked').checked = true;
+  await h.ui.confirmEntryDeletion();
+  assert.equal(h.requests[2].endpoint, '/api/entries/restore');
+  assert.equal(h.requests[2].payload.review_token, 'restore-token');
+  assert.match(h.controls.get('#toast-message').textContent, /2 entries restored/);
 });
 
 test('Saved certificates filter by the same certificate types as Companies', () => {
@@ -169,82 +182,167 @@ test('Saved filters have their own removable chips, count and toolbar reset', ()
   assert.equal(h.controls.get('#plant-filter').value, 'plant1');
 });
 
-test('Inward search narrows large lists and requires an exact plant and SN selection', () => {
-  for (const id of ['upload-inward']) {
-    const h = harness();
-    uploadForm(h);
-    h.controls.get('#external-upload-target').value = 'workbook';
-    const picker = vm.runInContext('uploadInwardPicker', h.context);
-    const input = h.controls.get(`#${id}`);
-    const list = h.controls.get(`#${id}-options`);
-    const rows = Array.from({length:350}, (_, index) => ({supplier:`Client ${index}`, plant:'plant1', sn:index}));
-    const target = {supplier:'Northstar Electronics', plant:'plant2', sn:'349'};
-    rows[349].supplier = target.supplier;
-    picker.update([...rows, target]);
-    input.dispatch('focus');
-    assert.equal(list.children.length, 12);
-    input.value = 'northstar 349 plant 2';
-    input.dispatch('input');
-    assert.equal(list.children.length, 1);
-    assert.match(text(list.children[0]), /Northstar Electronics.*Plant 2.*SN 349/);
-    assert.equal(picker.selection(), null);
-    assert.equal(input.checkValidity(), false);
-    input.dispatch('keydown', {key:'ArrowDown', preventDefault() {}});
-    assert.equal(input.getAttribute('aria-activedescendant'), list.children[0].id);
-    input.dispatch('keydown', {key:'Enter', preventDefault() {}});
-    assert.deepEqual({...picker.selection()}, {plant:'plant2', sn:'349'});
-    assert.equal(input.checkValidity(), true);
-    assert.equal(list.hidden, true);
-    input.value = 'unknown company';
-    input.dispatch('input');
-    assert.equal(picker.selection(), null);
-    assert.equal(h.controls.get(`#${id}-results`).textContent, 'No matching inwards.');
-  }
-});
-
 function uploadForm(h) {
   const form = h.controls.get('#upload-certificate-form');
-  const names = ['cod_date', 'certificate_type', ...vm.runInContext('uploadDetailFields', h.context)];
-  const fields = Object.fromEntries(names.map(name => [name, new Node('input')]));
+  const fields = Object.fromEntries(['certificate_type', 'cod_date', 'supplier', 'location',
+    'inward_date', 'reference', 'form6', 'certificate_weight'].map(name => [name, new Node('input')]));
   form.elements = {namedItem:name => fields[name]};
-  Object.defineProperty(form, 'values', {get:() => Object.fromEntries(Object.entries(fields).map(([name, field]) => [name, field.value]))});
+  form.reset = () => { for (const field of Object.values(fields)) field.value = ''; };
+  Object.defineProperty(form, 'values', {get:() => {
+    const local = !h.controls.get('#upload-company-fields').disabled;
+    const names = local ? Object.keys(fields) : ['cod_date'];
+    return Object.fromEntries(names.map(name => [name, fields[name].value]));
+  }});
+  h.controls.get('#external-upload-file').files = [];
   return {form, fields};
 }
 
-test('Replacement accepts a used PDF and leaves the selected filename and COD to the server', async () => {
-  const h = harness({fetch:async () => ({ok:false, status:400, json:async () => ({error:'Test response'})})});
-  const {form} = uploadForm(h);
-  h.controls.get('#upload-company-fields').querySelector = () => new Node('legend');
-  const {updateUploadTarget, updateUploadCod, saveUploadedCertificate} = vm.runInContext(
-    '({updateUploadTarget, updateUploadCod, saveUploadedCertificate})', h.context);
-  h.ui.app.state.rows = [
-    {supplier:'Client', source_kind:'manual', record_id:'hdd', certificate_type:'destruction',
-      certificate_status:'generated', certificate_no:'0788', pdf_relative_path:'0788_Client_hdd.pdf'},
-  ];
-  h.controls.get('#external-upload-target').value = 'workbook';
-  updateUploadTarget(true);
-  const input = h.controls.get('#upload-inward');
-  input.value = '0788';
-  input.dispatch('input');
-  h.controls.get('#upload-inward-options').children[0].dispatch('click');
+function reviewUpload(h, row, template = row.certificate_type || 'standard') {
+  h.ui.app.editor = {sourceRow:row, template, noCertificate:row.certificate_status === 'na',
+    destructionSource:row.destruction_source, workspaceRevision:'reviewed-revision'};
+  return vm.runInContext('reviewUploadSlot()', h.context);
+}
+
+async function submitUpload(h, form, facts) {
   const file = {};
   h.controls.get('#external-upload-file').files = [file];
-  const submit = h.controls.get('#save-uploaded-certificate');
-  const note = h.controls.get('#upload-attached-auto-note');
-  const event = {currentTarget:form, preventDefault() {}};
-  for (const detection of [{cod:'009', cod_source:'pdf', printed_cods:['009']},
-    {cod:'9999', cod_source:'filename', printed_cods:[]}]) {
-    h.ui.app.uploadedFile = {token:'uploaded', file, previously_used:true, ...detection};
-    updateUploadCod();
-    assert.equal(note.textContent, detection.cod_source === 'pdf' ? 'COD on the uploaded PDF · 009' : '');
-    assert.equal(note.hidden, detection.cod_source !== 'pdf');
-    assert.match(h.controls.get('#upload-replacement-note').textContent, /keeps its filename and COD 0788/);
-    assert.equal(h.controls.get('#upload-duplicate-alert').hidden, true);
-    assert.equal(submit.disabled, false);
-    await saveUploadedCertificate(event);
-    assert.equal(h.requests.at(-1).payload.details.cod_no, undefined);
-    assert.equal(h.requests.at(-1).payload.replacement.record_id, 'hdd');
-  }
+  h.ui.app.uploadedFile = {token:'uploaded', file, ...facts};
+  vm.runInContext('updateUploadCod()', h.context);
+  await vm.runInContext('saveUploadedCertificate', h.context)({currentTarget:form, preventDefault() {}});
+  return h.requests.at(-1).payload;
+}
+
+test('Review upload uses the open plant and SN even when another plant shares the SN', async () => {
+  const h = harness({fetch:async () => ({ok:false, status:400, json:async () => ({error:'Check the PDF.'})})});
+  const {form, fields} = uploadForm(h);
+  const row = {supplier:'Client', plant:'plant2', sn:'12', certificate_status:'ready', certificate_type:'sita'};
+  h.ui.app.state.rows = [{...row, plant:'plant1'}, row];
+  assert.equal(reviewUpload(h, row, 'siemens'), null);
+  const slot = reviewUpload(h, row);
+  vm.runInContext('openUploadCertificate', h.context)({slot});
+  assert.match(h.controls.get('#upload-destination').textContent, /Client.*International.*Plant 2.*SN 12/);
+  assert.equal(h.controls.has('#upload-inward'), false);
+  fields.cod_date.value = '04/11/26';
+  const payload = await submitUpload(h, form, {cod:'0456', cod_source:'pdf'});
+  assert.deepEqual(payload, {token:'uploaded', details:{cod_date:'04/11/26', cod_no:'0456'},
+    inward:{plant:'plant2', sn:'12', certificate_type:'sita'}, replacement:null,
+    expected_revision:'reviewed-revision'});
+});
+
+test('Review upload uses the HDD request and replaces only its existing PDF once issued', async () => {
+  const h = harness({fetch:async () => ({ok:false, status:400, json:async () => ({error:'Check the PDF.'})})});
+  const {form, fields} = uploadForm(h);
+  const parent = {supplier:'Client', plant:'plant1', sn:35, certificate_status:'ready'};
+  const request = {supplier:'Client', plant:'plant1', record_id:'a'.repeat(32), source_kind:'manual',
+    certificate_type:'destruction', certificate_status:'blank', destruction_requested:true,
+    destruction_source:{plant:'plant1', case_id:'35'}};
+  h.ui.app.state.rows = [parent, request];
+  assert.equal(reviewUpload(h, {...request, destruction_requested:false}), null);
+  assert.equal(reviewUpload(h, {...request, certificate_status:'na'}), null);
+  const open = vm.runInContext('openUploadCertificate', h.context);
+  open({slot:reviewUpload(h, request)});
+  fields.cod_date.value = '05/11/26';
+  const attached = await submitUpload(h, form, {cod:'0788'});
+  assert.deepEqual(attached.inward, {plant:'plant1', sn:'35', certificate_type:'destruction'});
+  h.controls.get('#upload-certificate-modal').close();
+
+  open({slot:reviewUpload(h, {...request, certificate_status:'generated_manual', certificate_no:'0788',
+    certificate_date:'2026-11-05', pdf_relative_path:'0788_Client_HDD.pdf'})});
+  assert.equal(fields.cod_date.value, '05/11/26');
+  assert.match(h.controls.get('#upload-replacement-note').textContent, /Keeps COD 0788/);
+  const replaced = await submitUpload(h, form, {cod:'009', printed_cods:['009'], previously_used:true});
+  assert.equal(h.controls.get('#upload-duplicate-alert').hidden, true);
+  assert.equal(replaced.details.cod_no, undefined);
+  assert.deepEqual(replaced.replacement, {record_id:request.record_id, certificate_type:'destruction'});
+});
+
+test('New offers direct save actions and uploads with the details already entered', async () => {
+  const h = harness({fetch:async () => ({ok:true, json:async () => ({state:{rows:[]}, certificate_no:'0101'})})});
+  const form = newEntry(h);
+  const {form:upload, fields} = uploadForm(h);
+  Object.assign(form.values, {supplier:'Typed client', location:'Pune', inward_date:'01/05/26',
+    reference:'TYPED-REF', form6:'F6-27', certificate_weight:'48', use_certificate_weight:true,
+    certificate_type:'siemens'});
+  h.ui.app.editor.template = 'siemens';
+  h.ui.app.editor.fields.siemens = {model_name:'Scanner'};
+  h.ui.app.workspaceRevision = 'current-revision';
+  h.ui.wire();
+  vm.runInContext('updateSourceControls()', h.context);
+  const preview = h.controls.get('#editor-review');
+  const openPreview = h.controls.get('#open-new-preview');
+  const create = h.controls.get('#save-details');
+  const requestHdd = h.controls.get('#new-hdd-needed');
+  requestHdd.checked = true;
+  assert.equal(preview.hidden, true);
+  assert.equal(h.controls.get('#details-title').textContent, 'Add client to Excel');
+  assert.equal(h.controls.get('#material-options').parentElement, h.controls.get('#new-client-secondary-fields'));
+  assert.equal(h.controls.get('#template-editor').parentElement, h.controls.get('#new-client-secondary-template-slot'));
+  assert.equal(h.controls.get('#editor-reference-field').parentElement, h.controls.get('#new-client-reference-slot'));
+  assert.equal(h.controls.get('#add-new-inward').hidden, false);
+  assert.equal(h.controls.get('#add-new-inward').textContent, 'Add to Plant 1 Excel');
+  assert.equal(openPreview.hidden, false);
+  assert.equal(create.hidden, true);
+  h.ui.schedulePreview();
+  assert.equal([...h.timers.values()].some(timer => timer.delay === 1000), false);
+  openPreview.dispatch('click');
+  assert.equal(preview.hidden, false);
+  assert.equal(h.controls.get('#material-options').parentElement, h.controls.get('#editor-material-slot'));
+  assert.equal(h.controls.get('#new-client-secondary-fields').hidden, true);
+  assert.equal(h.controls.get('#template-editor').parentElement, h.controls.get('#editor-template-slot'));
+  assert.equal(openPreview.hidden, true);
+  assert.equal(create.hidden, false);
+  assert.equal(create.textContent, 'Create PDF and save to Excel');
+  assert.equal(h.requests.length, 0);
+  assert.equal([...h.timers.values()].some(timer => timer.delay === 1000), true);
+  h.controls.get('#hide-new-preview').dispatch('click');
+  assert.equal(preview.hidden, true);
+  assert.equal(create.hidden, true);
+  assert.equal([...h.timers.values()].some(timer => timer.delay === 1000), false);
+  assert.equal(form.values.supplier, 'Typed client');
+  assert.equal(requestHdd.checked, true);
+  const button = h.controls.get('#upload-editor-certificate');
+  assert.equal(button.hidden, true);
+  button.dispatch('click');
+  assert.equal(Boolean(h.controls.get('#upload-certificate-modal').open), false);
+  const chooseDestination = value => {
+    form.values.source_kind = value;
+    form.dispatch('change', {target:{name:'source_kind', value}});
+  };
+  chooseDestination('manual');
+  assert.equal(button.hidden, false);
+  assert.equal(h.controls.get('#template-editor').parentElement, h.controls.get('#new-client-secondary-template-slot'));
+  chooseDestination('workbook');
+  assert.equal(button.hidden, true);
+  chooseDestination('manual');
+  assert.equal(button.textContent, 'Upload app-only certificate');
+  button.dispatch('click');
+  assert.equal(h.controls.get('#upload-certificate-modal').open, true);
+  assert.equal(h.controls.get('#upload-company-fields').hidden, true);
+  assert.equal(h.controls.get('#upload-type-field').hidden, true);
+  assert.equal(Boolean(h.controls.get('#unsaved-modal').open), false);
+  assert.equal(form.values.source_kind, 'manual');
+  h.closeButtons.find(button => button.dataset.close === 'upload-certificate-modal').dispatch('click');
+  assert.equal(form.values.location, 'Pune');
+  form.values.location = 'Mumbai';
+  button.dispatch('click');
+  fields.cod_date.value = '05/11/26';
+  const payload = await submitUpload(h, upload, {cod:'9999', cod_source:'pdf'});
+  assert.equal(h.requests.at(-1).endpoint, '/api/certificates/save-upload');
+  assert.equal(payload.details.certificate_type, 'siemens');
+  assert.equal(payload.details.supplier, 'Typed client');
+  assert.equal(payload.details.location, 'Mumbai');
+  assert.equal(payload.details.inward_date, '2026-05-01');
+  assert.equal(payload.details.reference, 'TYPED-REF');
+  assert.equal(payload.details.form6, 'F6-27');
+  assert.equal(payload.details.certificate_weight, '48');
+  assert.equal(payload.details.certificate_fields.model_name, 'Scanner');
+  assert.equal(payload.details.cod_date, '05/11/26');
+  assert.equal(payload.details.case_id, undefined);
+  assert.equal(payload.details.cod_no, undefined);
+  assert.equal(payload.inward, null);
+  assert.equal(payload.expected_revision, 'current-revision');
+  assert.equal(h.controls.get('#details-modal').open, false);
+  assert.equal(h.ui.app.workspaceView, 'files');
 });
 
 test('Starting COD is a generation input and not an inward Excel change', () => {
@@ -255,81 +353,6 @@ test('Starting COD is a generation input and not an inward Excel change', () => 
   assert.equal(excelFieldDifferences(before, after).length, 0);
   assert.deepEqual(Array.from(excelFieldDifferences(before,
     {...after, details:{supplier:'Harbor Labs Annex'}}), change => change.key), ['supplier']);
-});
-
-test('Upload offers Data Destruction for a saved request and submits its Excel serial number', async () => {
-  const h = harness({fetch:async () => ({ok:false, status:400, json:async () => ({error:'Check the PDF.'})})});
-  const {form, fields} = uploadForm(h);
-  const legend = new Node('legend');
-  h.controls.get('#upload-company-fields').querySelector = () => legend;
-  const {updateUploadTarget, saveUploadedCertificate, uploadCandidates} = vm.runInContext(
-    '({updateUploadTarget, saveUploadedCertificate, uploadCandidates})', h.context);
-  const inward = {supplier:'Amazon', plant:'plant1', sn:35, certificate_status:'ready'};
-  const request = {supplier:'Amazon HDD', plant:'plant1', record_id:'a'.repeat(32), source_kind:'manual',
-    certificate_type:'destruction', certificate_status:'blank', destruction_requested:true,
-    destruction_source:{plant:'plant1', case_id:'35'}, raw_details:{location:'HDD site'}};
-  const types = () => Array.from(uploadCandidates(), row => row.upload_certificate_type);
-  h.ui.app.state.rows = [inward];
-  assert.deepEqual(types(), ['standard']);
-  h.ui.app.state.rows = [inward, {...request, destruction_requested:false}];
-  assert.deepEqual(types(), ['standard']);
-  h.ui.app.state.rows = [inward, {...request, certificate_status:'na'}];
-  assert.deepEqual(types(), ['standard']);
-  h.ui.app.state.rows = [inward, request];
-  assert.deepEqual(types(), ['standard', 'destruction']);
-
-  h.controls.get('#external-upload-target').value = 'workbook';
-  updateUploadTarget(true);
-  h.controls.get('#upload-inward').dispatch('focus');
-  h.controls.get('#upload-inward-options').children[1].dispatch('click');
-  assert.equal(fields.location.value, 'HDD site');
-  const file = {};
-  h.controls.get('#external-upload-file').files = [file];
-  h.ui.app.uploadedFile = {token:'uploaded', file, cod:'0006'};
-  fields.cod_date.value = '17/11/26';
-  await saveUploadedCertificate({currentTarget:form, preventDefault() {}});
-  assert.deepEqual(h.requests.at(-1).payload.inward, {plant:'plant1', sn:'35', certificate_type:'destruction'});
-
-  h.ui.app.state.rows = [inward, {...request, certificate_status:'generated_manual',
-    certificate_no:'0006', pdf_relative_path:'0006.pdf'}];
-  const existing = uploadCandidates().filter(row => row.upload_certificate_type === 'destruction');
-  assert.equal(existing.length, 1);
-  assert.equal(existing[0].upload_replacement, true);
-  assert.equal(existing[0].upload_target.record_id, request.record_id);
-});
-
-test('Upload finds existing CODs and uses the inward COD for a scan without readable text', async () => {
-  const h = harness({fetch:async () => ({ok:false, status:400, json:async () => ({error:'Check the PDF.'})})});
-  const {form, fields} = uploadForm(h);
-  h.controls.get('#upload-company-fields').querySelector = () => new Node('legend');
-  const {updateUploadTarget, saveUploadedCertificate} = vm.runInContext(
-    '({updateUploadTarget, saveUploadedCertificate})', h.context);
-  h.ui.app.state.rows = [
-    {supplier:'Same client', plant:'plant1', sn:'10', certificate_status:'generated_manual', certificate_no:'0456'},
-    {supplier:'Same client', plant:'plant2', sn:'11', certificate_status:'completed', certificate_no:'0457',
-      pdf_relative_path:'0457.pdf'},
-    {supplier:'Missing PDF', plant:'plant2', sn:'12', certificate_status:'ready', certificate_no:'0458',
-      has_issued_certificate:true},
-  ];
-  h.controls.get('#external-upload-target').value = 'workbook';
-  updateUploadTarget(true);
-  const input = h.controls.get('#upload-inward');
-  const options = h.controls.get('#upload-inward-options');
-  input.value = '0458'; input.dispatch('input');
-  assert.equal(options.children.length, 0);
-  input.value = '0457'; input.dispatch('input');
-  assert.equal(options.children.length, 1);
-  assert.match(text(options.children[0]), /Replace existing PDF.*COD 0457/);
-  input.value = '0456'; input.dispatch('input');
-  options.children[0].dispatch('click');
-  const file = {};
-  h.controls.get('#external-upload-file').files = [file];
-  fields.cod_date.value = '17/11/26';
-  for (const detection of [{}, {cod:'2026', cod_source:'filename'}, {cod:'0999', cod_source:'pdf'}]) {
-    h.ui.app.uploadedFile = {token:'uploaded', file, ...detection};
-    await saveUploadedCertificate({currentTarget:form, preventDefault() {}});
-    assert.equal(h.requests.at(-1).payload.details.cod_no, detection.cod_source === 'pdf' ? '0999' : '0456');
-  }
 });
 
 test('An HDD tracking warning is shown as a tracking issue rather than a sorting issue', () => {
@@ -343,135 +366,6 @@ test('An HDD tracking warning is shown as a tracking issue rather than a sorting
   assert.doesNotMatch(output.textContent, /sort dates/i);
 });
 
-test('Attach to a client replaces the matching issued certificate and keeps its COD', async () => {
-  const h = harness({fetch:async () => ({ok:false, status:400, json:async () => ({error:'Check the PDF.'})})});
-  const mode = h.controls.get('#external-upload-target');
-  const input = h.controls.get('#upload-inward');
-  const options = h.controls.get('#upload-inward-options');
-  const {form, fields} = uploadForm(h);
-  const {updateUploadTarget, saveUploadedCertificate} = vm.runInContext('({updateUploadTarget, saveUploadedCertificate})', h.context);
-  h.ui.app.workspaceRevision = 'reviewed-revision';
-  h.ui.app.state.rows = [
-    {supplier:'Client', plant:'plant1', sn:'12', certificate_status:'ready'},
-    {supplier:'Client', plant:'plant2', sn:'12', certificate_status:'completed',
-      certificate_type:'siemens', certificate_no:'0456', certificate_date:'2026-11-05',
-      pdf_relative_path:'Auto Generated/0456_Client.pdf', reference:'Excel reference', location:'Excel site',
-      last_certificate_details:{supplier:'Name on certificate', reference:'PDF reference', certificate_weight:'8.075'}},
-
-  ];
-  mode.value = 'workbook';
-  updateUploadTarget(true);
-  assert.equal(h.controls.get('#upload-inward-label').textContent, 'Client');
-  input.dispatch('focus');
-  input.value = '0456'; input.dispatch('input');
-  assert.equal(options.children.length, 1);
-  assert.match(text(options.children[0]), /Plant 2.*SN 12.*COD 0456/);
-  options.children[0].dispatch('click');
-  assert.equal(h.controls.get('#upload-cod').value, '0456');
-  assert.equal(fields.cod_date.value, '05/11/26');
-  assert.equal(fields.certificate_type.value, 'siemens');
-  assert.equal(fields.certificate_type.disabled, true);
-  assert.equal(h.controls.get('#upload-company-fields').hidden, false);
-  assert.equal(fields.supplier.value, 'Name on certificate');
-  assert.equal(fields.reference.value, 'PDF reference');
-  assert.equal(fields.certificate_weight.value, '8.075');
-  fields.reference.value = '';
-  fields.location.value = 'Revised site';
-  assert.equal(h.controls.get('#save-uploaded-certificate').textContent, 'Replace PDF');
-  const file = {};
-  h.controls.get('#external-upload-file').files = [file];
-  h.ui.app.uploadedFile = {token:'uploaded', file, cod:'0456'};
-  await saveUploadedCertificate({currentTarget:form, preventDefault() {}});
-  assert.deepEqual(h.requests[0].payload, {
-    token:'uploaded', details:{cod_date:'05/11/26'},
-    inward:null, replacement:{plant:'plant2', sn:'12'},
-    certificate_edits:{supplier:'Name on certificate', location:'Revised site', inward_date:'',
-      reference:'', form6:'', certificate_weight:'8.075'},
-    expected_revision:'reviewed-revision',
-  });
-  assert.equal(h.controls.get('#upload-certificate-error').textContent, 'Check the PDF.');
-});
-
-test('Upload PDF prefills the chosen inward and preserves edited fields when data refreshes', async () => {
-  const h = harness({fetch:async () => ({ok:false, status:400, json:async () => ({error:'Check the PDF.'})})});
-  const {form, fields} = uploadForm(h);
-  const mode = h.controls.get('#external-upload-target');
-  const input = h.controls.get('#upload-inward');
-  const options = h.controls.get('#upload-inward-options');
-  const {updateUploadTarget, saveUploadedCertificate} = vm.runInContext('({updateUploadTarget, saveUploadedCertificate})', h.context);
-  h.ui.app.workspaceRevision = 'reviewed-revision';
-  const inward = {supplier:'Client', plant:'plant1', sn:'12', certificate_status:'ready', location:'Pune',
-    reference:'REF-12', form6:'F6-12', inward_date:'2026-11-03', certificate_type:'sita', items:[{item:'Laptops', quantity:3, weight:4.5}]};
-  h.ui.app.state.rows = [inward, {supplier:'Second', plant:'plant2', sn:'12', certificate_status:'ready'}];
-  mode.value = 'workbook';
-  updateUploadTarget(true);
-  assert.equal(h.controls.get('#upload-company-fields').hidden, true);
-  input.dispatch('focus');
-  options.children[0].dispatch('click');
-  assert.equal(fields.supplier.value, 'Client');
-  assert.equal(fields.certificate_type.value, 'sita');
-  assert.equal(fields.cod_date.value, '');
-  assert.equal(fields.inward_date.value, '03/11/26');
-  assert.equal(fields.reference.value, 'REF-12');
-  assert.equal(fields.form6.value, 'F6-12');
-  assert.match(text(h.controls.get('#upload-materials-list')), /Laptops.*Qty 3.*4.5 kg/);
-  fields.reference.value = 'Changed reference';
-  fields.cod_date.value = '04/11/26';
-  h.ui.app.state.rows[0] = {...inward, location:'Pune - updated'};
-  updateUploadTarget();
-  assert.equal(fields.location.value, 'Pune - updated');
-  assert.equal(fields.reference.value, 'Changed reference');
-  assert.equal(fields.cod_date.value, '04/11/26');
-  const file = {};
-  h.controls.get('#external-upload-file').files = [file];
-  h.ui.app.uploadedFile = {token:'uploaded', file, cod:'0456', reference:'PDF reference'};
-  await saveUploadedCertificate({currentTarget:form, preventDefault() {}});
-  assert.deepEqual(h.requests.at(-1).payload, {
-    token:'uploaded', details:{certificate_type:'sita', cod_date:'04/11/26'},
-    inward:{plant:'plant1', sn:'12'}, replacement:null,
-    certificate_edits:{supplier:'Client', location:'Pune - updated', inward_date:'03/11/26',
-      reference:'Changed reference', form6:'F6-12', certificate_weight:''}, expected_revision:'reviewed-revision',
-  });
-  input.dispatch('focus');
-  options.children[1].dispatch('click');
-  assert.equal(fields.supplier.value, 'Second');
-  assert.equal(fields.reference.value, '');
-  assert.equal(fields.cod_date.value, '');
-  assert.equal(h.controls.get('#upload-materials').hidden, true);
-});
-
-test('Upload PDF displays automatic CODs and leaves assignment to the save request', async () => {
-  const h = harness({fetch:async () => ({ok:false, status:400, json:async () => ({error:'Check the PDF.'})})});
-  const html = fs.readFileSync(path.join(__dirname, '../web/index.html'), 'utf8');
-  const codField = html.match(/<textarea id="upload-cod"[^>]*>/)[0];
-  assert.match(codField, /\breadonly\b/);
-  assert.doesNotMatch(codField, /\bname=/);
-  const form = h.controls.get('#upload-certificate-form');
-  form.values = {certificate_type:'standard', cod_date:'05/11/26', supplier:'Client'};
-  form.elements = {namedItem:name => ({value:form.values[name]})};
-  h.controls.get('#external-upload-target').value = 'local';
-  h.ui.app.state.numbering = {next_cod:'0456'};
-  h.ui.app.workspaceRevision = 'reviewed-revision';
-  const file = {};
-  h.controls.get('#external-upload-file').files = [file];
-  const {updateUploadCod, saveUploadedCertificate} = vm.runInContext('({updateUploadCod, saveUploadedCertificate})', h.context);
-  for (const [printed, shown] of [['0423', '0423'], ['', '']]) {
-    h.ui.app.uploadedFile = {token:'uploaded', file, cod:printed};
-    updateUploadCod();
-    assert.equal(h.controls.get('#upload-cod').value, shown);
-    assert.equal(h.controls.get('#upload-cod').readOnly, Boolean(printed));
-    if (!printed) assert.equal(h.controls.get('#upload-cod').placeholder, '0456');
-    await saveUploadedCertificate({currentTarget:form, preventDefault() {}});
-    assert.deepEqual(h.requests.at(-1).payload, {
-      token:'uploaded', details:form.values, inward:null, replacement:null,
-      expected_revision:'reviewed-revision',
-    });
-  }
-  h.controls.get('#upload-cod').value = '0424';
-  await saveUploadedCertificate({currentTarget:form, preventDefault() {}});
-  assert.equal(h.requests.at(-1).payload.details.cod_no, '0424');
-});
-
 test('App dates display DD/MM/YY and submit the correct ISO day', () => {
   const h=harness(),form=editing(h);
   assert.equal(h.ui.dateLabel('2026-11-02'),'02/11/26');
@@ -483,17 +377,16 @@ test('App dates display DD/MM/YY and submit the correct ISO day', () => {
   const input=new Node('input');input.value='2026-11-02';h.ui.configureDateInput(input);
   assert.equal(input.type,'text');assert.equal(input.value,'02/11/26');
   input.value='31/02/26';input.dispatch('input');assert.equal(input.checkValidity(),false);
-  const entry=clientEntry(h);entry.form.values.inward_date='02/11/26';
-  assert.equal(h.ui.clientEntryPayload(entry.form).details.inward_date,'2026-11-02');
 });
 
-test('Add client ignores outside clicks and retains its fields until explicitly closed', () => {
-  const h=harness(),{form}=clientEntry(h);h.ui.wire();h.ui.openAddClient();
-  form.values.supplier='Still entering this client';
-  const modal=h.controls.get('#add-client-modal');modal.dispatch('click',{clientX:-10,clientY:-10});
-  assert.equal(modal.open,true);assert.equal(form.values.supplier,'Still entering this client');
-  h.closeButtons.find(button=>button.dataset.close==='add-client-modal').dispatch('click');
-  assert.equal(modal.open,false);h.ui.openAddClient();assert.equal(form.values.supplier,'Still entering this client');
+test('New ignores outside clicks and asks before discarding entered details', () => {
+  const h = harness(), form = newEntry(h); h.ui.wire();
+  form.values.supplier = 'Still entering this client';
+  h.controls.get('#details-modal').dispatch('click', {clientX:-10,clientY:-10});
+  assert.equal(h.controls.get('#details-modal').open,true);
+  assert.equal(form.values.supplier,'Still entering this client');
+  h.closeButtons.find(button=>button.dataset.close==='details-modal').dispatch('click');
+  assert.equal(h.controls.get('#unsaved-modal').open,true);
 });
 
 test('Deletion stays available before generation and remains blocked by recycling or HDD issuance', () => {
@@ -647,12 +540,10 @@ test('Details to finish includes N/A inwards when office details are missing', (
 test('The four inward fields remain visible in Add client and directly inside Review & edit', () => {
   const html=fs.readFileSync(path.join(__dirname,'../web/index.html'),'utf8');
   const editor=html.slice(html.indexOf('id="details-modal"'),html.indexOf('id="excel-save-modal"'));
-  const intake=html.slice(html.indexOf('id="add-client-modal"'));
   for(const key of ['comments','transporter_details','docket_vehicle_no','weight_slip_scale']) {
-    assert.ok(editor.includes(`name="${key}"`)); assert.ok(intake.includes(`name="${key}"`));
+    assert.ok(editor.includes(`name="${key}"`));
   }
   assert.doesNotMatch(editor,/<details[^>]*id="editor-inward-details"|followup-modal|editor-fill-details/);
-  assert.doesNotMatch(intake,/Fill later/);
 });
 
 function inlineInward(h, issued=true) {
@@ -730,22 +621,29 @@ const deletionSearchRows = [
   {source_kind:'manual',plant:'plant1',record_id:'local-test',supplier:'International client',certificate_no:'0214',certificate_status:'ready'}
 ];
 
-test('Ungenerated-entry deletion is inside collapsed Settings Advanced and uses a searchable checklist', () => {
+const deletionSearchResponse = (rows = deletionSearchRows) => ({
+  ok:true, json:async () => ({rows, workspace_revision:'search-review'}),
+});
+const deletionChoices = h => h.controls.get('#entry-delete-choices').children;
+
+test('Ungenerated-entry deletion is inside collapsed Settings Advanced and uses a searchable checklist', async () => {
   const html=fs.readFileSync(path.join(__dirname,'../web/index.html'),'utf8');
-  assert.match(html,/<details class="technical-details"><summary>Advanced<\/summary>[\s\S]*?id="open-entry-deletion"/);
-  const h=harness();h.ui.app.state={rows:deletionSearchRows,workspace_revision:'search-review'};
-  h.ui.openEntryDeletion();
-  assert.equal(h.ui.app.entryDeletion.rows.length,3);
+  assert.match(html,/<details class="technical-details" id="entry-deletion-settings"><summary>Advanced<\/summary>[\s\S]*?id="open-entry-deletion"/);
+  const protectedRow = {...deletionSearchRows[1], sn:'21', supplier:'Protected company', deletion_blocked:'Certificate already generated'};
+  const h=harness({fetch:async () => deletionSearchResponse([...deletionSearchRows, protectedRow])});
+  await h.ui.openEntryDeletion();
+  assert.equal(h.ui.app.entryDeletion.rows.length,4);
+  assert.equal(deletionChoices(h)[3].children[0].disabled,true);
   assert.equal(h.ui.app.entryDeletion.checked.size,0);
   assert.equal(h.controls.get('#entry-delete-preview').disabled,true);
   assert.doesNotMatch(html, /id="entry-delete-hdd"/);
   assert.equal(h.controls.get('#entry-delete-search').focused,true);
   for(const query of ['acme','17','0212','REF-ALPHA','F6-OLD','mumbai','ready acme']){
     h.controls.get('#entry-delete-search').value=query;h.ui.filterEntryDeletion();
-    assert.equal(h.ui.app.entryDeletion.labels.filter(label=>!label.hidden).length,1,query);
-    assert.equal(h.ui.app.entryDeletion.labels[0].hidden,false);
+    assert.equal(deletionChoices(h).length,1,query);
+    assert.match(text(deletionChoices(h)[0]), /Acme Medical/);
   }
-  assert.equal(h.requests.length,0);
+  assert.equal(h.requests[0].endpoint,'/api/entries/deletion-choices');
 });
 
 test('Settings no longer offers old-history cleanup or exposes its endpoint', () => {
@@ -768,7 +666,7 @@ test('Inward deletion keeps the Advanced checklist hidden until its review is re
   const h=harness({fetch:async()=>new Promise(resolve=>{finishPreview=()=>resolve({ok:true,json:async()=>({
     review:{entries:[{plant:'plant1',sn:'17',supplier:'Acme Medical',cod:'0212',materials:1}],pdfs:[],kept_hdd:[]},review_token:'review-token'})});})});
   h.ui.app.state={rows:deletionSearchRows,workspace_revision:'search-review'};
-  h.ui.openEntryDeletion({showDialog:false});
+  await h.ui.openEntryDeletion({onlyRow:deletionSearchRows[0]});
   h.ui.app.entryDeletion.checked.add(0);
   assert.equal(Boolean(h.controls.get('#entry-deletion-modal').open),false,'no searchable Settings dialog should flash');
   const pending=h.ui.reviewEntryDeletion();
@@ -782,64 +680,67 @@ test('Inward deletion keeps the Advanced checklist hidden until its review is re
 
 test('Deletion lists HDD separately and the inward shortcut reviews only that inward', async () => {
   const review={entries:[], pdfs:[], kept_hdd:[{supplier:'Acme Medical'}]};
-  const h=harness({fetch:async()=>({ok:true,json:async()=>({review,review_token:'token'})})});
+  const h=harness({fetch:async endpoint=>endpoint.endsWith('deletion-choices')
+    ? deletionSearchResponse(h.ui.app.state.rows) : {ok:true,json:async()=>({review,review_token:'token'})}});
   h.ui.app.state={rows:[deletionSearchRows[0],
     {source_kind:'manual',plant:'plant1',record_id:'linked-hdd',supplier:'Acme Medical',certificate_type:'destruction',
       destruction_source:{plant:'plant1',case_id:'17'},certificate_status:'alert'},
     {source_kind:'manual',plant:null,record_id:'standalone-hdd',supplier:'Standalone',certificate_type:'destruction',
       certificate_status:'ready'}],workspace_revision:'search-review'};
-  h.ui.openEntryDeletion();
-  assert.match(text(h.ui.app.entryDeletion.labels[0]), /Recycling/);
-  assert.match(text(h.ui.app.entryDeletion.labels[1]), /Data Destruction.*SN 17/);
-  assert.match(text(h.ui.app.entryDeletion.labels[2]), /Data Destruction.*Local record/);
+  await h.ui.openEntryDeletion();
+  assert.match(text(deletionChoices(h)[0]), /Recycling/);
+  assert.match(text(deletionChoices(h)[1]), /Data Destruction.*SN 17/);
+  assert.match(text(deletionChoices(h)[2]), /Data Destruction.*Local record/);
   h.controls.get('#entry-delete-search').value='acme data destruction';
   h.ui.filterEntryDeletion();
-  assert.deepEqual(Array.from(h.ui.app.entryDeletion.labels, label=>label.hidden), [true,false,true]);
+  assert.equal(deletionChoices(h).length,1);
+  assert.match(text(deletionChoices(h)[0]), /Data Destruction.*SN 17/);
   h.controls.get('#entry-deletion-modal').close();
   await h.ui.handleAction({dataset:{action:'remove-inward',index:'0'}});
-  assert.deepEqual(h.requests[0].payload.selected,
+  assert.deepEqual(h.requests[1].payload.selected,
     [{source_kind:'workbook',plant:'plant1',sn:'17',sheet:'Inward Register',row:2}]);
-  assert.equal(Object.hasOwn(h.requests[0].payload, 'include_linked_hdd'), false);
+  assert.equal(Object.hasOwn(h.requests[1].payload, 'include_linked_hdd'), false);
 });
 
-test('Deletion search keeps checked entries across searches and shows hidden selection counts', () => {
-  const h=harness();h.ui.app.state={rows:deletionSearchRows,workspace_revision:'search-review'};h.ui.openEntryDeletion();
-  const first=h.ui.app.entryDeletion.labels[0].children[0];first.checked=true;first.dispatch('change');
+test('Deletion search keeps checked entries across searches and shows hidden selection counts', async () => {
+  const h=harness({fetch:async () => deletionSearchResponse()});await h.ui.openEntryDeletion();
+  const first=deletionChoices(h)[0].children[0];first.checked=true;first.dispatch('change');
   h.controls.get('#entry-delete-search').value='another';h.ui.filterEntryDeletion();
   assert.equal(h.ui.app.entryDeletion.checked.size,1);
   assert.match(h.controls.get('#entry-delete-selected').textContent,/1 selected.*1 hidden/);
   assert.equal(h.controls.get('#entry-delete-preview').disabled,false);
   h.controls.get('#entry-delete-search').value='';h.ui.filterEntryDeletion();
-  assert.equal(first.checked,true);assert.equal(h.ui.app.entryDeletion.labels[0].hidden,false);
+  assert.equal(deletionChoices(h)[0].children[0].checked,true);
 });
 
 test('Advanced deletion reviews exact entries and PDFs and waits for a checked confirmation', async () => {
   const review={entries:[{source_kind:'workbook',plant:'plant1',sn:'17',supplier:'Acme Medical',cod:'0212',materials:2,certificate_type:'siemens'}],pdfs:['Certificates/Auto Generated/0212_Acme_Mumbai.pdf'],kept_hdd:[{supplier:'Acme Medical',cod:'0215'}]};
-  const h=harness({fetch:async(endpoint)=>({ok:true,json:async()=>endpoint.endsWith('delete-preview')?{review,review_token:'review-token'}:{deleted:true,state:{rows:[]}}})});
-  h.ui.app.state={rows:deletionSearchRows,workspace_revision:'search-review'};
-  vm.runInContext('setState=state=>{app.state=state;};',h.context);h.ui.wire();h.ui.openEntryDeletion();
-  const input=h.ui.app.entryDeletion.labels[0].children[0];input.checked=true;input.dispatch('change');
+  const h=harness({fetch:async endpoint=>endpoint.endsWith('deletion-choices') ? deletionSearchResponse()
+    : {ok:true,json:async()=>endpoint.endsWith('delete-preview')?{review,review_token:'review-token'}:{deleted:true,state:{rows:[]}}}});
+  vm.runInContext('setState=state=>{app.state=state;};',h.context);h.ui.wire();await h.ui.openEntryDeletion();
+  const input=deletionChoices(h)[0].children[0];input.checked=true;input.dispatch('change');
   await h.ui.reviewEntryDeletion();
-  assert.equal(h.requests.length,1);assert.equal(h.requests[0].endpoint,'/api/entries/delete-preview');
-  assert.deepEqual(h.requests[0].payload.selected,[{source_kind:'workbook',plant:'plant1',sn:'17',sheet:'Inward Register',row:2}]);
+  assert.equal(h.requests.length,2);assert.equal(h.requests[1].endpoint,'/api/entries/delete-preview');
+  assert.deepEqual(h.requests[1].payload.selected,[{source_kind:'workbook',plant:'plant1',sn:'17',sheet:'Inward Register',row:2}]);
   assert.match(text(h.controls.get('#entry-delete-review-list')),/0212_Acme_Mumbai.pdf/);
   assert.match(h.controls.get('#entry-delete-kept-hdd').textContent,/kept as standalone/);
   assert.equal(h.controls.get('#entry-delete-confirm').disabled,true);
   assert.equal(h.controls.get('#entry-delete-cancel').focused,true);
-  await h.ui.confirmEntryDeletion();assert.equal(h.requests.length,1);
+  await h.ui.confirmEntryDeletion();assert.equal(h.requests.length,2);
   h.controls.get('#entry-delete-checked').checked=true;h.controls.get('#entry-delete-checked').dispatch('change');
   await h.ui.confirmEntryDeletion();
-  assert.equal(h.requests.length,2);assert.equal(h.requests[1].endpoint,'/api/entries/delete');
-  assert.equal(h.requests[1].payload.review_token,'review-token');assert.equal(h.requests[1].payload.checked,true);
+  assert.equal(h.requests.length,3);assert.equal(h.requests[2].endpoint,'/api/entries/delete');
+  assert.equal(h.requests[2].payload.review_token,'review-token');assert.equal(h.requests[2].payload.checked,true);
   assert.equal(h.controls.get('#entry-deletion-modal').open,false);assert.equal(h.ui.app.entryDeletion,null);
 });
 
 test('Canceling advanced deletion clears its review and never deletes an entry', async () => {
-  const h=harness({fetch:async()=>({ok:true,json:async()=>({review:{entries:[],pdfs:[],kept_hdd:[]},review_token:'token'})})});
-  h.ui.app.state={rows:deletionSearchRows,workspace_revision:'search-review'};h.ui.wire();h.ui.openEntryDeletion();
+  const h=harness({fetch:async endpoint=>endpoint.endsWith('deletion-choices') ? deletionSearchResponse()
+    : {ok:true,json:async()=>({review:{entries:[],pdfs:[],kept_hdd:[]},review_token:'token'})}});
+  h.ui.wire();await h.ui.openEntryDeletion();
   h.ui.app.entryDeletion.checked.add(0);await h.ui.reviewEntryDeletion();
   h.controls.get('#entry-deletion-modal').close();
-  assert.equal(h.ui.app.entryDeletion,null);assert.equal(h.requests.length,1);
+  assert.equal(h.ui.app.entryDeletion,null);assert.equal(h.requests.length,2);
   assert.equal(h.controls.get('#entry-delete-checked').checked,false);
 });
 
@@ -4034,32 +3935,19 @@ test('Restoring an older first-generation draft keeps Excel facts and discards u
   assert.equal(h.requests.length,0);
 });
 
-function clientEntry(h) {
-  const form = h.controls.get('#add-client-form');
-  const defaults = {plant:'plant1',sn:'',supplier:'',location:'',inward_date:'',form6:'',reference:'',comments:'',transporter_details:'',docket_vehicle_no:'',weight_slip_scale:''};
-  form.values = {...defaults};
-  const inputs = Object.fromEntries(Object.keys(defaults).map(name => {
-    const input = new Node('input'); input.name = name;
-    Object.defineProperty(input,'value',{get:() => form.values[name],set:value => { form.values[name] = value; }});
-    const field = new Node('label'); input.closest = () => field;
-    return [name,input];
-  }));
-  form.elements = {namedItem:name => inputs[name]};
-  form.reset = () => { form.values = {...defaults}; };
-  form.reportValidity = () => Boolean(form.values.supplier.trim());
-  form.querySelectorAll = () => Object.values(inputs);
-  h.ui.app.workspaceRevision = 'revision-1';
-  return {form,inputs};
+function newEntry(h) {
+  const form = editing(h);
+  for (const name of ['certificate_weight','case_id','inward_date','form6','reference','source_kind','plant']) {
+    const field = new Node('label');
+    field.querySelector = () => new Node('span');
+    form.elements.namedItem(name).closest = () => field;
+  }
+  Object.assign(h.ui.app.editor, {newEntry:true, existing:false, sourceSn:null});
+  form.values.edit_scope = 'update_excel';
+  form.values.form6 = '';
+  h.ui.app.editor.baseline = h.ui.detailsBody(form);
+  return form;
 }
-
-test('Add client always requests an automatic SN and exposes no manual SN field', () => {
-  const h=harness(), {form,inputs}=clientEntry(h);
-  form.values.sn='OLD-DRAFT-NUMBER';
-  assert.equal(h.ui.validateClientSerialNumber(),true);
-  assert.equal(form.values.sn,''); assert.equal(inputs.sn.validationMessage,'');
-  const html=fs.readFileSync(path.join(__dirname,'../web/index.html'),'utf8');
-  assert.match(html, /<input type="hidden" name="sn" value="">/);
-});
 
 test('Company order follows received date across statuses and keeps unknown dates last', () => {
   const h = harness();
@@ -4072,36 +3960,43 @@ test('Company order follows received date across statuses and keeps unknown date
   assert.deepEqual(rows.sort(h.ui.compareRows).map(row => row.sn),['9','2','1','3']);
 });
 
-test('Add client leaves certificate template selection to certificate creation', () => {
+test('The single New form offers all four certificate types', () => {
   const html = fs.readFileSync(path.join(__dirname,'../web/index.html'),'utf8');
-  const form = html.match(/<form id="add-client-form">([\s\S]*?)<\/form>/)[1];
-  assert.doesNotMatch(form,/Standard COD|name="certificate_type"/);
-  assert.doesNotMatch(form,/class="client-entry-id"|Numeric quantities can use|Required for every inward/);
-  assert.match(form,/id="client-serial-number-hint"[^>]*hidden/);
-  assert.match(html,/<select name="certificate_type"><option value="standard">Recycling/);
+  const form = html.match(/<form id="details-form"[^>]*>([\s\S]*?)<\/form>/)[1];
+  assert.doesNotMatch(html, /id="add-client-button"|id="add-client-form"/);
+  assert.doesNotMatch(form, /name="new_action"/);
+  for (const id of ['add-new-inward', 'save-details', 'upload-editor-certificate']) assert.ok(form.includes('id="' + id + '"'));
+  for (const kind of ['standard', 'destruction', 'siemens', 'sita']) assert.ok(form.includes(`<option value="${kind}">`));
 });
 
-test('Add client keeps calculation and additional fields visible without dropdowns', () => {
-  const h = harness(); clientEntry(h); h.ui.openAddClient();
-  assert.equal(h.controls.get('#client-serial-number-hint').hidden,true);
-  assert.equal(h.controls.get('#client-serial-number-hint').textContent,'');
-  const inputs = h.ui.app.clientMaterialRows[0];
-  assert.equal(inputs.hint.hidden,true);
-  assert.equal(inputs.hint.textContent,'');
-  assert.equal(h.controls.get('#client-material-weight-total').hidden,true);
-  const card = h.controls.get('#client-material-rows').children[0];
-  const grid = card.children[1];
-  assert.match(text(grid.children[0]),/Material or asset/);
-  assert.match(text(grid.children[1]),/Weight \(KG\)/);
-  const calculation = all(grid,node => node.className?.includes('client-material-calculation'))[0];
-  assert.ok(calculation);
-  assert.equal(all(grid,node => node.tag === 'details').length,0);
-  assert.match(text(calculation),/Calculate weight.*Per Pcs Weight.*Quantity in Pcs.*Weight \(KG\)/);
-  const html = fs.readFileSync(path.join(__dirname,'../web/index.html'),'utf8');
-  const optional = html.match(/<section class="client-entry-more-details"[\s\S]*?<\/section>/)[0];
-  for (const name of ['reference','comments','transporter_details','docket_vehicle_no','weight_slip_scale']) {
-    assert.ok(optional.includes(`name="${name}"`),name);
-  }
+test('Add to Excel can register a Data Destruction only client and shows its pending certificate', async () => {
+  const h = harness({fetch:async () => ({ok:true,json:async () => ({client_added:true,
+    client:{sn:'1002',plant:'plant1',supplier:'HDD client',status:'na',certificate_scope:'destruction'},
+    state:{rows:[],scan_complete:true}})})});
+  const form = newEntry(h);
+  form.values.supplier = 'HDD client';
+  form.values.certificate_type = 'destruction';
+  h.ui.app.editor.template = 'destruction';
+  vm.runInContext('updateSourceControls()', h.context);
+  assert.equal(h.controls.get('#editor-review').hidden, true);
+  assert.equal(h.controls.get('#open-new-preview').hidden, true);
+  assert.equal(h.controls.get('#save-details').hidden, true);
+  assert.equal(h.controls.get('#template-editor').hidden, true);
+  form.values.source_kind = 'manual';
+  vm.runInContext('updateSourceControls()', h.context);
+  const secondary = h.controls.get('#new-client-secondary-fields');
+  assert.equal(h.controls.get('#template-editor').parentElement, h.controls.get('#new-client-secondary-template-slot'));
+  assert.equal(h.controls.get('#template-editor').hidden, false);
+  assert.equal(secondary.hidden, false);
+  assert.equal(h.controls.get('#material-options').hidden, true);
+  assert.equal(h.controls.get('#open-new-preview').hidden, false);
+  form.values.source_kind = 'workbook';
+  vm.runInContext('updateSourceControls()', h.context);
+  await h.ui.saveClient(form);
+  assert.equal(h.requests[0].payload.certificate_scope, 'destruction');
+  assert.equal(h.controls.get('#template-filter').value, 'destruction');
+  assert.equal(h.controls.get('#search').value, '1002');
+  assert.match(h.controls.get('#toast-message').textContent, /finish the Data Destruction details/);
 });
 
 test('Opening Excel for repair gives a short success notice', async () => {
@@ -4114,63 +4009,39 @@ test('Opening Excel for repair gives a short success notice', async () => {
   assert.equal(h.ui.app.openingExcel,false);
 });
 
-test('Add client follows the plant and keeps unfinished inputs without a certificate preview', () => {
-  const h = harness(), {form,inputs} = clientEntry(h);
-  h.controls.get('#plant-filter').value = 'plant2';
-  h.ui.openAddClient();
-  assert.equal(form.values.plant,'plant2');
-  assert.equal(h.ui.app.clientMaterialRows.length,1);
-  assert.equal(h.requests.length,0);
-  const requestId = h.ui.app.clientRequestId;
-  form.values.supplier = 'New company'; h.ui.app.clientMaterialRows[0].item.value = 'Laptop';
-  h.controls.get('#add-client-modal').close(); h.ui.openAddClient();
-  assert.equal(form.values.supplier,'New company');
-  assert.equal(h.ui.clientMaterialValues()[0].item,'Laptop');
-  assert.equal(h.ui.app.clientRequestId,requestId);
-  assert.notEqual(inputs.form6.closest().hidden,true);
-});
-
 test('Add client saves with Form 6 blank and leaves it for certificate creation', async () => {
   const h = harness({fetch:async () => ({ok:true,json:async () => ({client_added:true,
     client:{sn:'1002',plant:'plant1',supplier:'New company',status:'blank'},
     state:{rows:[],scan_complete:true}})})});
-  const {form} = clientEntry(h);
-  h.ui.openAddClient(); form.values.supplier = 'New company';
-  await h.ui.saveClient();
+  const form = newEntry(h); form.values.supplier = 'New company';
+  form.reportValidity = () => { throw new Error('Add to Excel must validate only its own required fields.'); };
+  await h.ui.saveClient(form);
   assert.equal(h.requests.length,1);
   assert.equal(h.requests[0].payload.details.form6,'');
-});
-
-test('Add client calculates numeric quantity but leaves text quantities for manual weight', () => {
-  const h = harness();
-  h.ui.renderClientMaterials([{item:'Laptop',quantity:'2',per_piece_weight:'3.5'}]);
-  const material = h.ui.app.clientMaterialRows[0];
-  assert.equal(material.weight.value,'7');
-  assert.equal(h.ui.clientMaterialValues()[0].weight,'');
-  material.quantity.value = '1 lot'; material.quantity.dispatch('input');
-  assert.equal(material.weight.value,'');
-  assert.equal(material.hint.textContent,'Enter weight directly.');
-  material.weight.value = '12';
-  assert.equal(h.ui.clientMaterialValues()[0].weight,'12');
 });
 
 test('Add client saves every material once and shows the new Excel entry in the list', async () => {
   let resolveSave;
   const h = harness({fetch:() => new Promise(resolve => { resolveSave = resolve; })});
-  const {form} = clientEntry(h); h.ui.openAddClient();
+  const form = newEntry(h);
   form.values.supplier = 'New company'; form.values.form6 = 'FORM-NEW';
-  form.values.sn = '1000'; form.values.inward_date = '2026-06-15';
+  form.values.case_id = '1000'; form.values.inward_date = '2026-06-15';
   form.values.comments = 'Return visit';
   form.values.transporter_details = 'ABC Logistics';
   form.values.docket_vehicle_no = 'D-123';
   form.values.weight_slip_scale = '18.5';
-  h.ui.renderClientMaterials([{item:'Laptop',quantity:'2',per_piece_weight:'3.5'},{item:'Printer',weight:'8'}]);
-  const pending = h.ui.saveClient();
-  await h.ui.saveClient();
+  Object.assign(form.values, {item:'Laptop', quantity:'2', per_piece_weight:'3.5', weight:'7',
+    material_1_item:'Printer', material_1_weight:'8', certificate_type:'siemens'});
+  h.ui.app.editor.template = 'siemens';
+  h.controls.get('#new-hdd-needed').checked = true;
+  h.ui.renderMaterialRows([{item:'Laptop',quantity:'2',per_piece_weight:'3.5'},{item:'Printer',weight:'8'}]);
+  const pending = h.ui.saveClient(form);
+  await h.ui.saveClient(form);
   assert.equal(h.requests.length,1);
   assert.equal(h.requests[0].endpoint,'/api/clients/add');
   assert.equal(h.requests[0].payload.expected_revision,'revision-1');
   assert.equal(h.requests[0].payload.details.items.length,2);
+  assert.equal(h.requests[0].payload.details.items[0].weight,'');
   assert.equal(h.requests[0].payload.details.items[1].weight,'8');
   assert.equal(h.requests[0].payload.details.sn,'');
   assert.equal(h.requests[0].payload.details.inward_date,'2026-06-15');
@@ -4178,30 +4049,31 @@ test('Add client saves every material once and shows the new Excel entry in the 
   assert.equal(h.requests[0].payload.details.transporter_details,'ABC Logistics');
   assert.equal(h.requests[0].payload.details.docket_vehicle_no,'D-123');
   assert.equal(h.requests[0].payload.details.weight_slip_scale,'18.5');
-  assert.equal(Object.hasOwn(h.requests[0].payload.details,'certificate_type'),false);
+  assert.equal(h.requests[0].payload.certificate_scope, 'siemens');
+  assert.equal(h.requests[0].payload.data_destruction_needed, true);
   resolveSave({ok:true,json:async () => ({client_added:true,client:{sn:'1002',plant:'plant1',supplier:'New company',status:'ready'},
     state:{rows:[{sn:'1002',plant:'plant1',supplier:'New company',certificate_status:'ready',outcome:'needs_review',
       warnings:['Reference number is required to create the certificate.']}],scan_complete:true},workspace_revision:'revision-2'})});
   await pending;
-  assert.equal(h.controls.get('#add-client-modal').open,false);
-  assert.match(h.controls.get('#toast-message').textContent,/Open Review & edit to finish the certificate details/);
+  assert.equal(h.controls.get('#details-modal').open,false);
+  assert.match(h.controls.get('#toast-message').textContent,/Medical and Data Destruction are listed in Companies/);
   assert.equal(h.controls.get('#search').value,'1002');
   assert.equal(h.controls.get('#status-filter').value,'all');
   assert.equal(h.ui.app.workspaceRevision,'revision-2');
-  assert.equal(h.ui.app.clientRequestId,null);
+  assert.equal(h.ui.app.editor.clientRequestId,null);
   assert.doesNotMatch(h.controls.get('#toast-message').textContent,/Ready to create/);
 });
 
 test('Failed Add client retains the form and stable request ID for a safe retry', async () => {
   const h = harness({fetch:async () => ({ok:false,status:400,json:async () => ({error:'Save and close Plant 1.xlsx in Excel, then try again.'})})});
-  const {form} = clientEntry(h); h.ui.openAddClient(); form.values.supplier = 'New company'; form.values.form6 = 'FORM-NEW';
-  const requestId = h.ui.app.clientRequestId;
-  await h.ui.saveClient();
-  assert.equal(h.controls.get('#add-client-modal').open,true);
+  const form = newEntry(h); form.values.supplier = 'New company'; form.values.form6 = 'FORM-NEW';
+  await h.ui.saveClient(form);
+  const requestId = h.ui.app.editor.clientRequestId;
+  assert.equal(h.controls.get('#details-modal').open,true);
   assert.equal(form.values.supplier,'New company');
-  assert.equal(h.controls.get('#add-client-error').hidden,false);
-  assert.equal(h.controls.get('#save-client').disabled,false);
-  await h.ui.saveClient();
+  assert.equal(h.controls.get('#details-error').hidden,false);
+  assert.equal(h.controls.get('#save-details').disabled,false);
+  await h.ui.saveClient(form);
   assert.equal(h.requests[0].payload.request_id,requestId);
   assert.equal(h.requests[1].payload.request_id,requestId);
 });
@@ -4217,13 +4089,12 @@ test('Add client retries a stale save with the refreshed revision and the same d
       error:adds === 1 ? 'The files changed since you opened these details.' : 'Save and close Excel.',
     })};
   }});
-  const {form} = clientEntry(h);
-  h.ui.openAddClient();
+  const form = newEntry(h);
   form.values.supplier = 'New company';
-  await h.ui.saveClient();
-  assert.equal(h.controls.get('#add-client-modal').open,true);
-  assert.match(h.controls.get('#add-client-error').textContent,/Excel list was refreshed/);
-  await h.ui.saveClient();
+  await h.ui.saveClient(form);
+  assert.equal(h.controls.get('#details-modal').open,true);
+  assert.match(h.controls.get('#details-error').textContent,/Excel list was refreshed/);
+  await h.ui.saveClient(form);
   assert.equal(h.requests[0].payload.expected_revision,'revision-1');
   assert.equal(h.requests[2].payload.expected_revision,'revision-2');
   assert.equal(h.requests[2].payload.request_id,h.requests[0].payload.request_id);
@@ -4234,13 +4105,12 @@ test('Add client can start a new request after the server resolves an old reques
   const h = harness({fetch:async () => ({ok:false,status:400,json:async () => ({
     client_request_ended:true,error:'This client was already added and later removed.',
   })})});
-  const {form} = clientEntry(h);
-  h.ui.openAddClient();
+  const form = newEntry(h);
   form.values.supplier = 'New company';
-  await h.ui.saveClient();
+  await h.ui.saveClient(form);
   assert.equal(h.requests.length,1);
-  assert.equal(h.controls.get('#add-client-modal').open,true);
-  await h.ui.saveClient();
+  assert.equal(h.controls.get('#details-modal').open,true);
+  await h.ui.saveClient(form);
   assert.notEqual(h.requests[1].payload.request_id,h.requests[0].payload.request_id);
   assert.equal(h.requests[1].payload.details.supplier,'New company');
 });
@@ -4437,6 +4307,25 @@ test('A local certificate retained after Excel deletion can add its own HDD requ
   assert.equal(h.context.opened[0],hdd);
 });
 
+test('App-only Data Destruction never uses its parent record ID as the displayed or searchable SN', () => {
+  const h = harness();
+  const parentId = 'a'.repeat(32);
+  const row = {source_kind:'manual', supplier:'Local client', record_id:'b'.repeat(32), certificate_type:'destruction',
+    plant:null, sn:parentId, case_id:parentId, destruction_source:{plant:null, case_id:parentId, record_id:parentId}};
+  const {companySerial, entryChoiceFacts} = vm.runInContext('({companySerial, entryChoiceFacts})', h.context);
+  assert.equal(companySerial(row), '');
+  assert.equal(companySerial({...row, case_id:'', sn:''}), '');
+  assert.ok(entryChoiceFacts(row).includes('Local record'));
+  assert.ok(!entryChoiceFacts(row).join(' ').includes(parentId));
+  const filters = {plant:'all', template:'all', status:'all'};
+  assert.equal(h.ui.matches(row, false, {...filters, serial:parentId}), false);
+  assert.equal(h.ui.matches(row, false, {...filters, search:parentId}), false);
+  assert.equal(h.ui.matches(row, false, {...filters, search:'Local client'}), true);
+  assert.equal(companySerial({...row, destruction_source:{...row.destruction_source, case_id:'0017'}}), '0017');
+  assert.equal(companySerial({...row, destruction_source:{plant:'plant1', case_id:'0018'}}), '0018');
+  assert.equal(companySerial({source_kind:'workbook', sn:'0019'}), '0019');
+});
+
 test('The Data Destruction checkbox works for an app-only certificate with no plant or SN', async () => {
   const base={source_kind:'manual',record_id:'local-only',plant:null,case_id:'',supplier:'Local client',
     certificate_type:'standard',certificate_status:'generated_manual'};
@@ -4538,7 +4427,7 @@ test('Opening linked certificates resets warnings and loads each record’s own 
     assert.equal(h.ui.app.editor.recordId,row.record_id||null);
     assert.equal(h.ui.app.editor.sourceSn,row.source_kind==='manual'?null:'1001');
     assert.equal(h.controls.get('#details-error').hidden,true);assert.equal(h.controls.get('#preview-warnings').hidden,true);
-    assert.match(h.controls.get('#certificate-selection-status').textContent,new RegExp(row.cod_no));
+    assert.equal(h.controls.has('#certificate-selection-status'), false);
     if(row===linkedHdd)assert.equal(h.ui.app.editor.fields.destruction.device_receipts,linkedHdd.certificate_fields.device_receipts);
   }
 });
@@ -4580,11 +4469,29 @@ test('Review & edit directly edits uploaded records and keeps the saved PDF prev
   }
 });
 
-test('Data destruction automatic preview works with device counts and no material weight', async () => {
+test('App-only Data Destruction previews without a plant or material weight', async () => {
   const h = harness(); const form = editing(h);
-  form.values.source_kind = 'manual'; form.values.certificate_weight = ''; form.values.weight = '';
-  h.ui.app.editor.template = 'destruction';
-  vm.runInContext('globalThis.destructionPreviewCount=0; previewDetails=async()=>{destructionPreviewCount++}',h.context);
+  Object.assign(form.values, {source_kind:'manual', certificate_type:'destruction', plant:'',
+    certificate_weight:'', weight:''});
+  const editor = h.ui.app.editor;
+  Object.assign(editor, {template:'destruction', sourceSn:null, existing:true, recordId:'hdd-1',
+    destructionSource:{plant:null, case_id:'local-id', record_id:'local-id'}});
+  editor.fields.destruction = {destruction_date:'2026-11-19',
+    device_receipts:'[{"date":"2026-05-01","count":"76"}]'};
+  for (const name of ['certificate_weight','case_id','inward_date','form6','reference','plant']) {
+    const field = new Node('label');
+    field.querySelector = () => new Node('span');
+    form.elements.namedItem(name).closest = () => field;
+  }
+  const plant = form.elements.namedItem('plant');
+  form.checkValidity = () => plant.disabled || !plant.required || Boolean(plant.value);
+  vm.runInContext(`globalThis.destructionPreviewCount=0;
+    previewDetails=async()=>{destructionPreviewCount++};
+    suggestWorkbookId=()=>{}; updatePrintedWeight=()=>{}; updateSourceControls();`, h.context);
+  assert.equal(plant.required, false);
+  assert.equal(plant.disabled, true);
+  assert.equal(plant.closest().hidden, true);
+  assert.doesNotMatch(h.controls.get('#details-description').textContent, /local-id/);
   h.ui.schedulePreview();
   const timer = [...h.timers.values()].find(timer => timer.delay === 1000);
   assert(timer); await timer.fn();

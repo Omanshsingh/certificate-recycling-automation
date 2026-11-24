@@ -75,14 +75,14 @@ class RegisterBorderTests(unittest.TestCase):
             self.assertEqual(edge(f'{col}4', 'bottom'), 'medium')
         self.assertIsNone(edge('A3', 'bottom'))
         self.assertEqual(edge('E3', 'bottom'), 'thin')
-        for col in 'PQ':
+        for col in 'EFGHPQ':
             for row in (2, 3):
                 self.assertEqual(edge(f'{col}{row}', 'bottom'), 'thin')
                 self.assertEqual(edge(f'{col}{row+1}', 'top'), 'thin')
         merges = {area.attrib['ref'] for area in sheet.iter(NS + 'mergeCell')}
-        self.assertNotIn('P2:P4', merges)
-        self.assertNotIn('Q2:Q4', merges)
-        self.assertIn('A2:A4', merges)
+        self.assertEqual(merges, {f'{col}2:{col}4' for col in 'ABCDIJKLMNOR'})
+        for col in 'IJKLMNOR':
+            self.assertIsNone(edge(f'{col}3', 'bottom'))
 
     def test_only_border_styles_change_and_formula_caches_survive(self):
         data = self.fixture()
@@ -110,12 +110,12 @@ class RegisterBorderTests(unittest.TestCase):
                         cell.attrib.pop('s', None)
                         if not len(cell) and set(cell.attrib) == {'r'}:
                             row.remove(cell)
-            # Tracking columns intentionally become separate physical cells;
-            # all other merges and worksheet payloads remain unchanged.
             merges = old_sheet.find(NS + 'mergeCells')
             for area in list(merges):
                 if area.attrib['ref'] in {'P2:P4', 'Q2:Q4'}:
                     merges.remove(area)
+            for col in 'LMNO':
+                ET.SubElement(merges, NS + 'mergeCell', {'ref': f'{col}2:{col}4'})
             merges.attrib['count'] = str(len(merges))
             self.assertEqual(ET.tostring(old_sheet), ET.tostring(new_sheet))
         before = read_batches(BytesIO(data))
@@ -140,6 +140,43 @@ class RegisterBorderTests(unittest.TestCase):
     def test_sorting_retains_the_repair(self):
         updated = sort_register_by_inward_date(self.fixture())
         self.assertEqual(repair_register_borders(updated), updated)
+
+    def test_status_merge_expands_over_material_and_hdd_rows(self):
+        book = load_workbook(BytesIO(self.fixture()))
+        sheet = book.active
+        sheet.unmerge_cells('R2:R4')
+        sheet.merge_cells('R2:R3')
+        sheet['R2'] = 'Generated'
+        sheet.unmerge_cells('P2:P4')
+        sheet.unmerge_cells('Q2:Q4')
+        sheet['P3'] = '0251'
+        sheet['P4'] = 'DD-0252'
+        output = BytesIO()
+        book.save(output)
+        book.close()
+        data = output.getvalue()
+        updated = repair_register_borders(data)
+        book = load_workbook(BytesIO(updated))
+        sheet = book.active
+        self.assertIn('R2:R4', {str(area) for area in sheet.merged_cells.ranges})
+        self.assertEqual([sheet[cell].value for cell in ('R2', 'P3', 'P4')],
+                         ['Generated', '0251', 'DD-0252'])
+        book.close()
+        self.assertEqual(repair_register_borders(updated), updated)
+
+    def test_status_repair_keeps_independent_continuation_value(self):
+        book = load_workbook(BytesIO(self.fixture()))
+        sheet = book.active
+        sheet.unmerge_cells('R2:R4')
+        sheet['R2'] = 'Generated'
+        sheet['R4'] = 'Ready'
+        output = BytesIO()
+        book.save(output)
+        book.close()
+        book = load_workbook(BytesIO(repair_register_borders(output.getvalue())))
+        self.assertNotIn('R2:R4', {str(area) for area in book.active.merged_cells.ranges})
+        self.assertEqual(book.active['R4'].value, 'Ready')
+        book.close()
 
 
 if __name__ == '__main__':

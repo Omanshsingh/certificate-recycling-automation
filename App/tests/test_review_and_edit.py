@@ -264,14 +264,17 @@ class ReviewAndEditTests(unittest.TestCase):
 
         source_file = self.root / 'operator.pdf'
         other_before = self.paths[1].read_bytes()
-        for cod, inward in (('0421', {'plant':'plant1', 'sn':'1001'}), ('0422', None)):
-            original = external_pdf(source_file, cod=cod).read_bytes()
+        for printed_cod, cod, inward in (
+                ('0421', '0421', {'plant':'plant1', 'sn':'1001'}),
+                ('9001', '0422', None), ('9001', '0423', None)):
+            original = external_pdf(source_file, cod=printed_cod).read_bytes()
             stage = stage_upload(self.root, original)
-            self.assertEqual(stage['cod'], cod)
+            self.assertEqual(stage['cod'], printed_cod)
             result = save_upload(self.root, web_app.BACKUP_DIR, {
                 'token':stage['token'], 'inward':inward, 'expected_revision':workspace_revision(self.root),
                 'details':{'supplier':'Independent client', 'certificate_type':'standard',
-                           'cod_date':'2026-10-14', 'location':'Pune', 'reference':'EXT-REF'},
+                           'cod_date':'2026-10-14', 'location':'Pune', 'reference':'EXT-REF',
+                           'cod_no':printed_cod},
             })
             self.assertEqual(result['certificate_no'], cod)
             saved = self.root / 'Certificates' / result['relative_path']
@@ -280,13 +283,16 @@ class ReviewAndEditTests(unittest.TestCase):
             entry = next(item for item in scan_inventory(self.root)['entries']
                          if item.get('present') and item['path'] == f"Certificates/{result['relative_path']}")
             self.assertTrue(entry['external'])
+            self.assertEqual(entry['current_cods'], [cod])
+            self.assertEqual(entry['cods'], [cod])
             if inward:
                 batch = self.source()
                 self.assertEqual((batch['cod_no'], batch['issued']), (cod, 'Generated Externally'))
                 self.assertEqual(find_certificate(self.root / 'Certificates', dict(batch, source_id='plant1')), saved)
                 linked_before = self.paths[0].read_bytes()
             else:
-                record = read_register(self.root)['records'][0]
+                record = next(item for item in read_register(self.root)['records']
+                              if item['id'] == result['record_id'])
                 self.assertEqual(record['details']['supplier'], 'Independent client')
                 self.assertEqual(record['status'], 'generated_manual')
                 self.assertEqual(current_record_pdf(self.root, record), saved)

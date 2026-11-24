@@ -47,6 +47,64 @@ class ClientIntakeTests(unittest.TestCase):
         return {'plant':'plant1', 'request_id':'a' * 32, 'expected_revision':workspace_revision(self.root),
                 'details':{'supplier':'New client', 'form6':'FORM-NEW', **details}}
 
+    def test_certificate_scope_creates_only_the_selected_requests(self):
+        from certificate_drafts import read_register
+
+        for index, (scope, expected_status) in enumerate(
+                [('recycling', 'Ready'), ('destruction', 'N/A'), ('both', 'Ready')], start=1):
+            body = dict(self.body(sn=str(1001 + index), supplier=f'Client {index}',
+                                  form6=f'FORM-{index}', reference=f'REF-{index}',
+                                  inward_date='2026-10-01', items=[{'item':'Laptop','weight':5}]),
+                        certificate_scope=scope, request_id=f'{index:032x}')
+            result = web_app.add_client(body)
+            self.assertEqual(result['client']['certificate_scope'], scope)
+            self.assertEqual(web_app.add_client(body)['client'], result['client'])
+            sn = result['client']['sn']
+            batch = next(row for row in read_batches(self.paths[0]) if row['case_id'] == sn)
+            self.assertEqual(batch['issued'], expected_status)
+            self.assertEqual((batch['cod_no'], batch['hdd_cod_no']), ('', ''))
+            records = [row for row in read_register(self.root)['records']
+                       if row['details'].get('destruction_source') == {'plant':'plant1', 'case_id':sn}]
+            self.assertEqual(len(records), int(scope != 'recycling'))
+            if records:
+                hdd = next(row for row in result['state']['rows'] if row.get('record_id') == records[0]['id'])
+                self.assertEqual(hdd['certificate_type'], 'destruction')
+            if scope == 'destruction':
+                response = web_app.update_inward_status({'plant':'plant1', 'sn':sn, 'action':'undo_na',
+                                                         'expected_revision':workspace_revision(self.root)})
+                self.assertEqual(response['status'], 'Ready')
+                self.assertEqual(read_register(self.root)['records'][0]['id'], records[0]['id'])
+
+    def test_retry_finishes_an_interrupted_hdd_only_add_without_another_inward(self):
+        from certificate_drafts import read_register
+
+        body = dict(self.body(), certificate_scope='destruction')
+        with patch('destruction_certificate._save_linked_request_locked', side_effect=OSError('Local register is busy')):
+            with self.assertRaisesRegex(ValueError, 'client is in Excel.*again to finish'):
+                web_app.add_client(body)
+        before = self.paths[0].read_bytes()
+        result = web_app.add_client(body)
+        self.assertEqual(len(read_batches(self.paths[0])), 2)
+        self.assertEqual(self.paths[0].read_bytes(), before)
+        self.assertEqual(result['client']['status'], 'na')
+        self.assertEqual(len(read_register(self.root)['records']), 1)
+
+    def test_medical_intake_can_queue_a_separate_hdd_request_on_retry(self):
+        from certificate_drafts import read_register
+
+        body = dict(self.body(form6='', reference='NEW-REF', inward_date='2026-10-01',
+                              items=[{'item':'Equipment', 'weight':10}]),
+                    certificate_scope='siemens', data_destruction_needed=True)
+        result = web_app.add_client(body)
+        self.assertEqual(web_app.add_client(body)['client'], result['client'])
+        sn = result['client']['sn']
+        self.assertEqual(len(read_batches(self.paths[0])), 2)
+        inward = next(row for row in read_batches(self.paths[0]) if row['case_id'] == sn)
+        self.assertEqual((inward['certificate_type'], inward['issued'], inward['cod_no']), ('siemens', 'Ready', ''))
+        hdd, = read_register(self.root)['records']
+        self.assertEqual(hdd['details']['destruction_source'], {'plant':'plant1', 'case_id':sn})
+        self.assertEqual((hdd['details']['certificate_type'], hdd['details']['cod_no']), ('destruction', ''))
+
     def test_inward_can_be_saved_before_form6_is_entered(self):
         body = self.body(form6='', reference='NEW-REFERENCE', inward_date='2026-10-01',
                          items=[{'item':'Asset','weight':5}])
@@ -131,8 +189,14 @@ class ClientIntakeTests(unittest.TestCase):
                 if key not in cols:
                     continue
                 column = cols[key] + 1
-                self.assertTrue(sheet.cell(batch['source_row'], column).alignment.wrap_text, key)
-                self.assertTrue(sheet.cell(batch['source_row'] + 1, column).alignment.wrap_text, key)
+                anchor = sheet.cell(batch['source_row'], column)
+                continuation = sheet.cell(batch['source_row'] + 1, column)
+                self.assertTrue(anchor.alignment.wrap_text, key)
+                if key == 'item':
+                    self.assertTrue(continuation.alignment.wrap_text, key)
+                else:
+                    self.assertIn(f'{anchor.coordinate}:{continuation.coordinate}',
+                                  {str(area) for area in sheet.merged_cells.ranges}, key)
         finally:
             book.close()
 
@@ -348,7 +412,7 @@ class ClientIntakeTests(unittest.TestCase):
                                       [batch_content(row) for row in after if row['case_id'] != batch['case_id']])
                 self.assertEqual(batch['total_weight'],15); self.assertEqual(batch['issued'],'Ready')
 
-    def test_added_clients_always_use_standard_certificate_type_and_require_form6(self):
+    def test_older_add_requests_default_to_recycling_without_a_certificate_choice(self):
         body = self.body(certificate_type='sita', inward_date='2026-10-01', items=[{'item':'Asset','weight':10}])
         result = web_app.add_client(body)
         self.assertEqual(read_batches(self.paths[0])[-1]['certificate_type'],'standard')
@@ -359,6 +423,39 @@ class ClientIntakeTests(unittest.TestCase):
         web_app.add_client(body)
         self.assertEqual(read_batches(self.paths[0])[-1]['certificate_type'],'standard')
         self.assertEqual(read_batches(self.paths[0])[-1]['form6'],'FORM-NEW-2')
+
+    def test_medical_and_international_choices_survive_workbook_reload_without_creating_hdd(self):
+        from certificate_drafts import read_register
+
+        book = load_workbook(self.paths[1])
+        sheet = book.active
+        for heading in ('Certificate Type', 'Certificate Weight (KG)', 'Certificate Fields'):
+            sheet.cell(1, sheet.max_column + 1, heading)
+        book.save(self.paths[1])
+        book.close()
+        for index, kind in enumerate(('siemens', 'sita')):
+            plant = f'plant{index + 1}'
+            fields = {'model_name': 'Scanner'} if kind == 'siemens' else {'company_display': 'International Client'}
+            body = dict(self.body(supplier=f'New {kind} client', form6='', reference='NEW-REF',
+                                  certificate_weight='12.5', certificate_fields=fields,
+                                  inward_date='2026-10-01', items=[{'item':'Equipment', 'weight':10}]),
+                        plant=plant, certificate_scope=kind, request_id=f'{index + 1:032x}')
+            cached = (body['expected_revision'], {'rows': [], 'scan_complete': True})
+            with patch.object(web_app, 'WORKSPACE_STATE_CACHE', cached):
+                result = web_app.add_client(body)
+                self.assertEqual(web_app.add_client(body)['client'], result['client'])
+            sn = result['client']['sn']
+            batches = read_batches(self.paths[index])
+            batch = next(row for row in batches if row['case_id'] == sn)
+            self.assertEqual(len(batches), 2)
+            self.assertEqual(batch['certificate_type'], kind)
+            self.assertEqual(batch['certificate_fields'], fields)
+            self.assertEqual(batch['certificate_weight'], 12.5)
+            self.assertEqual((batch['form6'], batch['cod_no'], batch['hdd_cod_no']), ('', '', ''))
+            shown = web_app.target_row(result['state'], (plant, sn))
+            self.assertEqual(shown['certificate_type'], kind)
+            self.assertEqual(shown['outcome'], 'needs_review' if kind == 'siemens' else 'ready')
+        self.assertEqual(read_register(self.root)['records'], [])
 
     def test_book_my_junk_client_is_added_as_na_and_cannot_be_issued(self):
         result = web_app.add_client(self.body(

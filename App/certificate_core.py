@@ -360,7 +360,9 @@ def _read_batches(path):
             if cod and not cod.startswith('='):
                 reserved.append(cod)
         row_issues.append({'sheet': sheet_name, 'row': excel_row, 'detail': message,
-                           'reserved_cod_numbers': reserved, 'auto_assign_sn': auto_assign})
+                           'reserved_cod_numbers': reserved, 'auto_assign_sn': auto_assign,
+                           **{key:text(raw[cols[key]]) for key in ('sn', 'supplier', 'location', 'form6', 'reference')
+                              if key in cols}})
 
     for excel_row, raw in enumerate(rows[1:], header_row + 1):
         if tuple(norm(value) for value in raw) == header_signature:

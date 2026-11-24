@@ -201,6 +201,7 @@ def remove_inward(root, body, *, commit=False):
 
 def undo_inward_removal(root, request_id, revision):
     """Restore one removed inward from its automatic workbook backup."""
+    from entry_deletion import require_deletion_within_restore_window
     from issuance_safety import recover_issuances
 
     root = Path(root).resolve()
@@ -227,7 +228,8 @@ def undo_inward_removal(root, request_id, revision):
                 journal['undone'] = True
                 save_json(journal_path, journal)
                 return {'undone':True}
-            require_revision(root, revision, overrides)
+            if revision is not None:
+                require_revision(root, revision, overrides)
             saved_backup = journal.get('backup_path')
             candidates = [Path(saved_backup)] if saved_backup else backups.glob(f'{path.stem}_*{path.suffix}')
             if current != journal['after_sha256']:
@@ -245,9 +247,11 @@ def undo_inward_removal(root, request_id, revision):
             from identifier_rules import require_restored_identifiers
             require_restored_identifiers(root, [dict(journal['entry'], source_kind='workbook')],
                                          {str(path):before}, read_register(root)['records'])
+            require_deletion_within_restore_window(journal)
             journal['undo_started'] = True
             save_json(journal_path, journal)
-            session.before_persist = lambda _: require_revision(root, revision, overrides)
+            if revision is not None:
+                session.before_persist = lambda _: require_revision(root, revision, overrides)
             session._persist(before, exact=True)
             journal['undone'] = True
             try:

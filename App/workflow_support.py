@@ -237,6 +237,12 @@ class Report:
                 warnings.append('Form 6 number is required to create the certificate.')
             if not str(batch.get('reference') or '').strip():
                 warnings.append('Reference number is required to create the certificate.')
+            if batch.get('certificate_type') == 'siemens':
+                fields = batch.get('certificate_fields') or {}
+                required = (fields.get('model_name'), fields.get('model_serial'), fields.get('tube_serial'),
+                            fields.get('site_location') or batch.get('location'))
+                if any(not str(value or '').strip() for value in required):
+                    warnings.append('Medical equipment details are required to create the certificate.')
         if warnings:
             outcome = 'needs_review'
             detail += ' Open Review & edit to finish the certificate details.'

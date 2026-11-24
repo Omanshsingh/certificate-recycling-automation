@@ -106,7 +106,8 @@ def inspect_pdf(path, *, pdf_data=None, number_prefix=''):
     return _inspect_pdf(path, pdf_data=pdf_data, number_prefix=number_prefix)[:3]
 
 
-def _inspect_pdf(path, *, pdf_data=None, number_prefix='', certificate_pages=None, issued_cod=None):
+def _inspect_pdf(path, *, pdf_data=None, number_prefix='', certificate_pages=None, issued_cod=None,
+                 assigned_upload_cod=None):
     named = filename_cod(path)
     cods, references = (set() if issued_cod else set(filter(None, [named]))), set()
     warnings = []
@@ -140,6 +141,8 @@ def _inspect_pdf(path, *, pdf_data=None, number_prefix='', certificate_pages=Non
                 found, refs = text_identifiers(text, number_prefix=number_prefix)
                 (attachment_cods if attached else printed).update(found)
                 references.update(refs)
+        if assigned_upload_cod:
+            return [assigned_upload_cod], sorted(references), [], []
         cods.update(printed)
         if issued_cod:
             cods.add(str(issued_cod))
@@ -185,7 +188,7 @@ def _issued_certificate_facts(root, *, history=None):
     for record in records:
         if record.get('state') not in {'complete', 'source_committed'}:
             continue
-        if record.get('external_replacement'):
+        if record.get('external_replacement') or record.get('assigned_upload_cod'):
             continue  # Its selected COD belongs to the recorded path, not every copy of the PDF.
         details = record.get('after')
         if not isinstance(details, dict):
@@ -248,13 +251,18 @@ def scan_inventory(root, persist=False, *, force=False):
                     for record in history if record.get('state') in {'complete', 'source_committed'}
                     and record.get('external_replacement') and record.get('pdf_path')
                     and record.get('pdf_sha256') and record.get('cod')}
+    assigned_uploads = {(record['pdf_path'].replace('\\', '/').casefold(), record['pdf_sha256']): str(record['cod'])
+                        for record in history if record.get('state') in {'complete', 'source_committed'}
+                        and record.get('assigned_upload_cod') and record.get('pdf_path')
+                        and record.get('pdf_sha256') and record.get('cod')}
     origins = {record['pdf_sha256']: 'external' if record.get('external_upload') else 'app'
                for record in history if record.get('state') in {'complete', 'source_committed'} and record.get('pdf_sha256')}
     migrated = migrated_certificate_origins(root)
     owners_by_digest = {record.get('pdf_sha256'):{'source_kind':record.get('source_kind'),
                         'plant':record.get('plant'), 'key':str(record.get('key')), 'cod':str(record.get('cod'))}
                         for record in history if record.get('state') == 'complete'
-                        and record.get('pdf_sha256') and not record.get('external_replacement')}
+                        and record.get('pdf_sha256') and not record.get('external_replacement')
+                        and not record.get('assigned_upload_cod')}
     # A byte-identical PDF may now be intentionally saved for more than one
     # inward. Prefer the issuance tied to this exact path; digest-only ownership
     # remains a fallback for older files that were moved outside the app.
@@ -292,6 +300,7 @@ def scan_inventory(root, persist=False, *, force=False):
                 digest = None
             issued_cod, certificate_pages = issued.get(digest, (None, None))
             replacement_cod = replacements.get((relative.casefold(), digest))
+            assigned_upload_cod = assigned_uploads.get((relative.casefold(), digest))
             if replacement_cod:
                 issued_cod, certificate_pages = replacement_cod, None
             if (old and old.get('inspection_version') == INSPECTION_VERSION
@@ -299,6 +308,7 @@ def scan_inventory(root, persist=False, *, force=False):
                     and old.get('inspection_certificate_pages') == certificate_pages
                     and old.get('inspection_issued_cod') == issued_cod
                     and old.get('inspection_replacement_cod') == replacement_cod
+                    and old.get('inspection_assigned_upload_cod') == assigned_upload_cod
                     and digest is not None and old.get('sha256') == digest and old.get('size') == stat.st_size):
                 # A restored byte-identical PDF remains the same issuance even
                 # though atomic rollback changed its filesystem timestamp.
@@ -310,7 +320,7 @@ def scan_inventory(root, persist=False, *, force=False):
                     digest, pdf_data = fingerprint(path, force=True, payload_limit=MAX_PDF_BYTES)
                 cods, refs, warnings, attachment_cods = _inspect_pdf(
                     path, pdf_data=pdf_data, number_prefix=number_prefix, certificate_pages=certificate_pages,
-                    issued_cod=issued_cod)
+                    issued_cod=issued_cod, assigned_upload_cod=assigned_upload_cod)
                 observed_cods = set(cods)
                 previous_cods = set((old or {}).get('certificate_cods', (old or {}).get('cods', [])))
                 previous_numbers = set((old or {}).get('cods', []))
@@ -330,6 +340,8 @@ def scan_inventory(root, persist=False, *, force=False):
                 # Corrections do not make a previously observed number free.
                 if replacement_cod:
                     cods, previous_cods = [replacement_cod], set()
+                if assigned_upload_cod:
+                    cods, previous_cods, previous_numbers = [assigned_upload_cod], set(), set()
                 entry = {'path': relative, 'cods': sorted(observed_cods | set(attachment_cods) | previous_numbers),
                          'certificate_cods': sorted(set(cods) | previous_cods),
                          'attachment_cods': attachment_cods,
@@ -339,7 +351,8 @@ def scan_inventory(root, persist=False, *, force=False):
                          'mtime_ns': stat.st_mtime_ns, 'sha256': digest,
                          'inspection_version': INSPECTION_VERSION, 'inspection_prefix': number_prefix,
                          'inspection_certificate_pages': certificate_pages, 'inspection_issued_cod': issued_cod,
-                         'inspection_replacement_cod': replacement_cod}
+                         'inspection_replacement_cod': replacement_cod,
+                         'inspection_assigned_upload_cod': assigned_upload_cod}
                 if old and digest is not None and old.get('sha256') == digest and old.get('managed_owner'):
                     entry['managed_owner'] = old['managed_owner']
             if replacement_cod:

@@ -57,6 +57,8 @@ class HddWorkbookTests(unittest.TestCase):
         book.close()
 
     def test_hdd_only_uses_existing_row_and_preserves_the_hdd_when_recycling_is_uploaded(self):
+        import web_app
+
         path = self.paths[0]
         fixtures.write_register(path, case_id='CLIENT1', cod='', status='N/A')
         result = self.generate()
@@ -67,8 +69,16 @@ class HddWorkbookTests(unittest.TestCase):
             self.assertEqual(sheet.cell(2, cols['cod_no'] + 1).value, hdd_cod)
         before = read_batches(path)[0]
         self.assertEqual((before['cod_no'], before['hdd_cod_no'], before['issued']), ('', hdd_cod, 'N/A'))
+        with patch.object(web_app, 'ROOT', self.root), patch.object(web_app, 'BACKUP_DIR', self.root / 'backups'), \
+                patch.object(web_app, 'WORKSPACE_STATE_CACHE', None), \
+                patch.object(web_app, 'refresh', return_value={'rows':[], 'scan_complete':True}):
+            web_app.update_inward_status({'plant':'plant1', 'sn':'CLIENT1', 'action':'undo_na',
+                                          'expected_revision':workspace_revision(self.root)})
+        reopened = read_batches(path)[0]
+        self.assertIn(reopened['issued'], {'Ready', 'Alert'})
+        self.assertEqual((reopened['cod_no'], reopened['hdd_cod_no']), ('', hdd_cod))
         with WorkbookSession(path, self.root / 'backups') as session:
-            session.set_issued_status('CLIENT1', before['source_sheet'], 2, '', 'N/A', 'Generated Externally',
+            session.set_issued_status('CLIENT1', reopened['source_sheet'], 2, '', reopened['issued'], 'Generated Externally',
                                       external={'cod': '0499', 'date': AS_OF, 'link': {'path': 'recycling.pdf'}})
         after = read_batches(path)[0]
         self.assertEqual((after['cod_no'], after['hdd_cod_no']), ('0499', hdd_cod))

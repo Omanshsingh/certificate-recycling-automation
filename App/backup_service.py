@@ -761,7 +761,8 @@ def _active_restore_file(relative):
              and Path(relative).suffix.casefold() == ".pdf"
              or lower[:2] == ["data", "issuance history"] and Path(relative).suffix.casefold() == ".json"
              or lower[:2] in (["data", "issuance recovery"], ["data", "working drafts"],
-                              ["data", "entry deletions"], ["data", "entry deletion recovery"])
+                              ["data", "entry deletions"], ["data", "entry deletion recovery"],
+                              ["data", "inward removals"])
              or lower == ["data", "custom certificates.json"]))
 
 

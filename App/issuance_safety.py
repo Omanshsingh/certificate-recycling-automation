@@ -236,7 +236,7 @@ class IssuanceTransaction:
                  *, source_kind, plant, key, cod, issued_date, before, after,
                  warnings=(), override_reason='', old_paths=(), template_path=None,
                  companion_source=None, converted_from=None, external_upload=False, retain_existing=False,
-                 external_replacement=False):
+                 external_replacement=False, assigned_upload_cod=False):
         self.root = Path(root).resolve()
         self.id = uuid.uuid4().hex
         self.folder = self.root / 'Data' / 'Issuance Recovery' / self.id
@@ -279,6 +279,8 @@ class IssuanceTransaction:
             self.data['retain_existing'] = retain_existing
         if external_replacement:
             self.data['external_replacement'] = True
+        if assigned_upload_cod:
+            self.data['assigned_upload_cod'] = True
         if companion_source:
             path, before_payload, after_payload = companion_source
             path = Path(path).resolve()

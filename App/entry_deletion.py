@@ -4,14 +4,16 @@ Active Excel rows, local records and verified PDFs are removed together. Recover
 copies and immutable issuance history remain outside the active certificate folder.
 """
 from contextlib import ExitStack
+from collections import Counter
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 import hmac
 import json
 import os
 from pathlib import Path
 import re
+from zipfile import BadZipFile
 
 from certificate_core import read_batches, status_value
 from certificate_drafts import read_register, register_path
@@ -20,7 +22,27 @@ from inward_removal import stage_removal
 from issuance_safety import audit_records, file_digest, digest_bytes, _replace_snapshot, _write_bytes, workbook_receipt_conflict
 from workbook_store import WorkbookSession, WorkbookSnapshot
 from workflow_support import load_settings, run_lock, save_json
-from workspace_review import require_revision, review_token
+from workspace_review import require_revision, review_token, workspace_revision
+
+
+ENTRY_RESTORE_WINDOW = timedelta(days=30)
+ENTRY_RESTORE_EXPIRED = 'The 30-day restore deadline has passed. To recover older entries, use a workspace backup from before the deletion.'
+
+
+def deletion_restore_deadline(value):
+    deleted_at = datetime.fromisoformat(value)
+    if deleted_at.tzinfo is None:
+        deleted_at = deleted_at.replace(tzinfo=timezone.utc)
+    return deleted_at.astimezone(timezone.utc) + ENTRY_RESTORE_WINDOW
+
+
+def require_deletion_within_restore_window(journal):
+    try:
+        deadline = deletion_restore_deadline(journal['at'])
+    except (KeyError, ValueError, TypeError, OverflowError) as exc:
+        raise ValueError('The date of this deletion could not be verified.') from exc
+    if datetime.now(timezone.utc) >= deadline:
+        raise ValueError(ENTRY_RESTORE_EXPIRED)
 
 
 def _key(entry):
@@ -37,6 +59,142 @@ def _require_unissued(details, status, identity, receipts, inventory):
         for pdf in inventory.get('entries', []) for owner in [pdf.get('managed_owner') or {}])
     if issued:
         raise ValueError('A certificate has already been generated for this entry. It cannot be deleted.')
+
+
+def deletion_choices(root):
+    """List saved records independently of dashboard filters and refresh state."""
+    root = Path(root).resolve()
+    rows, warnings, snapshots = [], [], {}
+    with run_lock(root):
+        paths = load_settings(root)['workbook_paths']
+        receipts = audit_records(root)
+        inventory = scan_inventory(root, persist=False)
+        issued = {(row.get('source_kind'), row.get('plant'), str(row.get('key', '')).strip().casefold())
+                  for row in receipts if row.get('state') != 'rolled_back'}
+        issued.update((owner.get('source_kind'), owner.get('plant'), str(owner.get('key', '')).strip().casefold())
+                      for pdf in inventory.get('entries', []) if (owner := pdf.get('managed_owner')))
+        records = read_register(root)['records']
+        linked_issued = set()
+
+        def is_issued(details, status, identity):
+            return (identity in issued or bool(details.get('hdd_cod_no'))
+                    or status_value(status) in {'generated', 'generated_manual', 'completed'})
+
+        def add(identity, details, status, **position):
+            blocked = 'Certificate already generated' if is_issued(details, status, _key(identity)) else ''
+            rows.append(dict(identity, **position, supplier=details.get('supplier'), location=details.get('location'),
+                             certificate_type=details.get('certificate_type', 'standard'),
+                             certificate_no=details.get('cod_no'), reference=details.get('reference'),
+                             form6=details.get('form6'), certificate_status=status_value(status),
+                             destruction_source=details.get('destruction_source'), deletion_blocked=blocked))
+            return rows[-1]
+
+        for record in records:
+            details = record['details']
+            identity = {'source_kind':'manual', 'plant':record['plant'], 'record_id':record['id']}
+            row = add(identity, details, record.get('status'), removed_inward=record.get('removed_inward'))
+            link = details.get('destruction_source') or {}
+            if row['deletion_blocked'] and link:
+                linked_issued.add(('manual', str(link['record_id']).casefold()) if link.get('record_id')
+                                  else (link.get('plant'), str(link.get('case_id', '')).strip().casefold()))
+
+        resolved = [Path(value).expanduser().resolve() if value else None for value in paths]
+        shared = all(resolved) and (resolved[0] == resolved[1] or
+                 (all(path.is_file() for path in resolved) and resolved[0].samefile(resolved[1])))
+        for index, path in enumerate(resolved, 1):
+            if path is None:
+                warnings.append(f'Plant {index} has no connected workbook.')
+                continue
+            try:
+                with WorkbookSnapshot(path) as snapshot:
+                    batches = read_batches(BytesIO(snapshot.data))
+                    snapshots[str(path)] = snapshot.data
+            except (OSError, ValueError, KeyError, TypeError, RuntimeError, BadZipFile) as exc:
+                warnings.append(f'Plant {index} could not be read: {exc}')
+                continue
+            plant = f'plant{index}'
+            counts = Counter(str(batch['case_id']).strip().casefold() for batch in batches)
+            for batch in batches:
+                identity = {'source_kind':'workbook', 'plant':plant, 'sn':str(batch['case_id']),
+                            'sheet':batch['source_sheet'], 'row':batch['source_row']}
+                row = add(identity, batch, batch.get('issued'))
+                if shared:
+                    row['deletion_blocked'] = 'Connect a different workbook for each plant'
+                elif counts[_key(identity)[2]] > 1:
+                    row['deletion_blocked'] = 'Repeated serial number. Check Excel first.'
+            for issue in getattr(batches, 'row_issues', ()):
+                rows.append({**{key:issue.get(key) for key in ('sheet', 'row', 'supplier', 'sn', 'location', 'form6', 'reference')},
+                             'source_kind':'workbook', 'plant':plant,
+                             'certificate_no':', '.join(issue.get('reserved_cod_numbers', [])),
+                             'deletion_blocked':'Check this row in Excel first'})
+
+        for row in rows:
+            source = ('manual', str(row['record_id']).casefold()) if row['source_kind'] == 'manual' else (
+                row['plant'], str(row.get('sn') or '').strip().casefold())
+            if not row['deletion_blocked'] and source in linked_issued:
+                row['deletion_blocked'] = 'Linked Data Destruction certificate already generated'
+        try:
+            revision = workspace_revision(root, snapshots)
+        except (OSError, ValueError) as exc:
+            revision = None
+            warnings.append(str(exc))
+            for row in rows:
+                row['deletion_blocked'] = row['deletion_blocked'] or 'Workspace files could not be checked'
+        return {'rows':rows, 'warnings':warnings, 'workspace_revision':revision}
+
+
+def deletion_history(root, *, selected=None):
+    """List recent deletions, or look up specific choices even if they expired."""
+    data_root = Path(root) / 'Data'
+    now = datetime.now(timezone.utc)
+    for kind, directory in (('entries', 'Entry Deletions'), ('inward', 'Inward Removals')):
+        for path in (data_root / directory).glob('*.json'):
+            if not re.fullmatch(r'[a-f0-9]{32}', path.stem):
+                continue
+            if selected is not None and (kind, path.stem) not in selected:
+                continue
+            try:
+                data = json.loads(path.read_text(encoding='utf-8'))
+                deadline = deletion_restore_deadline(data['at'])
+            except (OSError, ValueError, KeyError, TypeError, OverflowError):
+                continue
+            if selected is None and now >= deadline:
+                continue
+            if kind == 'entries':
+                if data.get('id') != path.stem or data.get('state') not in {'complete', 'undoing'}:
+                    continue
+                review = data.get('review')
+                entries = review.get('entries') if isinstance(review, dict) else None
+            else:
+                if data.get('undone'):
+                    continue
+                if not data.get('saved'):
+                    source, after = data.get('path'), data.get('after_sha256')
+                    try:
+                        if not source or not after or file_digest(Path(source)) != after:
+                            continue
+                    except (OSError, ValueError):
+                        continue
+                entries = [data.get('entry', {})]
+            if isinstance(entries, list) and entries and all(isinstance(entry, dict) for entry in entries):
+                yield deadline, {'kind':kind, 'request_id':path.stem, 'at':data['at'],
+                                 'restore_until':deadline.isoformat()}, entries, data
+
+
+def last_deletion(root):
+    """Find the latest deletion for the standalone workspace recovery tool."""
+    latest = max(deletion_history(root), key=lambda item: item[0], default=None)
+    if latest is None:
+        return None
+    _, target, entries, _ = latest
+    return dict(target, count=len(entries), supplier=entries[0].get('supplier'))
+
+
+def undo_deletion(root, target):
+    if target['kind'] == 'inward':
+        from inward_removal import undo_inward_removal
+        return undo_inward_removal(root, target['request_id'], None)
+    return undo_entry_deletion(root, target['request_id'], None)
 
 
 def _selected(body):
@@ -226,10 +384,15 @@ def recover_entry_deletions(root):
     recovered = []
     for path in sorted((root/'Data'/'Entry Deletions').glob('*.json')):
         data = json.loads(path.read_text(encoding='utf-8'))
-        if data.get('state') in {'complete','rolled_back','undone'}:
+        if data.get('state') in {'complete','rolled_back','undone','restored'}:
             continue
         if not re.fullmatch(r'[a-f0-9]{32}', str(data.get('id',''))) or data.get('version') != 1:
             raise ValueError('The entry deletion recovery record needs checking.')
+        if data['state'] == 'restore_committed':
+            from entry_restore_merge import finish_merge_restore
+            finish_merge_restore(root, path, data)
+            recovered.append('Finished restoring the deleted entries.')
+            continue
         _paths(root, data)
         with ExitStack() as stack:
             sessions = {item['path']:stack.enter_context(WorkbookSession(Path(item['path']), root/'Data'/'Workbook Backups'))
@@ -336,7 +499,8 @@ def undo_entry_deletion(root, identifier, revision):
         _paths(root, data)
         sessions = {item['path']:stack.enter_context(WorkbookSession(Path(item['path']), root/'Data'/'Workbook Backups'))
                     for item in data['sources'] if Path(item['path']).resolve() != register_path(root).resolve()}
-        require_revision(root, revision, {path:session.data for path,session in sessions.items()})
+        if revision is not None:
+            require_revision(root, revision, {path:session.data for path,session in sessions.items()})
         folder = root/'Data'/'Entry Deletion Recovery'/identifier
         restored_workbooks = {}
         restored_records = None
@@ -345,7 +509,7 @@ def undo_entry_deletion(root, identifier, revision):
             actual = digest_bytes(session.data) if session else file_digest(Path(item['path']))
             if actual != item['after']:
                 raise ValueError(f'{Path(item["path"]).name} changed after the deletion. '
-                                 f'The recovery copies in {folder} contain the previous entries.')
+                                 f'The pre-deletion copies are in {folder}. To roll back the workspace, use Restore backup.')
             before = (folder/item['before_snapshot']).read_bytes()
             if digest_bytes(before) != item['before']:
                 raise ValueError('A pre-deletion recovery copy failed verification.')
@@ -362,6 +526,7 @@ def undo_entry_deletion(root, identifier, revision):
             if (file_digest(folder/pdf['snapshot']) != pdf['sha256']
                     or file_digest(root/pdf['archive']) not in {None, pdf['sha256']}):
                 raise ValueError('A PDF deletion recovery copy failed verification.')
+        require_deletion_within_restore_window(data)
         data['state'] = 'undoing'
         save_json(journal, data)
         _sync(root, data, False, sessions)

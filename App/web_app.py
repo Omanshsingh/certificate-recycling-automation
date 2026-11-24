@@ -439,8 +439,24 @@ def add_client(body):
     request_id = body.get('request_id')
     if not isinstance(request_id, str) or not re.fullmatch(r'[a-f0-9]{32}', request_id):
         raise ValueError('Reopen Add client and try again.')
-    details = intake_details(body.get('details'))
+    certificate_scope = body.get('certificate_scope', 'recycling')
+    certificate_types = {'recycling': 'standard', 'destruction': 'standard', 'both': 'standard',
+                         'siemens': 'siemens', 'sita': 'sita'}
+    if not isinstance(certificate_scope, str) or certificate_scope not in certificate_types:
+        raise ValueError('Choose which certificate this client needs.')
+    certificate_type = certificate_types[certificate_scope]
+    details = intake_details(body.get('details'), certificate_type=certificate_type)
+    extra_destruction = body.get('data_destruction_needed', False)
+    if not isinstance(extra_destruction, bool):
+        raise ValueError('Choose whether Data Destruction is also needed.')
+    destruction_needed = certificate_scope in {'destruction', 'both'} or extra_destruction
+    if destruction_needed and supplier_is_always_not_applicable(details['supplier']):
+        raise ValueError('This company is always N/A. Choose Recycling without a Data Destruction request to add its inward.')
     signature = json.loads(json.dumps(details, default=str))
+    if destruction_needed:
+        signature['certificate_scope'] = certificate_scope
+    if extra_destruction and certificate_scope not in {'destruction', 'both'}:
+        signature['data_destruction_needed'] = True
     journal_path = ROOT / 'Data' / 'Client Additions' / f'{request_id}.json'
     paths = configured_paths(allow_unavailable=True)
     path = paths[int(plant[-1]) - 1]
@@ -488,7 +504,9 @@ def add_client(body):
                 from inward_serials import UnsafeSerialResequence, reserved_workbook_serials, resequence_added_inward
                 automatic_sn = not details.get('sn')
                 reserved_serials = reserved_workbook_serials(ROOT, plant) if automatic_sn else ()
-                updated, batch = stage_new_client(session, details, reserved_serials=reserved_serials)
+                updated, batch = stage_new_client(session, details, reserved_serials=reserved_serials,
+                                                  certificate_type=certificate_type,
+                                                  recycling_needed=certificate_scope != 'destruction')
                 if automatic_sn:
                     try:
                         updated, batch, serial_changes = resequence_added_inward(
@@ -515,12 +533,27 @@ def add_client(body):
                     pass  # The prepared record verifies a committed add if its response is lost.
             saved_batches = read_batches(BytesIO(session.data))
             ordering_warning = session.order_warning or ''
+        if destruction_needed and not journal.get('destruction_record_id'):
+            if batch.get('duplicate_serial_number'):
+                raise ValueError('This client is in Excel. Correct its repeated Serial Number and retry to finish saving Data Destruction.')
+            from destruction_certificate import _save_linked_request_locked
+            link = {'plant':plant, 'case_id':batch['case_id']}
+            try:
+                journal['destruction_record_id'] = _save_linked_request_locked(
+                    ROOT, plant, batch, link, read_register(ROOT), needed=True)
+            except (OSError, ValueError) as exc:
+                raise ValueError(f'The client is in Excel. Choose Add to Excel again to finish saving Data Destruction. {exc}') from exc
+            try:
+                save_json(journal_path, journal)
+            except OSError:
+                pass  # A retry can find the existing linked request.
     added_at = remember_workbook_added_at(plant, batch['case_id'], journal.get('created_at'), path)
     row_batch = dict(batch, source_id=plant, source_path=str(path),
                      _effective_certificate_status=batch.get('issued', ''), added_at=added_at)
     report = Report(ROOT, date.today(), 'Add client', publish_latest=False)
-    report.add_saved_inward(row_batch, 'ready' if status_value(batch.get('issued')) == 'ready' else 'needs_review',
-                           'Client added to Excel.')
+    status = status_value(batch['issued'])
+    outcome = 'not_applicable' if status == 'na' else 'ready' if status == 'ready' else 'needs_review'
+    report.add_saved_inward(row_batch, outcome, 'Client added to Excel.')
     report.rows[0]['added_at'] = added_at
     state = cached_workspace_state(expected)
     if state is not None:
@@ -551,8 +584,10 @@ def add_client(body):
             except Exception:
                 state = {'rows':[], 'scan_complete':False}
             state = dict(state, setup_warning=f'Client added to Excel, but the dashboard could not refresh: {exc}. Refresh before adding it again.')
+    if journal.get('destruction_record_id'):
+        state = merge_manual_record_state(None, journal['destruction_record_id'], state) or state
     return {'client_added':True, 'client':{'plant':plant, 'sn':batch['case_id'],
-            'supplier':batch['supplier'], 'status':status_value(batch['issued'])},
+            'supplier':batch['supplier'], 'status':status, 'certificate_scope':certificate_scope},
             'order_warning':ordering_warning, 'serial_order_kept':serial_order_kept, 'state':state}
 
 
@@ -2478,6 +2513,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def _do_get(self):
         path = urlsplit(self.path).path
+        if path in {'/api/entries/deletion-choices', '/api/entries/restore-choices'}:
+            try:
+                if path.endswith('/deletion-choices'):
+                    from entry_deletion import deletion_choices
+                    payload = deletion_choices(ROOT)
+                else:
+                    from entry_restore import restore_choices
+                    payload = {'rows':restore_choices(ROOT)}
+                self.send_json(dict(payload, changed=False))
+            except (OSError, ValueError) as exc:
+                self.send_error_json(exc, 400)
+            return
         if path == "/api/workbook-changes":
             try:
                 result = check_workbook_changes()
@@ -2745,16 +2792,12 @@ class Handler(BaseHTTPRequestHandler):
                     WORKBOOK_CHECK_STAMPS.pop(str(ROOT), None)
                     result['state'] = post_commit_state(rebuild_history_state, saved_message='Inward removed from Excel')
                 self.send_json(result)
-            elif parsed.path == '/api/entries/undo-delete':
-                if body.get('kind') == 'inward':
-                    from inward_removal import undo_inward_removal
-                    result = undo_inward_removal(ROOT, body.get('request_id'), body.get('expected_revision'))
-                elif body.get('kind') == 'entries':
-                    from entry_deletion import undo_entry_deletion
-                    result = undo_entry_deletion(ROOT, body.get('request_id'), body.get('expected_revision'))
-                else:
-                    raise ValueError('Choose a saved deletion to undo.')
-                result['state'] = post_commit_state(rebuild_history_state, saved_message='Deletion undone')
+            elif parsed.path in {'/api/entries/restore-preview', '/api/entries/restore'}:
+                from entry_restore import restore_entries
+                result = restore_entries(ROOT, body, commit=parsed.path == '/api/entries/restore')
+                if result.get('restored'):
+                    WORKBOOK_CHECK_STAMPS.pop(str(ROOT), None)
+                    result['state'] = post_commit_state(rebuild_history_state, saved_message='Selected entries restored')
                 self.send_json(result)
             elif parsed.path == '/api/destruction/request':
                 expected = body.get('expected_revision')

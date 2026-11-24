@@ -93,6 +93,15 @@ def formatted_client_template(sheet, header_row, cols, multi_line=False):
 
 CLIENT_TEXT_FIELDS = ('supplier', 'location', 'item', 'comments', 'transporter_details',
                       'docket_vehicle_no', 'weight_slip_scale')
+INWARD_ROW_FIELDS = ('item', 'quantity', 'per_piece_weight', 'weight', 'cod_no', 'cod_date')
+
+
+def inward_row_columns(cols):
+    return {cols[key] + 1 for key in INWARD_ROW_FIELDS if key in cols}
+
+
+def inward_client_columns(sheet, header, cols):
+    return {cell.column for cell in sheet[header] if text(cell.value)} - inward_row_columns(cols)
 
 
 def copy_client_row_styles(sheet, source_row, target_rows, width=None, *, wrap_columns=()):
@@ -215,25 +224,93 @@ def _style_inward_dividers(sheet, blocks):
                 cell.border = border
 
 
-def _register_border_styles(book, sheet, blocks, xml, styles_xml):
-    # COD/date need physical rows for recycling and HDD tracking. Vertical
-    # merges hide even explicitly styled internal borders in Excel.
-    _, _, cols = select_register(book)
-    tracking_cols = {cols[key] + 1 for key in ('cod_no', 'cod_date') if key in cols}
-    tracking_merges = {str(area) for area in sheet.merged_cells.ranges
-                       if area.min_col == area.max_col and area.min_col in tracking_cols
-                       and area.min_row < area.max_row
-                       and any(first <= area.min_row <= area.max_row <= last for first, last in blocks)}
-    if tracking_merges:
-        section = _element(xml, 'mergeCells').search(xml)
-        if section:
-            block = _element(section.group(), 'mergeCell').sub(
-                lambda match: '' if _attributes(match.group())['ref'] in tracking_merges else match.group(), section.group())
-            count = len(list(_element(block, 'mergeCell').finditer(block)))
-            block = re.sub(r'\bcount=(["\x27]).*?\1', f'count="{count}"', block, count=1) if count else ''
-            xml = xml[:section.start()] + block + xml[section.end():]
-        for area in tracking_merges:
-            sheet.unmerge_cells(area)
+def _patch_register_merges(xml, removed, added):
+    if not removed and not added:
+        return xml
+    section = _element(xml, 'mergeCells').search(xml)
+    prefix = re.search(r'<(?P<p>(?:[\w.-]+:)?)worksheet\b', xml).group('p')
+    additions = ''.join(f'<{prefix}mergeCell ref="{area}"/>' for area in added)
+    if section:
+        block = _element(xml, 'mergeCell').sub(
+            lambda match: '' if _attributes(match.group())['ref'] in removed else match.group(), section.group())
+        position = block.rfind('</')
+        block = block[:position] + additions + block[position:]
+        count = len(list(_element(block, 'mergeCell').finditer(block)))
+        replacement = re.sub(r'\bcount=(["\x27]).*?\1', f'count="{count}"', block, count=1) if count else ''
+        return xml[:section.start()] + replacement + xml[section.end():]
+    following = ('phoneticPr', 'conditionalFormatting', 'dataValidations', 'hyperlinks', 'printOptions',
+                 'pageMargins', 'pageSetup', 'headerFooter', 'rowBreaks', 'colBreaks', 'customProperties',
+                 'cellWatches', 'ignoredErrors', 'drawing', 'legacyDrawing', 'tableParts', 'extLst')
+    position = min((match.start() for tag in following if (match := _element(xml, tag).search(xml))), default=xml.rfind('</'))
+    return xml[:position] + f'<{prefix}mergeCells count="{len(added)}">{additions}</{prefix}mergeCells>' + xml[position:]
+
+
+def _register_occupied_cells(sheet, xml):
+    cells = {(cell.row, cell.column) for cell in sheet._cells.values()
+             if cell.value is not None or cell.comment or cell.hyperlink}
+    if sheet.merged_cells.ranges:
+        # A workbook can contain values underneath a merge. openpyxl hides
+        # them, but changing the layout must neither hide nor delete data.
+        for match in _element(xml, 'c').finditer(xml):
+            fragment = match.group()
+            if fragment.endswith('/>'):
+                continue
+            cell = sheet[_attributes(fragment)['r']]
+            if isinstance(cell, MergedCell) and (
+                    _element(fragment, 'f').search(fragment) or _element(fragment, 'is').search(fragment)
+                    or re.search(r'<(?:[\w.-]+:)?v\b[^>]*>[^<]+<', fragment)):
+                cells.add((cell.row, cell.column))
+    return cells
+
+
+def _client_block_merges(sheet, blocks, columns, occupied_cells, unassigned_rows):
+    """Give each client-level column one cell, preserving independent values."""
+    removed, added = set(), []
+    table_bounds = [range_boundaries(table.ref) for table in sheet.tables.values()]
+    merges_by_column = {}
+    for area in sheet.merged_cells.ranges:
+        for column in range(area.min_col, area.max_col + 1):
+            merges_by_column.setdefault(column, []).append(area)
+    occupied_rows = {row for row, _ in occupied_cells}
+    for first, last in blocks:
+        limit = min((row - 1 for row in unassigned_rows if first < row <= last), default=last)
+        end = max((row for row in range(first + 1, limit + 1) if row in occupied_rows), default=first)
+        if end == first:
+            continue
+        for column in sorted(columns):
+            if any(left <= column <= right and top <= end and bottom >= first
+                   for left, top, right, bottom in table_bounds):
+                continue
+            if any((row, column) in occupied_cells for row in range(first + 1, end + 1)):
+                continue
+            overlaps = [area for area in merges_by_column.get(column, ())
+                        if area.min_row <= end and area.max_row >= first]
+            if any(area.min_col != column or area.max_col != column or area.min_row != first
+                   or area.max_row >= end for area in overlaps):
+                continue
+            for area in overlaps:
+                removed.add(str(area))
+                sheet.unmerge_cells(str(area))
+            letter = get_column_letter(column)
+            merged = f'{letter}{first}:{letter}{end}'
+            sheet.merge_cells(merged)
+            added.append(merged)
+    return removed, added
+
+
+def _register_border_styles(book, sheet, blocks, xml, styles_xml, unassigned_rows):
+    _, header, cols = select_register(book)
+    line_columns = inward_row_columns(cols)
+    occupied = _register_occupied_cells(sheet, xml)
+    line_merges = {str(area) for area in sheet.merged_cells.ranges
+                   if area.min_col == area.max_col and area.min_col in line_columns
+                   and area.min_row < area.max_row
+                   and not any((row, area.min_col) in occupied for row in range(area.min_row + 1, area.max_row + 1))
+                   and any(first <= area.min_row <= area.max_row <= last for first, last in blocks)}
+    for area in line_merges:
+        sheet.unmerge_cells(area)
+    removed, added = _client_block_merges(sheet, blocks, inward_client_columns(sheet, header, cols), occupied, unassigned_rows)
+    xml = _patch_register_merges(xml, line_merges | removed, added)
     # openpyxl discards non-border formatting on merged placeholders when
     # reading. Start from their original styles so a border repair cannot
     # change fonts, fills, number formats, alignment or protection.
@@ -329,7 +406,7 @@ def _patch_cell_styles(xml, style_ids):
 
 
 def repair_register_borders(data, *, book=None, batches=None):
-    """Repair borders without moving rows or rewriting any cell payloads."""
+    """Repair client merges and borders without moving rows or changing cell values."""
     batches = read_batches(BytesIO(data)) if batches is None else batches
     owns_book = book is None
     if owns_book:
@@ -344,7 +421,9 @@ def repair_register_borders(data, *, book=None, batches=None):
         with ZipFile(BytesIO(data)) as archive:
             member = _sheet_member(archive, sheet.title)
             xml = archive.read(member).decode('utf-8')
-            style_ids, styles, unmerged = _register_border_styles(book, sheet, blocks, xml, archive.read('xl/styles.xml').decode('utf-8'))
+            unassigned = {issue['row'] for issue in getattr(batches, 'row_issues', ())}
+            style_ids, styles, unmerged = _register_border_styles(
+                book, sheet, blocks, xml, archive.read('xl/styles.xml').decode('utf-8'), unassigned)
             patched = _patch_cell_styles(unmerged, style_ids)
             if patched == xml:
                 return data
@@ -380,12 +459,12 @@ def order_register_for_save(data, session, *, fit_inward=None):
         data = compact_register_gaps(data)
     except UnsupportedReorderError as exc:
         session.order_warning = str(exc)
-    data = normalize_register_presentation(data, fit_inward=fit_inward)
     try:
-        return sort_register_by_inward_date(data)
+        data = sort_register_by_inward_date(data)
     except UnsupportedReorderError as exc:
         session.order_warning = str(exc)
-        return repair_register_borders(data)
+        data = repair_register_borders(data)
+    return normalize_register_presentation(data, fit_inward=fit_inward)
 
 
 def sort_register_by_inward_date(data, *, source_rows=None):
@@ -494,7 +573,9 @@ def sort_register_by_inward_date(data, *, source_rows=None):
                     if serial and row not in by_start and not any(row in batch['summary_rows'] for batch in records):
                         unsafe(f'Excel row {row} contains a note or unrecognised Serial Number')
 
-            style_ids, styles, xml = _register_border_styles(book, sheet, blocks, xml, archive.read('xl/styles.xml').decode('utf-8'))
+            unassigned = {issue['row'] for issue in getattr(batches, 'row_issues', ())}
+            style_ids, styles, xml = _register_border_styles(
+                book, sheet, blocks, xml, archive.read('xl/styles.xml').decode('utf-8'), unassigned)
             xml = _patch_cell_styles(xml, style_ids)
             rows_section = _element(xml, 'sheetData').search(xml)
             rows = []
@@ -1432,20 +1513,8 @@ def add_tracking_column(data, *, on_order_warning=None):
                     style = sheet.cell(row, cols['sn'] + 1).style_id
                     xml = _set_cell(xml, f'{get_column_letter(column)}{row}', '', 'blank', style)
                 if end > start:
-                    merges.append(f'<{prefix}mergeCell ref="{get_column_letter(column)}{start}:{get_column_letter(column)}{end}"/>')
-            # Append the new status merges without normalizing existing cells.
-            merge_section = _element(xml, 'mergeCells').search(xml)
-            if merges:
-                if merge_section:
-                    block = merge_section.group(); pos = block.rfind('</')
-                    block = block[:pos] + ''.join(merges) + block[pos:]
-                    count = len(list(_element(block, 'mergeCell').finditer(block)))
-                    block = re.sub(r'\bcount=["\x27]\d+["\x27]', f'count="{count}"', block, count=1)
-                    xml = xml[:merge_section.start()] + block + xml[merge_section.end():]
-                else:
-                    pos = min([m.start() for tag in ('phoneticPr', 'conditionalFormatting', 'dataValidations', 'hyperlinks', 'printOptions', 'pageMargins', 'pageSetup', 'drawing', 'extLst')
-                               if (m := _element(xml, tag).search(xml))] or [xml.rfind('</')])
-                    xml = xml[:pos] + f'<{prefix}mergeCells count="{len(merges)}">' + ''.join(merges) + f'</{prefix}mergeCells>' + xml[pos:]
+                    merges.append(f'{get_column_letter(column)}{start}:{get_column_letter(column)}{end}')
+            xml = _patch_register_merges(xml, set(), merges)
             column_xml = f'<{prefix}col width="18" customWidth="1" min="{column}" max="{column}"/>'
             col_section = _element(xml, 'cols').search(xml)
             if col_section:
@@ -1528,8 +1597,8 @@ class WorkbookSession:
             check.close()
         self.order_warning = None
         from register_presentation import normalize_register_presentation
-        prepared = repair_register_borders(normalize_register_presentation(add_tracking_column(self.data,
-            on_order_warning=lambda warning: setattr(self, 'order_warning', warning))))
+        prepared = normalize_register_presentation(add_tracking_column(self.data,
+            on_order_warning=lambda warning: setattr(self, 'order_warning', warning)))
         source_rows = {}
         from register_rows import compact_register_gaps
         try:
@@ -1554,6 +1623,7 @@ class WorkbookSession:
             # Manual edits can introduce cross-record formulas or row-anchored
             # objects. Keep their order intact and let the app explain why.
             self.order_warning = str(exc)
+            prepared = repair_register_borders(prepared)
         if prepared != self.data:
             self._persist(prepared)
             identity_field = 'case_id' if serial_changes else 'source_row'
@@ -2238,6 +2308,7 @@ def stage_certificate_details(session, details, validate_cells=True, *, inward_s
 
         shrink_material_rows = []
         shrink_retained_end = None
+        shrink_total_cells = ()
         if validate_cells and material_override is not None and original_batch:
             material_columns = {cols[key] + 1 for key in ('item', 'quantity', 'per_piece_weight', 'weight') if key in cols}
             following_rows = [batch['source_row'] for batch in sheet_batches if batch['source_row'] > target_row]
@@ -2260,6 +2331,8 @@ def stage_certificate_details(session, details, validate_cells=True, *, inward_s
                     and area.min_row == target_row and area.max_row == original_material_rows[-1]
                     for area in affected_merges)
                 if not occupied_other_cells and safe_merges:
+                    from register_rows import _material_totals
+                    shrink_total_cells, _ = _material_totals(sheet, header_row, cols, sheet_batches)
                     for area in affected_merges:
                         sheet.unmerge_cells(str(area))
                         if retained_end > target_row:
@@ -2279,15 +2352,6 @@ def stage_certificate_details(session, details, validate_cells=True, *, inward_s
                 source_row = template_row if index == 0 else continuation_row
                 copy_client_row_styles(sheet, source_row, [row_number], sheet.max_column,
                                        wrap_columns=wrap_columns)
-            if len(style_rows) > 1 and validate_cells:
-                material_columns = {cols[key] + 1 for key in
-                                    ('item', 'quantity', 'per_piece_weight', 'weight') if key in cols}
-                for area in list(sheet.merged_cells.ranges):
-                    if (area.min_row == template_row and area.min_col == area.max_col
-                            and area.max_row > template_row and area.min_col not in material_columns):
-                        column = get_column_letter(area.min_col)
-                        sheet.merge_cells(f'{column}{style_rows[0]}:{column}{style_rows[-1]}')
-
         values = {
             "sn": case_id,
             "inward_date": parse_date(details.get("inward_date")),
@@ -2441,19 +2505,9 @@ def stage_certificate_details(session, details, validate_cells=True, *, inward_s
                                 {key:value for key,value in details.items() if key not in cols})
         shrink_warning = None
         if shrink_material_rows:
-            from register_rows import shift_register_rows
-            candidate = updated
-            groups = []
-            for row_number in sorted(shrink_material_rows):
-                if groups and groups[-1][1] + 1 == row_number:
-                    groups[-1][1] = row_number
-                else:
-                    groups.append([row_number, row_number])
+            from register_rows import delete_empty_register_rows
             try:
-                for first, last in reversed(groups):
-                    candidate = shift_register_rows(candidate, first, last - first + 1, delete=True,
-                                                    expand_shared=True)
-                updated = candidate
+                updated = delete_empty_register_rows(updated, shrink_material_rows, material_total_cells=shrink_total_cells)
             except ValueError:
                 shrink_warning = ('The material change was saved, but Excel kept an extra blank row because its layout '
                                   'could not be safely compacted automatically. Review the workbook before reusing that row.')

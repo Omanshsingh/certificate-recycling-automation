@@ -10,8 +10,9 @@ from openpyxl.formula.tokenizer import Tokenizer
 from openpyxl.utils.cell import range_boundaries, get_column_letter, coordinate_to_tuple
 
 from register_protection import externally_protected
-from certificate_core import select_register
-from workbook_store import _attributes, _element, _sheet_member
+from certificate_core import norm, select_register
+from workbook_store import (_attributes, _element, _inward_blocks, _register_occupied_cells,
+                            _sheet_member, inward_client_columns)
 
 
 def expanded_shared_formulas(xml, sheet):
@@ -52,8 +53,35 @@ def expanded_shared_formulas(xml, sheet):
     return expanded
 
 
+def _material_totals(sheet, header, cols, records):
+    """Identify simple totals over one client's own material-weight column."""
+    if 'weight' not in cols:
+        return set(), {}
+    weight = get_column_letter(cols['weight'] + 1)
+    pattern = re.compile(rf'=SUM\({weight}(\d+):{weight}(\d+)\)')
+    total_cols = [cell.column for cell in sheet[header]
+                  if norm(cell.value) in {'totalweight', 'totalweightkg', 'totalweightinkg'}]
+    last_row = sheet.max_row
+    formulas, ends = set(), {}
+    for index, batch in enumerate(records):
+        if not batch['items']:
+            continue
+        start = batch['source_row']
+        limit = records[index + 1]['source_row'] - 1 if index + 1 < len(records) else last_row
+        totals = [sheet.cell(start, column) for column in total_cols]
+        totals.extend(sheet.cell(row, cols['weight'] + 1) for row in batch.get('summary_rows', []))
+        for cell in totals:
+            if cell.data_type != 'f' or not isinstance(cell.value, str):
+                continue
+            match = pattern.fullmatch(re.sub(r'\s|\$', '', cell.value).upper())
+            if match and int(match[1]) == start and start < int(match[2]) <= limit:
+                formulas.add(cell.coordinate)
+                ends[start] = max(ends.get(start, start), int(match[2]))
+    return formulas, ends
+
+
 def compact_register_gaps(data, *, source_rows=None):
-    """Remove legacy cleared row boxes, preserving populated and merged blocks."""
+    """Remove cleared rows and shorten verified material totals and their merges."""
     from certificate_core import read_batches, batch_content
     from workbook_store import register_content_end, UnsupportedReorderError
     before = read_batches(BytesIO(data))
@@ -61,30 +89,33 @@ def compact_register_gaps(data, *, source_rows=None):
         return data
     book = load_workbook(BytesIO(data), data_only=False)
     try:
-        sheet, header, _ = select_register(book)
+        sheet, header, cols = select_register(book)
         if externally_protected(sheet):
             return data
-        end = register_content_end(sheet, header)
+        records = [batch for batch in before if batch['source_sheet'] == sheet.title]
+        totals, material_ends = _material_totals(sheet, header, cols, records)
+        end = max(register_content_end(sheet, header), max(material_ends.values(), default=header))
+        with ZipFile(BytesIO(data)) as archive:
+            xml = archive.read(_sheet_member(archive, sheet.title)).decode('utf-8')
+        occupied = {row for row, _ in _register_occupied_cells(sheet, xml)}
+        client_cols = inward_client_columns(sheet, header, cols)
+        blocks = dict(_inward_blocks(sheet, records))
+        locked_rows = set()
+        for area in sheet.merged_cells.ranges:
+            if sheet.cell(area.min_row, area.min_col).value is None:
+                continue
+            can_shorten = (area.min_col == area.max_col and area.min_col in client_cols
+                           and area.max_row <= blocks.get(area.min_row, 0))
+            if not can_shorten:
+                locked_rows.update(range(area.min_row, area.max_row + 1))
         gaps = []
         for row in range(header + 1, end + 1):
-            if any(cell.value is not None or cell.comment or cell.hyperlink for cell in sheet[row]):
-                continue
-            if any(area.min_row <= row <= area.max_row
-                   and sheet.cell(area.min_row, area.min_col).value is not None for area in sheet.merged_cells.ranges):
-                continue
-            gaps.append(row)
+            if row not in occupied and row not in locked_rows:
+                gaps.append(row)
         if not gaps:
             return data
-        groups = []
-        for row in gaps:
-            if groups and groups[-1][1] + 1 == row:
-                groups[-1][1] = row
-            else:
-                groups.append([row, row])
-        updated = data
         try:
-            for first, last in reversed(groups):
-                updated = shift_register_rows(updated, first, last - first + 1, delete=True, expand_shared=True)
+            updated = delete_empty_register_rows(data, gaps, material_total_cells=totals)
         except ValueError as exc:
             raise UnsupportedReorderError(f'Empty row cleanup needs review in Excel: {exc}') from exc
         def facts(rows):
@@ -100,6 +131,22 @@ def compact_register_gaps(data, *, source_rows=None):
         return updated
     finally:
         book.close()
+
+
+def delete_empty_register_rows(data, rows, *, material_total_cells=()):
+    """Delete verified empty rows and keep client totals aligned with their materials."""
+    groups = []
+    for row in sorted(set(rows)):
+        if groups and groups[-1][1] + 1 == row:
+            groups[-1][1] = row
+        else:
+            groups.append([row, row])
+    for first, last in reversed(groups):
+        count = last - first + 1
+        data = shift_register_rows(data, first, count, delete=True, material_total_cells=material_total_cells)
+        material_total_cells = {f'{get_column_letter(col)}{row - count if row > last else row}'
+                                for row, col in map(coordinate_to_tuple, material_total_cells)}
+    return data
 
 
 def ensure_material_capacity(data, sn, required):
@@ -125,9 +172,7 @@ def ensure_material_capacity(data, sn, required):
         if required <= capacity:
             return data
         count = required - capacity
-        scalar_cols = set(range(1, sheet.max_column + 1)) - {cols[k] + 1 for k in ('item', 'quantity', 'per_piece_weight', 'weight') if k in cols}
-        if batch.get('hdd_cod_no'):
-            scalar_cols -= {cols[k] + 1 for k in ('cod_no', 'cod_date') if k in cols}
+        scalar_cols = inward_client_columns(sheet, header, cols)
         shifted = shift_register_rows(data, insert_at, count, expand_shared=True)
         with ZipFile(BytesIO(shifted)) as archive:
             member = _sheet_member(archive, sheet.title)
@@ -165,7 +210,7 @@ def ensure_material_capacity(data, sn, required):
         book.close()
 
 
-def shift_register_rows(data, first, count, *, delete=False, expand_shared=True):
+def shift_register_rows(data, first, count, *, delete=False, expand_shared=True, material_total_cells=()):
     """Insert or remove rows, expanding complete shared formulas without losing calculations."""
     last = first + count - 1
     book = load_workbook(BytesIO(data), data_only=False)
@@ -203,7 +248,9 @@ def shift_register_rows(data, first, count, *, delete=False, expand_shared=True)
             start = f'{get_column_letter(left)}{top}'
             return start if ':' not in value else f'{start}:{get_column_letter(right)}{bottom}'
 
-        def formula(value, *, rule=False):
+        def formula(value, *, rule=False, coordinate=None):
+            # Only the gap cleaner supplies these verified material totals.
+            shorten_total = delete and coordinate in material_total_cells
             parts = []
             for token in Tokenizer(value if value.startswith('=') else '=' + value).items:
                 text = token.value
@@ -212,10 +259,11 @@ def shift_register_rows(data, first, count, *, delete=False, expand_shared=True)
                 if token.type == 'OPERAND' and token.subtype == 'RANGE':
                     if not re.fullmatch(r'\$?[A-Z]{1,3}\$?\d+(?::\$?[A-Z]{1,3}\$?\d+)?', text, re.I):
                         raise ValueError('This register has linked calculations. Move its rows in Excel instead.')
-                    if delete and not rule and any(first <= int(n) <= last for n in re.findall(r'\d+', text)):
+                    if delete and not rule and not shorten_total and any(first <= int(n) <= last for n in re.findall(r'\d+', text)):
                         raise ValueError('Another calculation uses this inward. Remove the entry in Excel instead.')
+                    clipped_row = first - 1 if shorten_total else first
                     text = re.sub(r'(\$?[A-Z]{1,3}\$?)(\d+)',
-                                  lambda m: m[1] + str(row_number(int(m[2])) or first), text, flags=re.I)
+                                  lambda m: m[1] + str(row_number(int(m[2])) or clipped_row), text, flags=re.I)
                 parts.append(text)
             return ''.join(parts)
 
@@ -234,12 +282,13 @@ def shift_register_rows(data, first, count, *, delete=False, expand_shared=True)
                 if other != sheet and any(cell.data_type == 'f' for row in other for cell in row):
                     raise ValueError('Another sheet has calculations. Move the register rows in Excel instead.')
 
-            def patch_formula(match, *, rule=False):
+            def patch_formula(match, *, rule=False, coordinate=None):
                 block = match.group()
                 if _attributes(block):
                     raise ValueError('This workbook has shared calculations. Move its rows in Excel instead.')
                 start, end = block.index('>') + 1, block.rfind('</')
-                return block[:start] + escape(formula(unescape(block[start:end]), rule=rule)) + block[end:]
+                value = unescape(block[start:end])
+                return block[:start] + escape(formula(value, rule=rule, coordinate=coordinate)) + block[end:]
 
             def patch_row(match):
                 block = match.group()
@@ -257,14 +306,14 @@ def shift_register_rows(data, first, count, *, delete=False, expand_shared=True)
                         formula_xml = formula_match.group()
                         formula_attrs = _attributes(formula_xml)
                         if formula_attrs.get('t') != 'shared':
-                            return patch_formula(formula_match)
+                            return patch_formula(formula_match, coordinate=coordinate)
                         # Split a complete shared group into independent,
                         # row-adjusted formulas so Excel retains its calculations.
                         value = shared_values.get(coordinate)
                         if not value:
                             raise ValueError(f'Excel could not expand the shared formula at {coordinate}. Check it before moving rows.')
                         prefix = formula_match.group('p')
-                        return f'<{prefix}f>{escape(formula(value))}</{prefix}f>'
+                        return f'<{prefix}f>{escape(formula(value, coordinate=coordinate))}</{prefix}f>'
 
                     cell_xml = _element(cell_xml, 'f').sub(patch_cell_formula, cell_xml)
                     return re.sub(r'\br=(["\x27])([A-Z]+)\d+\1',
@@ -290,7 +339,7 @@ def shift_register_rows(data, first, count, *, delete=False, expand_shared=True)
                 body = body[:position] + ''.join(rows) + body[position:]
             xml = xml[:section.start()] + body + xml[section.end():]
 
-            def patch_ref(match, attribute='ref'):
+            def patch_ref(match, attribute='ref', *, merge=False):
                 block = match.group()
                 old = _attributes(block).get(attribute)
                 if not old:
@@ -299,13 +348,18 @@ def shift_register_rows(data, first, count, *, delete=False, expand_shared=True)
                 value = ' '.join(ref for ref in refs if ref)
                 if not value:
                     return ''
+                if merge:
+                    left, top, right, bottom = range_boundaries(value)
+                    if left == right and top == bottom:
+                        return ''
                 block = re.sub(rf'\b{attribute}=(["\x27]).*?\1', f'{attribute}={quoteattr(value)}', block, count=1)
                 for tag in ('formula', 'formula1', 'formula2'):
                     block = _element(block, tag).sub(lambda m: patch_formula(m, rule=True), block)
                 return block
 
-            for tag in ('dimension', 'mergeCell', 'autoFilter'):
+            for tag in ('dimension', 'autoFilter'):
                 xml = _element(xml, tag).sub(patch_ref, xml)
+            xml = _element(xml, 'mergeCell').sub(lambda match: patch_ref(match, merge=True), xml)
             for tag in ('conditionalFormatting', 'dataValidation'):
                 xml = _element(xml, tag).sub(lambda m: patch_ref(m, 'sqref'), xml)
             for tag, child in (('mergeCells', 'mergeCell'), ('dataValidations', 'dataValidation')):

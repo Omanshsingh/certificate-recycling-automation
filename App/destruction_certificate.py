@@ -157,11 +157,34 @@ def make_certificate(batch, cod, issued_date, destination):
     return destination
 
 
+def _save_linked_request_locked(root, plant, source, link, data, *, needed):
+    """Save a linked request using an inward already checked under the run lock."""
+    from certificate_core import parse_date
+    from certificate_drafts import write_register, clean_details, _manual_record_issued, _save_draft_locked
+
+    current = next((record for record in data['records']
+                    if record['details'].get('destruction_source') == link), None)
+    if current:
+        if current.get('destruction_requested', True) != needed:
+            if not needed and _manual_record_issued(root, current):
+                raise ValueError('This Data Destruction certificate has been issued. Open its row to review it or mark it Completed.')
+            current['destruction_requested'] = needed
+            write_register(root, data)
+        return current['id']
+    if not needed:
+        return None
+    received = parse_date(source.get('inward_date'))
+    details = dict(source, certificate_type='destruction', certificate_fields={
+        'device_receipts': json.dumps([{'date': received.isoformat() if received else '', 'count': ''}])},
+                   destruction_source=link, cod_no='', cod_date='', reference='', items=[])
+    details.pop('certificate_weight', None)
+    return _save_draft_locked(root, plant, clean_details(details), data)
+
+
 def request_for_inward(root, plant, case_id, expected_revision=None, *, needed=True, confirmed=False, record_id=None):
     """Save an idempotent additional request without writing to the inward workbook."""
-    from certificate_core import parse_date, read_batches
-    from certificate_drafts import (read_register, write_register, clean_details,
-                                    _manual_record_issued, _save_draft_locked)
+    from certificate_core import read_batches
+    from certificate_drafts import read_register
     from issuance_safety import recover_issuances
     from workflow_support import load_settings, run_lock
     from workspace_review import require_revision
@@ -199,20 +222,4 @@ def request_for_inward(root, plant, case_id, expected_revision=None, *, needed=T
             require_revision(root, expected_revision)
             if not record_id and path.read_bytes() != source_bytes:
                 raise ValueError('The Excel files changed while opening Data Destruction. Refresh and try again.')
-        current = next((record for record in data['records']
-                        if record['details'].get('destruction_source') == link), None)
-        if current:
-            if current.get('destruction_requested', True) != needed:
-                if not needed and _manual_record_issued(root, current):
-                    raise ValueError('This Data Destruction certificate has been issued. Open its row to review it or mark it Completed.')
-                current['destruction_requested'] = needed
-                write_register(root, data)
-            return current['id']
-        if not needed:
-            return None
-        received = parse_date(source.get('inward_date'))
-        details = dict(source, certificate_type='destruction', certificate_fields={
-            'device_receipts': json.dumps([{'date': received.isoformat() if received else '', 'count': ''}])},
-                       destruction_source=link, cod_no='', cod_date='', reference='', items=[])
-        details.pop('certificate_weight', None)
-        return _save_draft_locked(root, plant, clean_details(details), data)
+        return _save_linked_request_locked(root, plant, source, link, data, needed=needed)
