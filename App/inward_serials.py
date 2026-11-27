@@ -62,7 +62,7 @@ def reserved_workbook_serials(root, plant):
 def assign_missing_serial_numbers(data, *, root=None, plant=None):
     """Fill blank SNs only on rows the parser can identify as new inwards."""
     from certificate_core import read_batches, select_register, text
-    from openpyxl import load_workbook
+    from register_reader import load_workbook
     from openpyxl.utils import get_column_letter
     from workbook_store import _set_cell, _sheet_member
 
@@ -183,7 +183,7 @@ def resequence_added_inward(data, added, original_data, *, root, plant, request_
     from certificate_core import read_batches, batch_content, select_register, text
     from workbook_store import (_set_cell, _sheet_member, sort_register_by_inward_date,
                                 UnsupportedReorderError)
-    from openpyxl import load_workbook
+    from register_reader import load_workbook
     from openpyxl.utils import get_column_letter
     from issuance_safety import audit_records, workbook_receipt_conflict
     from certificate_drafts import read_register

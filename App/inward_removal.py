@@ -10,7 +10,7 @@ import re
 import xml.etree.ElementTree as ET
 from zipfile import ZipFile
 
-from openpyxl import load_workbook
+from register_reader import load_workbook
 from openpyxl.formula.tokenizer import Tokenizer
 from openpyxl.utils.cell import range_boundaries
 
@@ -38,7 +38,7 @@ def stage_removal(data, sn, sheet_name, source_row, *, certificate_conversion=Fa
     batch = matches[0]
     if batch['source_sheet'] != sheet_name or batch['source_row'] != source_row:
         raise ValueError('This inward moved in Excel. Refresh and check the entry again.')
-    if not certificate_conversion and status_value(batch.get('issued')) in {'generated', 'generated_manual', 'completed'}:
+    if not certificate_conversion and status_value(batch.get('_recycling_status', batch.get('issued'))) in {'generated', 'generated_manual', 'completed'}:
         raise ValueError('This inward already has certificate details, so it cannot be removed here.')
     if any('total row needs checking' in issue for issue in batch.get('blocking_issues', [])):
         raise ValueError('Check the total rows in Excel before removing this inward.')

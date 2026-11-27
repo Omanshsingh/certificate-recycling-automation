@@ -5,7 +5,7 @@ from hashlib import sha512
 from io import BytesIO
 from zipfile import ZipFile
 
-from openpyxl import load_workbook
+from register_reader import load_workbook
 
 from certificate_core import select_register
 

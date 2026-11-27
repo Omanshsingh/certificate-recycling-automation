@@ -9,6 +9,7 @@ from __future__ import annotations
 from copy import copy
 from datetime import date
 from decimal import Decimal
+from functools import lru_cache
 from io import BytesIO
 import json
 import os
@@ -314,8 +315,12 @@ def layout_warnings(batch, cod, issued_date):
         from destruction_certificate import layout_warnings as destruction_layout_warnings
         return destruction_layout_warnings(batch)
     values = display_values(batch, cod, issued_date)
-    warnings = []
     placed = list(positioned_regions(batch.get("certificate_type"), values))
+    return _placement_warnings(placed, values)
+
+
+def _placement_warnings(placed, values):
+    warnings = []
     for region in placed:
         value = values.get(region["key"], region["text"])
         if value and value != region["text"] and _layout(region, value)[-1]:
@@ -419,6 +424,30 @@ def _original_region(source, region, height, groups=None):
     return layer
 
 
+_FIXED_REGION_FIELDS = ('key', 'left', 'top', 'width', 'height', 'text')
+
+
+@lru_cache(maxsize=12)
+def _fixed_template_page(original_bytes, background_bytes, height, fixed_regions):
+    """Compose the artwork and unchanged labels once per template layout.
+
+    Cache serialized bytes so each certificate has its own editable PDF page.
+    The exact template bytes are part of the key, including after an edit.
+    """
+    if not fixed_regions:
+        return background_bytes
+    original = PdfReader(BytesIO(original_bytes)).pages[0]
+    groups = _original_groups(original)
+    writer = PdfWriter()
+    page = writer.add_page(PdfReader(BytesIO(background_bytes)).pages[0])
+    for fields in fixed_regions:
+        region = dict(zip(_FIXED_REGION_FIELDS, fields))
+        page.merge_page(_original_region(original, region, height, groups=groups))
+    output = BytesIO()
+    writer.write(output)
+    return output.getvalue()
+
+
 def make_template_certificate(batch, cod, issued_date, destination, allow_warnings=False):
     kind = template_id(batch.get("certificate_type"))
     if kind == 'destruction':
@@ -426,17 +455,25 @@ def make_template_certificate(batch, cod, issued_date, destination, allow_warnin
         return make_certificate(batch, cod, issued_date, destination)
     data = geometry(kind)
     values = display_values(batch, cod, issued_date)
-    warnings = layout_warnings(batch, cod, issued_date)
-    if warnings and not allow_warnings:
-        raise ValueError("; ".join(warnings))
-    original = PdfReader(TEMPLATE_ROOT / f"{kind}.pdf").pages[0]
-    original_groups = None
+    placed = list(positioned_regions(kind, values))
+    if not allow_warnings:
+        warnings = _placement_warnings(placed, values)
+        if warnings:
+            raise ValueError("; ".join(warnings))
+    fixed = [region for region in placed
+             if region['text'] and not region.get('moved')
+             and values.get(region['key'], region['text']) == region['text']]
+    fixed_keys = {region['key'] for region in fixed}
+    base = _fixed_template_page(
+        (TEMPLATE_ROOT / f"{kind}.pdf").read_bytes() if fixed else b'',
+        (TEMPLATE_ROOT / f"{kind}.background.pdf").read_bytes(),
+        data['height'],
+        tuple(tuple(region[field] for field in _FIXED_REGION_FIELDS) for region in fixed),
+    )
     writer = PdfWriter()
-    writer.add_page(PdfReader(TEMPLATE_ROOT / f"{kind}.background.pdf").pages[0])
-    background = writer.pages[0]
+    background = writer.add_page(PdfReader(BytesIO(base)).pages[0])
     overlay = BytesIO()
     pdf = canvas.Canvas(overlay, pagesize=(data["width"], data["height"]))
-    placed = list(positioned_regions(kind, values))
     # Table borders are structural vectors. Drawing the merged cell geometry
     # lets operators move/resize the complete box while keeping the artwork.
     pdf.setLineWidth(.75)
@@ -452,14 +489,7 @@ def make_template_certificate(batch, cod, issued_date, destination, allow_warnin
         pdf.line(x1, data["height"]-y1, x2, data["height"]-y2)
     for region in placed:
         value = values.get(region["key"], region["text"])
-        if value == region["text"] and value and not region.get("moved"):
-            if original_groups is None:
-                # All fixed labels share the same original page. Parse it once
-                # for this PDF while keeping every output layer independent.
-                original_groups = _original_groups(original)
-            background.merge_page(_original_region(original, region, data["height"], groups=original_groups))
-            continue
-        if not value:
+        if not value or region['key'] in fixed_keys:
             continue
         font, size, lines, leading, width, height, _ = _layout(region, value)
         ml, mt, mr, mb = region.get("margins", [2, 2, 2, 2])

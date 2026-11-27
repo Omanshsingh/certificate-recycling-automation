@@ -13,7 +13,7 @@ PROPERTY = 'EcorecoCertificateDetails'
 PROPERTY_V2 = 'EcorecoCertificateDetailsV2_'
 KEYS = {'form6', 'reference', 'certificate_type', 'certificate_fields', 'certificate_weight',
         '_pdf_recovery_pending', '_hdd_cod_no', '_hdd_cod_date', '_hdd_primary', '_external_pdf',
-        '_recycling_completed'}
+        '_recycling_completed', '_recycling_status', '_aggregate_status'}
 PROPERTY_CHUNK_SIZE = 180  # Excel limits each custom-property value to 255 characters.
 
 
@@ -109,7 +109,7 @@ def _physical_serial_aliases(data, sheet_name, case_id):
     """Recover old numeric metadata keys only from the matching Excel cell."""
     if not re.fullmatch(r'-?0\d+', str(case_id)):
         return ()
-    from openpyxl import load_workbook
+    from register_reader import load_workbook
     from certificate_core import register_header, text
     book = load_workbook(BytesIO(data), data_only=False)
     try:

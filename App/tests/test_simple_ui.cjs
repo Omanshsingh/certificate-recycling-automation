@@ -85,7 +85,7 @@ function harness(options = {}) {
       requests.push({endpoint, ...init, payload:init.body ? JSON.parse(init.body) : undefined});
       return options.fetch ? options.fetch(endpoint, init) : {ok:true,json:async () => ({workspace_revision:'revision-2'})};
     }});
-  const ui = vm.runInContext(`${source}\n({app, stateLabel, statusClass, nextStep, matches, makeActions, makeClientCell, makeDetailRow, renderFolderInventory, simpleWarning, readableNumber, detailsBody, materialWeightTotal, updateMaterialWeightTotal, renderMaterialRows, visiblePage, pastCertificateNumbers, certificateFileTitle, showSavedFile, renderPastNumbers, api, fieldDifferences, renderChangeSummary, editorDirty, saveWorkingDraft, saveDraft, readWorkingDraft, clearWorkingDraft, offerDraftRecovery, restoreWorkingDraft, requestDetailsClose, finishDraftClose, certificateUrl, showGenerationSuccess, submitGeneration, bulkGenerationPayload, openBulkGeneration, startBulkGeneration, renderEditorSummary, setEditorMode, validateEditor, finishEditing, openDetails, beginIssuedCertificateCorrection, renderIssuedChangeReview, openIssuedChangeReview, resolveIssuedExcelChanges, saveDetails, showWarnings, confirmWarnings, pickAnnexure, previewDetails, toggleFullPdfPreview, backupAction, openBackupRestore, restoreBackup, historyDifferences, loadHistory, showHistoryDetail, invalidatePreview, confirmAction, settleActionConfirmation, handleAction, wire, stopApp, summarize})`, context);
+  const ui = vm.runInContext(`${source}\n({app, stateLabel, statusClass, nextStep, matches, makeActions, makeClientCell, makeDetailRow, renderFolderInventory, simpleWarning, readableNumber, detailsBody, materialWeightTotal, updateMaterialWeightTotal, renderMaterialRows, visiblePage, pastCertificateNumbers, certificateFileTitle, showSavedFile, renderPastNumbers, api, fieldDifferences, renderChangeSummary, editorDirty, saveWorkingDraft, saveDraft, readWorkingDraft, clearWorkingDraft, offerDraftRecovery, restoreWorkingDraft, requestDetailsClose, finishDraftClose, certificateUrl, showGenerationSuccess, submitGeneration, bulkGenerationPayload, openBulkGeneration, startBulkGeneration, renderEditorSummary, setEditorMode, validateEditor, openDetails, beginIssuedCertificateCorrection, renderIssuedChangeReview, openIssuedChangeReview, resolveIssuedExcelChanges, saveDetails, showWarnings, confirmWarnings, pickAnnexure, previewDetails, toggleFullPdfPreview, backupAction, openBackupRestore, restoreBackup, historyDifferences, loadHistory, showHistoryDetail, invalidatePreview, confirmAction, settleActionConfirmation, handleAction, wire, stopApp, summarize})`, context);
   Object.assign(ui, vm.runInContext('({savedFilePlant, savedFileUrl, savedFileMatches, setWorkspaceView, resetRecordFilters, nextWorkbookId, suggestWorkbookId, printedWeight, updatePrintedWeight, schedulePreview, saveSettings, settingsValues, openSettings, requestSettingsClose, returnFromWarnings, toast, makeStatus, reconnectDashboard, saveExcelChoice, renderTemplateEditor})',context));
   Object.assign(ui, vm.runInContext('({startInlineEdit, finishInlineEdit, syncWorkbookChanges, setState, renderWorkbookIssues, refreshState, pollReminderReview})',context));
   Object.assign(ui, vm.runInContext('({saveClient, materialValues, duplicateSerialNumber, compareRows})',context));
@@ -389,12 +389,13 @@ test('New ignores outside clicks and asks before discarding entered details', ()
   assert.equal(h.controls.get('#unsaved-modal').open,true);
 });
 
-test('Deletion stays available before generation and remains blocked by recycling or HDD issuance', () => {
+test('Deleting an unissued Recycling inward keeps linked HDD records independent', () => {
   const h=harness(),row={source_kind:'workbook',plant:'plant1',sn:'1',sheet:'Inward Register',row:2,certificate_status:'ready',certificate_no:'0042'};
   assert.equal(h.ui.canDeleteEntry(row),true);
-  for(const change of [{has_issued_certificate:true},{hdd_cod_no:'0043'},{pdf_filename:'0042.pdf'},{certificate_status:'generated'},{certificate_status:'completed'}])assert.equal(h.ui.canDeleteEntry({...row,...change}),false);
+  for(const change of [{has_issued_certificate:true},{pdf_filename:'0042.pdf'},{certificate_status:'generated'},{certificate_status:'completed'}])assert.equal(h.ui.canDeleteEntry({...row,...change}),false);
+  assert.equal(h.ui.canDeleteEntry({...row,hdd_cod_no:'0043'}),true);
   h.ui.app.state.rows=[row,{source_kind:'manual',plant:'plant1',record_id:'hdd',certificate_status:'generated_manual',destruction_source:{plant:'plant1',case_id:'1'}}];
-  assert.equal(h.ui.canDeleteEntry(row),false);
+  assert.equal(h.ui.canDeleteEntry(row),true);
 });
 
 test('Changing an issued certificate type never offers inward deletion', async () => {
@@ -2520,6 +2521,28 @@ function searchableBulk() {
   h.ui.openBulkGeneration();return h;
 }
 
+test('Bulk COD override shows reviewed assignments and keeps choices when going back', async () => {
+  const h = searchableBulk();
+  const start = h.controls.get('#bulk-start-cod');
+  assert.equal(start.required, false);
+  start.value = '217'; start.dispatch('input');
+  const index = h.ui.app.bulkRows.findIndex(row => row.sn === '13');
+  h.ui.app.bulkCheckboxes[index].checked = true;
+  h.ui.app.bulkCheckboxes[index].dispatch('change');
+  vm.runInContext(`submitGeneration = async payload => {
+    app.submittedBatch = payload;
+    showWarnings([], {endpoint:'/api/generate', payload, assignments:[
+      {plant:'plant1', sn:'13', supplier:'Siemens Healthcare', cod:'0219'}]});
+  };`, h.context);
+  await h.ui.startBulkGeneration();
+  assert.equal(h.ui.app.submittedBatch.starting_cod, '217');
+  assert.match(text(h.controls.get('#warning-list')), /Siemens Healthcare.*COD 0219/);
+  h.controls.get('#warning-go-back').dispatch('click');
+  assert.equal(h.controls.get('#bulk-generation-modal').open, true);
+  assert.equal(start.value, '217');
+  assert.equal(h.ui.app.bulkChecked.has(index), true);
+});
+
 test('Create several searches names, SNs, references and cities without losing selections', () => {
   const h=searchableBulk();
   const selected=h.ui.app.bulkRows.findIndex(row=>row.sn==='21');
@@ -3420,7 +3443,8 @@ test('First generation exposes one PDF edit action and keeps Excel writes disabl
   for (const name of ['cod_no','cod_date','case_id']) assert.equal(form.elements.namedItem(name).readOnly,true);
   assert.equal(h.controls.get('#save-details').textContent,'Generate certificate');
   assert.equal(h.ui.detailsBody(form).edit_scope,'certificate_only');
-  assert.equal(h.controls.get('#edit-pdf-details').textContent,'Done editing');
+  assert.equal(h.controls.get('#edit-pdf-details').textContent,'✎ Edit details');
+  assert.equal(h.controls.get('#edit-pdf-details').hidden,true);
   assert.equal(h.requests.length,0);
   assert.equal(all(h.controls.get('#editor-facts'),node => node.tag === 'button').length,0);
   h.ui.startInlineEdit('supplier','Company'); assert.equal(h.ui.app.editor.inlineEdit,undefined);
@@ -4302,6 +4326,9 @@ test('A local certificate retained after Excel deletion can add its own HDD requ
   Object.assign(h.ui.app.editor,{sourceSn:null,localInwardId:base.record_id,recordId:base.record_id,template:'siemens',fields:{siemens:{}}});
   form.values.source_kind='manual';form.values.certificate_type='siemens';h.ui.app.editor.baseline=h.ui.detailsBody(form);
   h.ui.switchLinkedCertificate('destruction');await settleSwitch();
+  assert.equal(h.controls.get('#action-confirmation-modal').open,true);
+  assert.equal(h.requests.length,0);
+  h.controls.get('#confirm-action').dispatch('click');await settleSwitch();
   assert.equal(h.requests.length,1);assert.equal(h.requests[0].endpoint,'/api/destruction/request');
   assert.equal(h.requests[0].payload.record_id,base.record_id);
   assert.equal(h.context.opened[0],hdd);
@@ -4365,6 +4392,9 @@ test('Canceling a switch preserves unsaved edits and the current dropdown; disca
   h.ui.finishDraftClose(false);await settleSwitch();
   assert.equal(h.context.opened.length,0);assert.equal(form.values.supplier,'Unsaved company');
   h.ui.switchLinkedCertificate('destruction');h.ui.finishDraftClose(true);await settleSwitch();
+  assert.equal(h.controls.get('#action-confirmation-modal').open,true);
+  assert.equal(h.requests.length,0);
+  h.controls.get('#confirm-action').dispatch('click');await settleSwitch();
   assert.equal(h.context.opened[0],linkedHdd);assert.equal(h.requests.length,0);
 });
 
@@ -4377,6 +4407,11 @@ test('HDD can open before Recycling is issued or the HDD checkbox is selected', 
   assert.equal(h.controls.get('#open-companion-certificate').hidden,false);
   assert.equal(h.controls.get('#open-companion-certificate').textContent,'Open Data Destruction (HDD)');
   h.ui.openCompanionCertificate();h.ui.openCompanionCertificate();
+  await settleSwitch();
+  assert.equal(h.controls.get('#action-confirmation-modal').open,true);
+  assert.equal(h.requests.length,0);
+  h.controls.get('#confirm-action').dispatch('click');
+  await settleSwitch();
   assert.equal(h.requests.length,1);assert.equal(h.requests[0].endpoint,'/api/destruction/request');
   assert.deepEqual(h.requests[0].payload,{plant:'plant1',sn:'1001',expected_revision:'revision-1'});
   const pending={...linkedHdd,cod_no:'',certificate_status:'draft'};
@@ -4388,6 +4423,8 @@ test('HDD can open before Recycling is issued or the HDD checkbox is selected', 
 test('A failed HDD request keeps the original editor open and shows the error', async () => {
   const h=harness({fetch:async()=>({ok:false,status:409,json:async()=>({error:'Excel has changed.'})})});linkedEditor(h,[linkedBase]);
   h.ui.switchLinkedCertificate('destruction');await settleSwitch();
+  assert.equal(h.requests.length,0);
+  h.controls.get('#confirm-action').dispatch('click');await settleSwitch();
   assert.equal(h.context.opened.length,0);assert.equal(h.controls.get('#details-modal').open,true);
   assert.match(h.controls.get('#details-error').textContent,/Excel has changed/);
   assert.equal(h.controls.get('#details-error').hidden,false);assert.equal(h.ui.app.detailsBusy,false);

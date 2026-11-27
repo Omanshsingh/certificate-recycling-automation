@@ -69,12 +69,15 @@ class AlertReliabilityTests(unittest.TestCase):
     def test_midnight_invalidates_unchanged_file_stamps(self):
         with patch.object(web_app, 'ROOT', self.root), patch.object(web_app, 'date') as day, \
                 patch.object(web_app, 'WORKBOOK_CHECK_STAMPS', {}), \
+                patch.object(web_app, 'LINKED_STATUS_STAMPS', {}), \
                 patch.object(web_app, 'configured_paths', return_value=[]), \
                 patch.object(web_app, 'load_settings', return_value={'workbook_paths': ['a', 'b']}), \
                 patch.object(web_app, 'latest_result', return_value={'rows': [], 'scan_complete': True}), \
                 patch.object(web_app, 'refresh', return_value={'rows': []}) as refresh:
             day.today.return_value = date(2026, 10, 25)
-            web_app.WORKBOOK_CHECK_STAMPS[str(self.root)] = web_app.workbook_check_stamp([])
+            stamp = web_app.workbook_check_stamp([])
+            web_app.WORKBOOK_CHECK_STAMPS[str(self.root)] = stamp
+            web_app.LINKED_STATUS_STAMPS[str(self.root)] = stamp
             self.assertFalse(web_app.check_workbook_changes()['changed'])
             day.today.return_value = date(2026, 10, 26)
             self.assertTrue(web_app.check_workbook_changes()['changed'])
@@ -112,6 +115,11 @@ class AlertReliabilityTests(unittest.TestCase):
         for kind in ('standard', 'sita', 'siemens', 'destruction'):
             row = self.record(status='ready', warnings=[old, 'An actual issue'])
             row['details']['certificate_type'] = kind
+            if kind == 'destruction':
+                row['details']['certificate_fields'] = {
+                    'destruction_date':'2026-10-16',
+                    'device_receipts':json.dumps([{'date':'2026-10-14', 'count':'1'}]),
+                }
             support.save_json(drafts.register_path(self.root), {'version': 1, 'records': [row]})
             self.assertEqual(drafts.manual_rows(self.root)[0]['warnings'], ['An actual issue'])
             self.assertEqual(drafts.read_register(self.root)['records'][0]['warnings'], [old, 'An actual issue'])

@@ -46,7 +46,7 @@ def _windows_change_time(path):
         data = BasicInfo()
         if not query(handle, 0, ctypes.byref(data), ctypes.sizeof(data)):
             return None
-        return data.change
+        return data.change or None
     finally:
         close(handle)
 
@@ -58,23 +58,34 @@ def file_signature(path):
     return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, change)
 
 
-def fingerprint(path, *, force=False, payload_limit=None):
-    """Return a digest and optional exact bytes; never retain PDF bytes in cache."""
+def fingerprint(path, *, force=False, payload_limit=None, verified=None):
+    """Return a digest and optional exact bytes; never retain PDF bytes in cache.
+
+    A caller may keep its own verified digests for one bulk operation. Those
+    entries come from fresh reads in that operation, never the display cache.
+    """
     path = Path(path)
-    key = str(path.resolve())
+    key = os.path.normcase(os.path.abspath(path))
     before = file_signature(path)
     now = time.monotonic()
-    with _LOCK:
-        cached = _CACHE.get(key)
-        if not force and before[-1] is not None and cached and cached[0] == before and now - cached[2] < MAX_AGE:
-            _CACHE.move_to_end(key)
-            return cached[1], None
+    if verified is not None:
+        previous = verified.get(key)
+        if before[-1] is not None and previous and previous[0] == before and now - previous[2] < MAX_AGE:
+            return previous[1], None
+    elif not force:
+        with _LOCK:
+            cached = _CACHE.get(key)
+            if before[-1] is not None and cached and cached[0] == before and now - cached[2] < MAX_AGE:
+                _CACHE.move_to_end(key)
+                return cached[1], None
     payload = None
     with path.open('rb') as stream:
         if payload_limit is not None and before[2] <= payload_limit:
-            candidate = stream.read(payload_limit + 1)
+            # Allocate for the observed file size. If it grows, hash the
+            # remaining bytes in chunks and let the signature check reject it.
+            candidate = stream.read(before[2] + 1)
             checksum = hashlib.sha256(candidate)
-            if len(candidate) <= payload_limit:
+            if len(candidate) == before[2]:
                 payload = candidate
             else:
                 for chunk in iter(lambda: stream.read(1024 * 1024), b''):
@@ -84,6 +95,8 @@ def fingerprint(path, *, force=False, payload_limit=None):
             digest = hashlib.file_digest(stream, 'sha256').hexdigest()
     if file_signature(path) != before:
         raise OSError(f'{path.name} changed while it was being checked. Retry the operation.')
+    if verified is not None and before[-1] is not None:
+        verified[key] = (before, digest, now)
     with _LOCK:
         _CACHE[key] = (before, digest, now)
         _CACHE.move_to_end(key)

@@ -12,7 +12,7 @@ import math
 import os
 import json
 
-from openpyxl import load_workbook
+from register_reader import load_workbook
 from openpyxl.utils.cell import get_column_letter
 from excel_values import excel_date, formula_number, weight_number, quantity_number
 from reportlab.lib.utils import ImageReader
@@ -214,6 +214,8 @@ def select_register(workbook):
     visible = [entry for entry in candidates if entry[0].sheet_state == 'visible']
     if len(visible) == 1:
         selected = visible[0]
+        if len(candidates) == 1:
+            return selected
         # An archived register can contain CODs that are absent from PDFs. Never
         # silently ignore those numbering sources. Only an exact hidden copy is safe.
         source_rows = list(selected[0].iter_rows(min_row=selected[1], values_only=True))
@@ -454,8 +456,16 @@ def _read_batches(path):
                 "certificate_fields": {} if 'certificate_fields' in cols else saved.get('certificate_fields', {}),
                 "cod_no": read_cell_text("cod_no", raw[cols["cod_no"]], excel_row) if "cod_no" in cols else "",
                 "cod_date": (excel_date(raw[cols['cod_date']], epoch, parse_date) or raw[cols['cod_date']]) if 'cod_date' in cols else None,
+                "excel_status": text(raw[cols["issued"]]) if "issued" in cols else "",
                 "issued": ("N/A" if supplier_is_always_not_applicable(raw[cols["supplier"]])
                            else text(raw[cols["issued"]]) if "issued" in cols else ""),
+                "_recycling_status": (
+                    saved.get('_recycling_status', text(raw[cols['issued']]) if 'issued' in cols else '')
+                    if (saved.get('_aggregate_status') and 'issued' in cols
+                        and status_value(raw[cols['issued']]) == status_value(saved.get('_aggregate_status')))
+                    else ("N/A" if supplier_is_always_not_applicable(raw[cols["supplier"]])
+                          else text(raw[cols["issued"]]) if "issued" in cols else "")),
+                "_aggregate_status": saved.get('_aggregate_status'),
                 "source_sheet": sheet_name,
                 "source_header_row": header_row,
                 "column_mapping": mapping,
@@ -695,7 +705,26 @@ def status_value(value):
 
 def effective_certificate_status(batch, record=None, completion_ack=None):
     """Normalize the worksheet status, including legacy labels from old installs."""
-    return status_value(batch.get("issued"))
+    return status_value(batch.get("_recycling_status", batch.get("issued")))
+
+
+def aggregate_inward_status(recycling_status, hdd_statuses=()):
+    """Combine required certificates so the shared Excel cell shows the lagging state."""
+    values = [status_value(recycling_status), *(status_value(value) for value in hdd_statuses)]
+    values = [value for value in values if value != 'na']
+    if not values:
+        return 'N/A'
+    rank = {'blank': 0, 'unknown': 0, 'alert': 0, 'ready': 1,
+            'generated': 2, 'generated_manual': 2, 'completed': 3}
+    lowest = min(rank.get(value, 0) for value in values)
+    lagging = [value for value in values if rank.get(value, 0) == lowest]
+    if lowest == 0:
+        return 'Alert'
+    if lowest == 1:
+        return 'Ready'
+    if lowest == 2:
+        return 'Generated Externally' if all(value == 'generated_manual' for value in lagging) else 'Generated'
+    return 'Completed'
 
 
 def batch_content(batch):

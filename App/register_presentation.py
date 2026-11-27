@@ -9,7 +9,7 @@ from xml.sax.saxutils import quoteattr
 from zipfile import ZipFile
 
 from PIL import ImageFont
-from openpyxl import load_workbook
+from register_reader import load_workbook
 from openpyxl.styles.numbers import is_date_format
 from openpyxl.utils.cell import column_index_from_string, get_column_letter
 from openpyxl.utils.datetime import to_excel
@@ -71,6 +71,7 @@ def _font_measure(name, size, bold=False, italic=False):
     return lambda value: sum(1 if east_asian_width(char) in 'WF' else .6 for char in value) * size * 96 / 72
 
 
+@lru_cache(maxsize=1024)
 def _wrapped_lines(value, width, measure):
     lines = 0
     for paragraph in value.replace('\r\n', '\n').replace('\r', '\n').split('\n'):
@@ -207,6 +208,8 @@ def _fit_wrapped_rows(xml, sheet, display_cells, normal_font, fit_rows, bold_col
 
 def normalize_register_presentation(data, *, wrap_only=False, include_validation=False, fit_inward=None,
                                     fit_register=False):
+    if wrap_only and not (fit_inward or fit_register or include_validation):
+        return data
     book = load_workbook(BytesIO(data), data_only=False)
     try:
         sheet, header, cols = select_register(book)
@@ -228,10 +231,32 @@ def normalize_register_presentation(data, *, wrap_only=False, include_validation
         with ZipFile(BytesIO(data)) as archive:
             member = _sheet_member(archive, sheet.title)
             xml = archive.read(member).decode('utf-8')
+            if wrap_only:
+                display_cells = []
+                for row in _element(xml, 'row').finditer(xml):
+                    fragment = row.group()
+                    if int(_attributes(fragment)['r']) not in fit_rows:
+                        continue
+                    for match in _element(fragment, 'c').finditer(fragment):
+                        cell_xml = match.group()
+                        attrs = _attributes(cell_xml)
+                        cell = sheet[attrs['r']]
+                        value = _display_cell_value(cell, cell_xml, attrs)
+                        if value is not None and value != '':
+                            display_cells.append((cell, value))
+                bold_columns = {cols[key] + 1 for key in ('issued', 'supplier') if key in cols}
+                fitted = _fit_wrapped_rows(xml, sheet, display_cells, book._fonts[0], fit_rows, bold_columns)
+                if include_validation and 'issued' in cols:
+                    fitted = _ensure_status_validation(fitted, get_column_letter(cols['issued'] + 1),
+                                                       max(10000, sheet.max_row + 2000), header + 1)
+                if fitted == xml:
+                    return data
+                return _presentation_package(archive, {member: fitted.encode('utf-8')})
+
             styles = archive.read('xl/styles.xml').decode('utf-8')
             existing = next((_attributes(m.group())['numFmtId'] for m in _element(styles, 'numFmt').finditer(styles)
                              if _attributes(m.group()).get('formatCode') == DATE_FORMAT), None)
-            if existing is None and not wrap_only:
+            if existing is None:
                 styles, _ = _date_style(styles, 0, DATE_FORMAT)
                 existing = next(_attributes(m.group())['numFmtId'] for m in _element(styles, 'numFmt').finditer(styles)
                                 if _attributes(m.group()).get('formatCode') == DATE_FORMAT)
@@ -249,27 +274,20 @@ def normalize_register_presentation(data, *, wrap_only=False, include_validation
                 cell = sheet[attrs['r']]
                 if cell.row < header:
                     continue
-                is_date = not wrap_only and cell.row > header and (cell.column in date_cols or is_date_format(cell.number_format))
-                value = cell.value
+                is_date = cell.row > header and (cell.column in date_cols or is_date_format(cell.number_format))
+                value = _display_cell_value(cell, match.group(), attrs)
                 if is_date and isinstance(value, str) and cell.data_type != 'f':
                     parsed = parse_date(value)
                     if parsed:
                         xml = _set_cell(xml, cell.coordinate, to_excel(parsed, book.epoch), 'n')
                         value = None
-                if cell.data_type == 'f':
-                    cached = _element(match.group(), 'v').search(match.group()) if attrs.get('t') == 'str' else None
-                    value = None
-                    if cached:
-                        # Parse the cached text, including numeric character references.
-                        inner = cached.group().partition('>')[2].rpartition('<')[0]
-                        value = ET.fromstring(f'<v>{inner}</v>').text
                 if cell.row in fit_rows and value is not None and value != '':
                     display_cells.append((cell, value))
                 style_key = (int(attrs.get('s', 0)), is_date)
                 if style_key in style_ids:
                     ids[cell.coordinate] = style_ids[style_key]
                     continue
-                definition = _wrapped_style(definitions[style_key[0]], prefix, top_left=not wrap_only)
+                definition = _wrapped_style(definitions[style_key[0]], prefix, top_left=True)
                 if is_date:
                     definition = _set_attribute(definition, 'numFmtId', existing)
                     definition = _set_attribute(definition, 'applyNumberFormat', 1)
@@ -291,11 +309,26 @@ def normalize_register_presentation(data, *, wrap_only=False, include_validation
             changes = {member: xml.encode('utf-8'), 'xl/styles.xml': styles.encode('utf-8')}
             if all(archive.read(name) == value for name, value in changes.items()):
                 return data
-            output = BytesIO()
-            with ZipFile(output, 'w') as target:
-                target.comment = archive.comment
-                for info in archive.infolist():
-                    target.writestr(info, changes.get(info.filename, archive.read(info.filename)))
-            return output.getvalue()
+            return _presentation_package(archive, changes)
     finally:
         book.close()
+
+
+def _display_cell_value(cell, fragment, attrs):
+    if cell.data_type != 'f':
+        return cell.value
+    cached = _element(fragment, 'v').search(fragment) if attrs.get('t') == 'str' else None
+    if cached:
+        inner = cached.group().partition('>')[2].rpartition('<')[0]
+        return ET.fromstring(f'<v>{inner}</v>').text
+    return None
+
+
+def _presentation_package(archive, changes):
+    output = BytesIO()
+    with ZipFile(output, 'w') as target:
+        target.comment = archive.comment
+        for info in archive.infolist():
+            content = changes[info.filename] if info.filename in changes else archive.read(info.filename)
+            target.writestr(info, content)
+    return output.getvalue()

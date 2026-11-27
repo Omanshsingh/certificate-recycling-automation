@@ -35,7 +35,7 @@ class AutomaticReadyTests(AutomationTestBase):
         original = read_batches(self.plant1)[0]
         self.refresh_sheet()
         current = read_batches(self.plant1)[0]
-        self.assertEqual(current, dict(original, issued='Ready'))
+        self.assertEqual(current, dict(original, issued='Ready', _recycling_status='Ready'))
         self.assertEqual(self.statuses(), ['Ready'])
         after = self.plant1.read_bytes()
         self.refresh_sheet()

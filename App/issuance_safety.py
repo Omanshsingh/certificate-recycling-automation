@@ -157,6 +157,24 @@ def _receipt_snapshot(root):
 
 def audit_records(root):
     records = deepcopy(_receipt_snapshot(root)[0])
+    corrections = Path(root) / 'Data' / 'Issuance Corrections'
+    if corrections.is_dir():
+        by_id = {row.get('id'):row for row in records}
+        for path in sorted(corrections.glob('*.json')):
+            correction = json.loads(path.read_text(encoding='utf-8'))
+            if not isinstance(correction, dict) or correction.get('version') != 1:
+                raise ValueError('The certificate correction history is unreadable. Restore its backup before continuing.')
+            row = by_id.get(correction.get('receipt_id'))
+            apply = correction.get('apply')
+            if (not row or not isinstance(apply, dict)
+                    or row.get('pdf_sha256') != correction.get('pdf_sha256')
+                    or not isinstance(apply.get('cod'), str) or not apply['cod'].strip()
+                    or not isinstance(apply.get('pdf_path'), str)
+                    or not isinstance(apply.get('after'), dict)):
+                raise ValueError('A certificate correction does not match its original PDF receipt. Restore its backup before continuing.')
+            row.update(deepcopy(apply))
+            row['correction_id'] = correction.get('id')
+            row['correction_reason'] = correction.get('reason', '')
     from certificate_drafts import read_register
     from manual_ownership import record_plant
     try:
@@ -429,7 +447,8 @@ class IssuanceTransaction:
                         'then refresh to finish. If it still fails, check write access to the PDF and its folder.') from exc
         from certificate_inventory import record_issuance
         record_issuance(self.root, destination, self.data['cod'], self.data['source_kind'],
-                        self.data['plant'], self.data['key'], external_upload=bool(self.data.get('external_upload')))
+                        self.data['plant'], self.data['key'], external_upload=bool(self.data.get('external_upload')),
+                        expected_sha=self.data['pdf_sha256'])
         self.data.update(state='complete', completed_at=datetime.now(timezone.utc).isoformat())
         self._save()
 

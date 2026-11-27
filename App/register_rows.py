@@ -5,7 +5,7 @@ import re
 from xml.sax.saxutils import escape, unescape, quoteattr
 from zipfile import ZipFile
 
-from openpyxl import load_workbook
+from register_reader import load_workbook
 from openpyxl.formula.tokenizer import Tokenizer
 from openpyxl.utils.cell import range_boundaries, get_column_letter, coordinate_to_tuple
 
@@ -80,14 +80,16 @@ def _material_totals(sheet, header, cols, records):
     return formulas, ends
 
 
-def compact_register_gaps(data, *, source_rows=None):
+def compact_register_gaps(data, *, source_rows=None, book=None):
     """Remove cleared rows and shorten verified material totals and their merges."""
     from certificate_core import read_batches, batch_content
     from workbook_store import register_content_end, UnsupportedReorderError
     before = read_batches(BytesIO(data))
     if not before:
         return data
-    book = load_workbook(BytesIO(data), data_only=False)
+    owns_book = book is None
+    if owns_book:
+        book = load_workbook(BytesIO(data), data_only=False)
     try:
         sheet, header, cols = select_register(book)
         if externally_protected(sheet):
@@ -130,7 +132,8 @@ def compact_register_gaps(data, *, source_rows=None):
                     source_rows[(sheet.title, row)] = row - sum(gap < row for gap in gaps)
         return updated
     finally:
-        book.close()
+        if owns_book:
+            book.close()
 
 
 def delete_empty_register_rows(data, rows, *, material_total_cells=()):

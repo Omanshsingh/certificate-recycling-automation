@@ -306,8 +306,16 @@ class Report:
 
 def _actionable_rows(result):
     rows = result.get("rows", []) if isinstance(result, dict) else []
+    def destruction_alert_due(row):
+        if not (row.get('attention_pending') or row.get('destruction_pending')):
+            return False
+        age = row.get('age_days')
+        # Start the Data Destruction reminder on day 4 after receipt. Keep
+        # missing or future dates actionable so they can be corrected.
+        return not isinstance(age, int) or age < 0 or age >= 4
+
     return [row for row in rows if row.get("reminder_due") or row.get("system_alert")
-            or row.get('attention_pending') or row.get('destruction_pending')]
+            or destruction_alert_due(row)]
 
 
 def alert_workbook_targets(result, workbook_paths):
@@ -410,13 +418,9 @@ def open_excel_record(workbook, sheet_name, row_number, *, case_id=None, header_
         f"$preferredRow={preferred_row or 0}; "
         "try {$excel=[Runtime.InteropServices.Marshal]::GetActiveObject('Excel.Application')} "
         "catch {$excel=New-Object -ComObject Excel.Application}; "
-        "Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class CertificateExcelFocus { "
-        "[DllImport(\"user32.dll\")] public static extern bool ShowWindow(IntPtr h, int c); "
-        "[DllImport(\"user32.dll\")] public static extern bool SetForegroundWindow(IntPtr h); }'; "
-        "$windowHandle=[IntPtr]::Zero; $deadline=[DateTime]::UtcNow.AddSeconds(18); "
+        "$deadline=[DateTime]::UtcNow.AddSeconds(18); "
         "while($true){try{ "
         "$excel.Visible=$true; $book=$null; "
-        "if($windowHandle -eq [IntPtr]::Zero){$windowHandle=[IntPtr]$excel.Hwnd}; "
         "foreach($candidate in $excel.Workbooks){if($candidate.FullName -ieq $path){$book=$candidate;break}}; "
         "if($null -eq $book){$book=$excel.Workbooks.Open($path)}; "
         "$sheet=$book.Worksheets.Item($sheetName); "
@@ -432,13 +436,16 @@ def open_excel_record(workbook, sheet_name, row_number, *, case_id=None, header_
         "if($found.Count -gt 1){throw 'Duplicate Excel headings were found. Save the workbook and refresh.'}; "
         "if($found.Count -eq 1){$mapping[$property.Name]=$found[0]}}; "
         "if(-not $mapping.ContainsKey('sn')){throw 'The Serial Number heading moved. Save the workbook and refresh.'}; "
-        "$lastRow=$sheet.UsedRange.Row+$sheet.UsedRange.Rows.Count-1; "
+        "$snColumn=$mapping['sn']; "
+        "$used=$sheet.UsedRange; $usedLast=$used.Row+$used.Rows.Count-1; "
+        "$lastRow=$usedLast; "
         "if($lastRow -le $headerRow){throw 'This client is no longer in the workbook.'}; "
-        "$values=$sheet.Range($cells.Item($headerRow+1,1),$cells.Item($lastRow,$lastColumn)).Value2; "
+        "$serials=$sheet.Range($cells.Item($headerRow+1,$snColumn),$cells.Item($lastRow,$snColumn)).Value2; "
         "$matchingRows=@(); for($index=1;$index -le $lastRow-$headerRow;$index++){ "
-        "$serialRaw=$values[$index,$mapping['sn']]; $value=([string]$serialRaw).Trim(); "
-        "if($serialRaw -is [double] -and [Math]::Truncate($serialRaw) -eq $serialRaw){ "
-        "$serialFormat=[string]$cells.Item($headerRow+$index,$mapping['sn']).NumberFormat; "
+        "$serialRaw=if($serials -is [array]){$serials[$index,1]}else{$serials}; $value=([string]$serialRaw).Trim(); "
+        "if($serialRaw -is [double] -and [Math]::Truncate($serialRaw) -eq $serialRaw "
+        "-and $clientId -match '^-?[0-9]+$' -and [double]$clientId -eq $serialRaw){ "
+        "$serialFormat=[string]$cells.Item($headerRow+$index,$snColumn).NumberFormat; "
         "if($serialFormat -match '^0+$'){ "
         "$value=$serialRaw.ToString('0',[Globalization.CultureInfo]::InvariantCulture); "
         "if($value.StartsWith('-')){$value='-'+$value.Substring(1).PadLeft([Math]::Max(0,$serialFormat.Length-1),'0')} "
@@ -449,19 +456,21 @@ def open_excel_record(workbook, sheet_name, row_number, *, case_id=None, header_
         "$firstIndex=$preferredIndex} elseif($matchingRows.Count -eq 1){$firstIndex=$matchingRows[0]} "
         "else{throw 'This Serial Number appears more than once. Open a specific list entry or correct the Serial Number in Excel.'}; "
         "$rowNumber=$headerRow+$firstIndex; "
-        "$limit=$lastRow-$headerRow; for($index=$firstIndex+1;$index -le $limit;$index++){ "
-        "if(([string]$values[$index,$mapping['sn']]).Trim()){$limit=$index-1;break}}; "
-        "$idCell=$cells.Item($rowNumber,$mapping['sn']); "
+        "$limit=$usedLast; for($index=$firstIndex+1;$index -le $lastRow-$headerRow;$index++){ "
+        "if(([string]$serials[$index,1]).Trim()){$limit=$headerRow+$index-1;break}}; "
+        "$idCell=$cells.Item($rowNumber,$snColumn); "
         "$endRow=$idCell.MergeArea.Row+$idCell.MergeArea.Rows.Count-1; "
+        "if($limit -gt $rowNumber){ "
+        "$values=$sheet.Range($cells.Item($rowNumber,1),$cells.Item($limit,$lastColumn)).Value2; "
         "foreach($key in @('item','quantity','per_piece_weight')){if($mapping.ContainsKey($key)){ "
-        "for($index=$firstIndex+1;$index -le $limit;$index++){ "
-        "if(([string]$values[$index,$mapping[$key]]).Trim()){$endRow=[Math]::Max($endRow,$headerRow+$index)}}}}; "
-        "if($mapping.ContainsKey('weight') -and $limit -gt $firstIndex){ "
-        "$weights=$sheet.Range($cells.Item($headerRow+1,$mapping['weight']),$cells.Item($lastRow,$mapping['weight'])).Formula; "
-        "for($index=$firstIndex+1;$index -le $limit;$index++){ "
+        "for($index=2;$index -le $limit-$rowNumber+1;$index++){ "
+        "if(([string]$values[$index,$mapping[$key]]).Trim()){$endRow=[Math]::Max($endRow,$rowNumber+$index-1)}}}}; "
+        "if($mapping.ContainsKey('weight')){ "
+        "$weights=$sheet.Range($cells.Item($rowNumber,$mapping['weight']),$cells.Item($limit,$mapping['weight'])).Formula; "
+        "for($index=2;$index -le $limit-$rowNumber+1;$index++){ "
         "$rawWeight=([string]$weights[$index,1]).Trim(); "
-        "if($rawWeight -and -not $rawWeight.StartsWith('=')){$endRow=[Math]::Max($endRow,$headerRow+$index)}}}; "
-        "$endRow=[Math]::Min([Math]::Max($endRow,$rowNumber),$headerRow+$limit); "
+        "if($rawWeight -and -not $rawWeight.StartsWith('=')){$endRow=[Math]::Max($endRow,$rowNumber+$index-1)}}}}; "
+        "$endRow=[Math]::Min([Math]::Max($endRow,$rowNumber),$limit); "
         "$target=$sheet.Range($cells.Item($rowNumber,1),$cells.Item($endRow,$lastColumn)); "
         "if($sheet.FilterMode -and $idCell.EntireRow.Hidden){$sheet.ShowAllData() | Out-Null}; "
         "if($idCell.EntireRow.Hidden){throw 'This client is in a hidden Excel row. Unhide it in Excel and try again.'}; "
@@ -470,19 +479,14 @@ def open_excel_record(workbook, sheet_name, row_number, *, case_id=None, header_
         "if($excel.Selection.Address() -ne $target.Address() -or $excel.ActiveWorkbook.FullName -ine $path "
         "-or $excel.ActiveSheet.Name -ine $sheetName){ "
         "throw 'Excel could not confirm the selected client. Try Open in Excel again.'}; "
-        "[CertificateExcelFocus]::ShowWindow([IntPtr]$excel.Hwnd,9) | Out-Null; "
-        "[CertificateExcelFocus]::SetForegroundWindow([IntPtr]$excel.Hwnd) | Out-Null; "
         "if($book.ReadOnly){throw 'Excel opened this workbook read-only. Close the other copy or release the file lock, then reopen it to edit.'}; "
-        "@{row=$rowNumber;last_row=$endRow;selected=$true} | ConvertTo-Json -Compress; break "
+        "@{row=$rowNumber;last_row=$endRow;selected=$true;window=$excel.Hwnd} | ConvertTo-Json -Compress; break "
         "} catch { "
         # Excel can briefly return a null COM object while switching worksheets.
         "$busy=$_.FullyQualifiedErrorId -eq 'InvokeMethodOnNull'; "
         "for($cause=$_.Exception;$null -ne $cause;$cause=$cause.InnerException){ "
         "if($cause.HResult -in @(-2147418111,-2147417846,-2146777998)){$busy=$true;break}}; "
         "if(-not $busy){throw}; "
-        "if($windowHandle -ne [IntPtr]::Zero){ "
-        "[CertificateExcelFocus]::ShowWindow($windowHandle,9) | Out-Null; "
-        "[CertificateExcelFocus]::SetForegroundWindow($windowHandle) | Out-Null}; "
         "if([DateTime]::UtcNow -ge $deadline){throw 'Excel is not ready to highlight this entry. Close any Excel message or finish editing the cell, then click Open in Excel again.'}; "
         "Start-Sleep -Milliseconds 350}}"
     )
@@ -506,6 +510,15 @@ def open_excel_record(workbook, sheet_name, row_number, *, case_id=None, header_
         raise OSError('Excel did not confirm the selected client. Try Open in Excel again.') from exc
     if result.get('selected') is not True or not header_row < selected_row <= 1048576:
         raise OSError('Excel could not confirm the highlighted client. Try again.')
+    if os.name == 'nt' and isinstance(result.get('window'), int) and result['window']:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.WinDLL('user32')
+        user32.ShowWindow.argtypes = (wintypes.HWND, ctypes.c_int)
+        user32.SetForegroundWindow.argtypes = (wintypes.HWND,)
+        window = wintypes.HWND(result['window'])
+        user32.ShowWindow(window, 9)
+        user32.SetForegroundWindow(window)
     return path, str(sheet_name), selected_row
 
 
@@ -539,11 +552,15 @@ def _notice_text(rows):
     due = [row for row in rows if row.get("reminder_due")]
     urgent = [row for row in rows if not row.get("reminder_due")
               and (row.get('system_alert') or row.get('attention_pending') or row.get('destruction_pending'))]
+    destruction_due = [row for row in urgent if row.get('attention_pending') or row.get('destruction_pending')]
+    other_urgent = len(urgent) - len(destruction_due)
     parts = []
     if due:
         parts.append(f"{len(due)} certificate{'s' if len(due) != 1 else ''} pending.")
-    if urgent:
-        parts.append(f"{len(urgent)} record{'s have' if len(urgent) != 1 else ' has'} details to check.")
+    if destruction_due:
+        parts.append(f"{len(destruction_due)} Data Destruction request{'s' if len(destruction_due) != 1 else ''} pending.")
+    if other_urgent:
+        parts.append(f"{other_urgent} record{'s have' if other_urgent != 1 else ' has'} details to check.")
     return "\n".join(parts + ["", "Choose Review now to see the list and what to do next."])
 
 

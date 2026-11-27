@@ -4,7 +4,7 @@ import re
 from types import SimpleNamespace
 from zipfile import ZipFile
 
-from openpyxl import load_workbook
+from register_reader import load_workbook
 from openpyxl.styles.numbers import is_date_format
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.datetime import to_excel

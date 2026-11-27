@@ -246,14 +246,15 @@ def save_uploaded_details(root, backup_dir, body):
                 raise ValueError(conflict)
             link = source.get('external_pdf') or {}
             recorded_pdf = receipt.get('pdf_sha256') if receipt and receipt.get('external_upload') else link.get('sha256')
-            if status_value(source['issued']) not in issued or not recorded_pdf:
+            if status_value(source.get('_recycling_status', source['issued'])) not in issued or not recorded_pdf:
                 raise ValueError('Refresh and reopen the uploaded certificate.')
             pdf = find_certificate(root / 'Certificates', dict(source, source_id=plant), receipt=receipt)
             _check_uploaded_pdf(pdf, expected_pdf, recorded_pdf)
             previous = dict(batch_content(source), cod_no=source['cod_no'], cod_date=source['cod_date'],
                             **{key:source.get(key, '') for key in FIELDS})
             details = _edited_upload_details(previous, supplied)
-            updated, saved = stage_certificate_details(session, details, inward_status=source['issued'])
+            updated, saved = stage_certificate_details(
+                session, details, inward_status=source.get('_recycling_status', source['issued']))
             if any(saved.get(key) != source.get(key) for key in ('cod_no', 'cod_date', 'external_pdf', 'hdd_cod_no', 'hdd_cod_date')):
                 raise ValueError('The existing certificate tracking could not be preserved. No details were saved.')
             if saved['form6'] != source['form6']:
@@ -382,12 +383,16 @@ def save_upload(root, backup_dir, body):
         workbook_record = bool(source and not is_hdd)
         source_kind = 'workbook' if workbook_record else 'manual'
         existing_cod = source.get('cod_no') if workbook_record else ''
+        prior_receipt = None
+        restoring_missing_pdf = False
         inventory = None
         previous_paths = {}
         permitted_paths = []
         if replacing:
             previous = source if workbook_record else existing
-            if not previous or status_value(previous.get('issued' if workbook_record else 'status')) not in {
+            previous_status = (previous.get('_recycling_status', previous.get('issued'))
+                               if workbook_record and previous else previous.get('status') if previous else None)
+            if not previous or status_value(previous_status) not in {
                     'generated', 'generated_manual', 'completed'}:
                 raise ValueError('Choose an issued certificate with a current PDF.')
             previous_details = source if workbook_record else existing['details']
@@ -407,8 +412,11 @@ def save_upload(root, backup_dir, body):
                 raise ValueError('The current PDF is missing or changed. Refresh and check Saved certificates.')
             permitted_paths, previous_paths = _replacement_paths(
                 root, inventory, current, existing_cod, source_kind, plant, key)
-            saved_details = receipt.get('after') if receipt and workbook_record else None
-            details = dict(previous_details, **(saved_details or {}))
+            # The selected workbook row is the current source of truth. A
+            # receipt's `after` snapshot can predate later edits to that row,
+            # so using it here would restore an old company name or details
+            # when replacing only the PDF.
+            details = dict(previous_details)
             kind = template_id(details.get('certificate_type'))
             details.update(certificate_type=kind, cod_date=issued_date.isoformat())
 
@@ -444,10 +452,24 @@ def save_upload(root, backup_dir, body):
         if not details['supplier']:
             raise ValueError('Enter the company name.')
         if workbook_record and not replacing:
-            if (status_value(source['issued']) not in {'blank', 'alert', 'ready', 'generated_manual'}
-                    or source.get('external_pdf') or source.get('pdf_recovery_pending')
-                    or latest_issuance(root, 'workbook', plant, source['case_id'])):
+            if (status_value(source.get('_recycling_status', source['issued'])) not in {'blank', 'alert', 'ready', 'generated_manual'}
+                    or source.get('external_pdf') or source.get('pdf_recovery_pending')):
                 raise ValueError('This client already has a certificate. Select its current certificate in the client list to replace the PDF.')
+            prior_receipt = latest_issuance(root, 'workbook', plant, source['case_id'])
+            if prior_receipt:
+                # A workbook status can be Ready even though the app still has
+                # a committed issuance receipt (for example, after its PDF was
+                # moved or deleted). Let Add PDF restore that same certificate
+                # with its existing COD, but never create a second copy while
+                # the receipt's PDF is still available.
+                if (not existing_cod or identity(prior_receipt.get('cod')) != identity(existing_cod)):
+                    raise ValueError('The recorded certificate number differs from Excel. Refresh and review this inward before uploading.')
+                inventory = scan_inventory(root, force=True)
+                current = find_certificate(root / 'Certificates', dict(source, source_id=plant),
+                                           inventory=inventory, receipt=prior_receipt)
+                if current:
+                    raise ValueError('A PDF for this certificate is already available. Refresh and select it before uploading.')
+                restoring_missing_pdf = True
         if replacing:
             cod = existing_cod
         elif app_only:
@@ -456,7 +478,10 @@ def save_upload(root, backup_dir, body):
                                  inventory=inventory)['next_cod']
         else:
             printed_numbers = {identity(value) for value in printed}
-            cod = reviewed_cod or existing_cod or (printed[0] if len(printed) == 1 else '')
+            # Keep the selected inward's assigned COD stable. PDF text can be
+            # stale or belong to a different file; only use it to seed a COD
+            # when the inward has not been assigned one yet.
+            cod = existing_cod or reviewed_cod or (printed[0] if len(printed) == 1 else '')
             if not cod:
                 if len(printed) > 1:
                     raise ValueError('The PDF text has more than one possible COD. Enter the number printed beside "Certificate No.".')
@@ -479,10 +504,12 @@ def save_upload(root, backup_dir, body):
             raise ValueError(f'COD {cod} is already assigned to a Data Destruction certificate.')
         if inventory is None:
             inventory = scan_inventory(root, force=True)
+        recovery_paths = ([prior_receipt.get('pdf_path')] if restoring_missing_pdf
+                          and isinstance(prior_receipt.get('pdf_path'), str) else [])
         duplicates = [] if replacing else [entry for entry in inventory['entries'] if entry.get('sha256') == digest]
         previously_used = not replacing and (bool(duplicates) or _was_issued_before(root, digest))
         if cod_conflicts(inventory, cod, allowed_paths=[entry['path'] for entry in duplicates]
-                         + permitted_paths):
+                         + permitted_paths + recovery_paths):
             raise ValueError(f'COD {cod} is already used by another PDF. Check the certificate number.')
         require_revision(root, revision, overrides)
         destination = current if replacing else safe_certificate_path(root, certificate_filename(details, cod=cod))
@@ -523,7 +550,9 @@ def save_upload(root, backup_dir, body):
             cod=cod, issued_date=issued_date, before=source if workbook_record else old_record,
             after=details, old_paths=previous_paths, companion_source=companion, external_upload=True,
             external_replacement=replacing, retain_existing=replacing and previous_paths[current] == digest,
-            assigned_upload_cod=app_only or (replacing and bool(receipt and receipt.get('assigned_upload_cod'))))
+            assigned_upload_cod=(app_only
+                                 or (replacing and bool(receipt and receipt.get('assigned_upload_cod')))
+                                 or (restoring_missing_pdf and bool(prior_receipt.get('assigned_upload_cod')))))
         try:
             if replacing and {root / item['path']: item['sha256'] for item in transaction.data['previous_pdfs']} != previous_paths:
                 raise ValueError('The current PDF changed during the upload. Refresh and review it again.')

@@ -218,6 +218,32 @@ class SimpleCertificateFlowTests(unittest.TestCase):
             self.assertEqual(len(pdf.pages), 1)
             self.assertIn(saved['cod_no'], pdf.pages[0].extract_text())
 
+    def test_bulk_reviews_and_issues_first_free_cods_from_override(self):
+        from workspace_review import reviewed_operation
+
+        make_workbook(self.paths[0], [{'sn': str(sn)} for sn in (1001, 1002, 1003)])
+        make_workbook(self.paths[1], [{'sn': str(sn), 'status': 'N/A', 'cod': cod}
+                                     for sn, cod in enumerate(('0217', '0218', '0220', 'OTHER9000'), 2001)])
+        settings_file = self.root / 'settings.local.json'
+        save_json(settings_file, dict(web_app.load_settings(self.root), next_cod=300))
+        payload = {'starting_cod': '217', 'expected_revision': workspace_revision(self.root),
+                   'selections': [{'plant': 'plant1', 'sn': str(sn)} for sn in (1001, 1002, 1003)]}
+
+        def submit(values):
+            return reviewed_operation(self.root, '/api/generate', values, lambda body: web_app.generate(
+                selections=body['selections'], starting_cod=body['starting_cod'],
+                expected_revision=body['expected_revision'], review_only=body.get('review_only', False),
+                confirmed=body.get('confirmed', False), reviewed_assignments=body.get('reviewed_assignments')))
+
+        review = submit(payload)
+        expected = ['0219', '0221', '0222']
+        self.assertEqual([item['cod'] for item in review['assignments']], expected)
+        self.assertEqual([row['cod_no'] for row in read_batches(self.paths[0])], ['', '', ''])
+        saved = submit(dict(payload, confirmed=True, review_token=review['review_token']))
+        self.assertEqual(saved['created'], 3)
+        self.assertEqual([row['cod_no'] for row in read_batches(self.paths[0])], expected)
+        self.assertEqual(saved['state']['numbering']['next_cod'], '0300')
+
     def test_cod_and_certificate_date_are_system_managed(self):
         with self.assertRaisesRegex(ValueError, 'assigned automatically'):
             web_app.validate_manual_identifiers({'details': {'cod_no':'0099'}})

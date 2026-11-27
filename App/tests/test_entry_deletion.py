@@ -121,15 +121,32 @@ class EntryDeletionTests(unittest.TestCase):
         self.assertNotIn('destruction_source',record['details'])
         self.assertEqual(record['details']['case_id'],'')
 
-    def test_generated_hdd_protects_its_unissued_inward(self):
-        identifier=self.pending_hdd();record=read_register(self.root)['records'][0]
-        details=dict(record['details'],certificate_fields={'destruction_date':'2026-10-29',
-            'device_receipts':'[{"date":"2026-09-01","count":"2"}]'})
-        generate_draft(self.root,'plant1',details,identifier,starting_cod='0001')
-        before=self.snapshot()
-        with self.assertRaisesRegex(ValueError,'cannot be deleted'):
-            delete_entries(self.root,self.payload())
-        self.assertEqual(self.snapshot(),before)
+    def test_issued_hdd_survives_deleting_its_unissued_recycling_inward(self):
+        from certificate_drafts import write_register
+        from entry_deletion import deletion_choices
+        from hdd_workbook import stage_hdd_tracking
+        identifier=self.pending_hdd();register=read_register(self.root)
+        record=register['records'][0]
+        record['status']='completed'
+        record['details']['cod_no']='0001'
+        write_register(self.root,register)
+        with WorkbookSession(self.paths[0],self.root/'Data'/'Workbook Backups') as session:
+            session._persist(stage_hdd_tracking(session,'1001','0001',date(2026,10,29)))
+        choices=deletion_choices(self.root)['rows']
+        inward=next(row for row in choices if row.get('source_kind') == 'workbook' and row.get('sn') == '1001')
+        hdd=next(row for row in choices if row.get('record_id') == identifier)
+        self.assertFalse(inward['deletion_blocked'])
+        self.assertTrue(hdd['deletion_blocked'])
+        payload,review=self.reviewed()
+        self.assertEqual(review['kept_hdd'][0]['record_id'],identifier)
+        delete_entries(self.root,payload,commit=True)
+        self.assertEqual(read_batches(self.paths[0]),[])
+        retained=read_register(self.root)['records']
+        self.assertEqual(len(retained),1)
+        self.assertEqual(retained[0]['id'],identifier)
+        self.assertEqual(retained[0]['details']['cod_no'],'0001')
+        self.assertEqual(retained[0]['status'],'completed')
+        self.assertNotIn('destruction_source',retained[0]['details'])
 
     def test_deletion_requires_checked_review_and_rejects_legacy_hdd_option(self):
         payload,_=self.reviewed();before=self.snapshot()

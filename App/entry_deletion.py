@@ -74,14 +74,18 @@ def deletion_choices(root):
         issued.update((owner.get('source_kind'), owner.get('plant'), str(owner.get('key', '')).strip().casefold())
                       for pdf in inventory.get('entries', []) if (owner := pdf.get('managed_owner')))
         records = read_register(root)['records']
-        linked_issued = set()
-
         def is_issued(details, status, identity):
-            return (identity in issued or bool(details.get('hdd_cod_no'))
+            return (identity in issued
                     or status_value(status) in {'generated', 'generated_manual', 'completed'})
 
         def add(identity, details, status, **position):
-            blocked = 'Certificate already generated' if is_issued(details, status, _key(identity)) else ''
+            primary_details = dict(details)
+            if identity['source_kind'] == 'workbook':
+                # The shared Excel row may also carry a Data Destruction COD.
+                # That HDD record can be kept independently when Recycling is
+                # deleted, so only Recycling's own issuance blocks deletion.
+                primary_details['hdd_cod_no'] = ''
+            blocked = 'Certificate already generated' if is_issued(primary_details, status, _key(identity)) else ''
             rows.append(dict(identity, **position, supplier=details.get('supplier'), location=details.get('location'),
                              certificate_type=details.get('certificate_type', 'standard'),
                              certificate_no=details.get('cod_no'), reference=details.get('reference'),
@@ -93,10 +97,6 @@ def deletion_choices(root):
             details = record['details']
             identity = {'source_kind':'manual', 'plant':record['plant'], 'record_id':record['id']}
             row = add(identity, details, record.get('status'), removed_inward=record.get('removed_inward'))
-            link = details.get('destruction_source') or {}
-            if row['deletion_blocked'] and link:
-                linked_issued.add(('manual', str(link['record_id']).casefold()) if link.get('record_id')
-                                  else (link.get('plant'), str(link.get('case_id', '')).strip().casefold()))
 
         resolved = [Path(value).expanduser().resolve() if value else None for value in paths]
         shared = all(resolved) and (resolved[0] == resolved[1] or
@@ -117,7 +117,7 @@ def deletion_choices(root):
             for batch in batches:
                 identity = {'source_kind':'workbook', 'plant':plant, 'sn':str(batch['case_id']),
                             'sheet':batch['source_sheet'], 'row':batch['source_row']}
-                row = add(identity, batch, batch.get('issued'))
+                row = add(identity, batch, batch.get('_recycling_status', batch.get('issued')))
                 if shared:
                     row['deletion_blocked'] = 'Connect a different workbook for each plant'
                 elif counts[_key(identity)[2]] > 1:
@@ -128,11 +128,6 @@ def deletion_choices(root):
                              'certificate_no':', '.join(issue.get('reserved_cod_numbers', [])),
                              'deletion_blocked':'Check this row in Excel first'})
 
-        for row in rows:
-            source = ('manual', str(row['record_id']).casefold()) if row['source_kind'] == 'manual' else (
-                row['plant'], str(row.get('sn') or '').strip().casefold())
-            if not row['deletion_blocked'] and source in linked_issued:
-                row['deletion_blocked'] = 'Linked Data Destruction certificate already generated'
         try:
             revision = workspace_revision(root, snapshots)
         except (OSError, ValueError) as exc:
@@ -242,8 +237,6 @@ def _prepare(root, body, sessions):
         if (link.get('record_id') in manual_ids or (not link.get('record_id') and
                 (link.get('plant'), str(link.get('case_id', '')).strip().casefold()) in workbook_links)):
             linked.append(record)
-            _require_unissued(record['details'], record.get('status'),
-                              ('manual', record['plant'], record['id'].casefold()), receipts, inventory)
     for choice in selected:
         plant = choice['plant']
         if choice['source_kind'] == 'workbook':
@@ -259,7 +252,9 @@ def _prepare(root, body, sessions):
                                    if str(row['case_id']).strip().casefold() == choice['sn'].strip().casefold()), None)
             if not original_match or (original_match['source_sheet'], original_match['source_row']) != (choice['sheet'], choice['row']):
                 raise ValueError('This inward moved in Excel. Search and review it again.')
-            _require_unissued(source, source.get('issued'), _key(choice), receipts, inventory)
+            recycling_details = dict(source, hdd_cod_no='')
+            _require_unissued(recycling_details, source.get('_recycling_status', source.get('issued')),
+                              _key(choice), receipts, inventory)
             previous = next((row for row in reversed(receipts) if row.get('state') == 'complete'
                 and (row.get('source_kind'),row.get('plant'),str(row.get('key')).strip().casefold()) == _key(choice)), None)
             conflict = workbook_receipt_conflict(source, previous)

@@ -5,7 +5,7 @@ generates its PDF, sends it through their normal process, and marks it Completed
 """
 from __future__ import annotations
 
-from contextlib import ExitStack
+from contextlib import ExitStack, closing
 from datetime import date
 from io import BytesIO
 import re
@@ -20,7 +20,6 @@ from certificate_core import (
     certificate_layout,
     certificate_number,
     certificate_reminder_due,
-    certificate_sequence,
     make_certificate,
     inward_details_complete,
     number,
@@ -34,7 +33,7 @@ from workflow_support import Report, load_settings, run_lock, operation_error_me
 from app_paths import resource
 from certificate_templates import TEMPLATE_ROOT, template_id, validate_fields, layout_warnings
 from certificate_inventory import (scan_inventory, cod_conflicts, verify_publication,
-                                   issuance_paths, record_issuance, certificate_destination,
+                                   issuance_paths, record_issuance, certificate_destination, filename_cod,
                                    unresolved_cod_entries, cod_recovery_message)
 from issuance_safety import (IssuanceTransaction, recover_issuances, latest_issuance,
                              audit_records, workbook_receipt_conflict,
@@ -203,87 +202,77 @@ def _read_sources(paths, sessions, report):
     return batches
 
 
-def _highest_sequence(batches, settings, output_folder, legacy_history=None, inventory=None):
-    highest = max(0, int(settings.get("certificate_number_start", 1)) - 1)
+def _series_sequence(value, settings):
+    prefix = str(settings.get('certificate_number_prefix', ''))
+    match = re.fullmatch(re.escape(prefix) + r'([0-9]+)', str(value or '').strip(), re.IGNORECASE)
+    return int(match[1]) if match else 0
+
+
+def _reserved_sequences(batches, settings, output_folder, *, inventory=None, legacy_history=None):
+    """Collect numbers in the configured series, including historical reservations."""
+    folder = Path(output_folder).resolve()
+    root = folder.parent
+    reserved = set()
+
+    def reserve(value):
+        sequence = _series_sequence(value, settings)
+        if sequence:
+            reserved.add(sequence)
+
     for batch in batches:
         for key in ('cod_no', 'hdd_cod_no'):
-            if batch.get(key):
-                highest = max(highest, certificate_sequence(batch[key], settings))
+            reserve(batch.get(key))
         for value in batch.get('reserved_cod_numbers', ()):
-            highest = max(highest, certificate_sequence(value, settings))
-    # Existing flat output PDFs are the durable numbering floor if an old
-    # workbook row is archived or its COD cell is cleared by the user.
-    output_folder = Path(output_folder).resolve()
-    output_root = output_folder.parent
-    inventory = inventory if inventory is not None else scan_inventory(output_root)
-    for path in (output_root/'Data'/'Entry Deletions').glob('*.json'):
+            reserve(value)
+    inventory = inventory if inventory is not None else scan_inventory(root)
+    for entry in inventory['entries']:
+        for value in entry['cods']:
+            reserve(value)
+    for entry in audit_records(root):
+        if entry.get('state') in {'complete', 'source_committed', 'deleted'}:
+            reserve(entry.get('cod'))
+    for path in (root / 'Data' / 'Entry Deletions').glob('*.json'):
         deletion = json.loads(path.read_text(encoding='utf-8'))
         if deletion.get('state') == 'complete':
             for value in deletion.get('cods', []):
-                highest = max(highest, certificate_sequence(value, settings))
-    for entry in inventory['entries']:
-        for value in entry['cods']:
-            highest = max(highest, certificate_sequence(value, settings))
-    custom_register = output_root / "Data" / "Custom Certificates.json"
+                reserve(value)
+    custom_register = root / 'Data' / 'Custom Certificates.json'
     if custom_register.is_file():
-        custom_data = json.loads(custom_register.read_text(encoding="utf-8"))
-        for record in custom_data.get("records", []):
-            highest = max(highest, certificate_sequence(record.get("details", {}).get("cod_no", ""), settings))
-    legacy_certificate_folder = output_root / "Output" / "Certificates"
-    # Only durable certificate/history locations, never sample templates,
-    # preview files or development/test directories elsewhere in the project.
-    durable_folders = (output_folder, legacy_certificate_folder, output_root / 'Data' / 'Archive')
-    for durable_folder in durable_folders:
-        for pdf in durable_folder.rglob('*.pdf') if durable_folder.is_dir() else ():
-            if pdf.name.startswith('.'):
+        for record in json.loads(custom_register.read_text(encoding='utf-8')).get('records', []):
+            reserve(record.get('details', {}).get('cod_no'))
+
+    # The inventory already inspects the current certificate folder. Archived
+    # and legacy PDFs may predate the inventory and still reserve their numbers.
+    for directory in (root / 'Output' / 'Certificates', root / 'Data' / 'Archive'):
+        for pdf in directory.rglob('*.pdf'):
+            if pdf.name.startswith('.') or pdf.is_relative_to(root / 'Data' / 'Archive' / 'Uncommitted Certificates'):
                 continue
-            if pdf.is_relative_to(output_root / 'Data' / 'Archive' / 'Uncommitted Certificates'):
-                # A rollback quarantine is diagnostic evidence, not an issued
-                # certificate or a reason to consume its never-committed COD.
-                continue
-            stem = pdf.stem
-            if durable_folder == output_root / 'Data' / 'Archive':
-                # Recovery archives prepend a random ID, not a COD.
-                stem = re.sub(r'^[a-f0-9]{32}_', '', stem, flags=re.I)
-            # New COD-led PDFs have COD, company, and city fields. Older
-            # generated PDFs may still have a final _1/_2 plant marker.
-            new_client_name = re.fullmatch(r"[^_]+_.+_.+", stem, re.I)
-            if new_client_name:
-                cod_prefix = stem.split("_", 1)[0]
-                highest = max(highest, certificate_sequence(cod_prefix, settings))
-                continue
-            # Do not treat older client-name PDFs as a number source.
-            legacy_client_name = re.fullmatch(r"cod_.+_[12]", stem, re.I)
-            legacy_cod_name = (
-                bool(re.fullmatch(r"(?:cod_|certificate_)\d+", stem, re.I))
-                or ("_" not in stem and stem.casefold().startswith(("cod", "certificate")))
-            )
-            in_flat_certificate_folder = pdf.parent.resolve() in {
-                output_folder,
-                legacy_certificate_folder.resolve(),
-            }
-            if not (legacy_cod_name or (in_flat_certificate_folder and not legacy_client_name)):
-                continue
-            match = re.search(r"(\d+)$", stem)
-            if match:
-                highest = max(highest, int(match.group(1)))
-    # Read only legacy COD values for sequence continuity; no mail state is used.
+            name = re.sub(r'^[a-f0-9]{32}_', '', pdf.name, flags=re.I)
+            reserve(filename_cod(name))
+
     if legacy_history and Path(legacy_history).is_file():
         try:
-            connection = sqlite3.connect(f"file:{Path(legacy_history).resolve().as_posix()}?mode=ro", uri=True)
-            try:
+            with closing(sqlite3.connect(f"{Path(legacy_history).resolve().as_uri()}?mode=ro", uri=True)) as connection:
                 tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-                for table in tables.intersection({"batches", "archived_issuances"}):
-                    columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
-                    if "certificate_no" not in columns:
-                        continue
-                    for (value,) in connection.execute(f"SELECT certificate_no FROM {table}"):
-                        highest = max(highest, certificate_sequence(value, settings))
-            finally:
-                connection.close()
-        except sqlite3.Error:
-            pass
-    return highest
+                for table in tables.intersection({'batches', 'archived_issuances'}):
+                    columns = {row[1] for row in connection.execute(f'PRAGMA table_info({table})')}
+                    if 'certificate_no' in columns:
+                        for (value,) in connection.execute(f'SELECT certificate_no FROM {table}'):
+                            reserve(value)
+        except sqlite3.Error as exc:
+            raise ValueError('The old COD register could not be read. Check the history before assigning new numbers.') from exc
+    return reserved
+
+
+def _highest_sequence(batches, settings, output_folder, legacy_history=None, inventory=None):
+    reserved = _reserved_sequences(batches, settings, output_folder, inventory=inventory, legacy_history=legacy_history)
+    return max(max(reserved, default=0), int(settings.get('certificate_number_start', 1)) - 1)
+
+
+def _first_free_sequence(start, reserved):
+    while start in reserved:
+        start += 1
+    return start
 
 
 def starting_cod_sequence(value):
@@ -294,21 +283,18 @@ def starting_cod_sequence(value):
     return int(raw)
 
 
-def numbering_plan(batches, settings, output_folder, *, inventory=None, starting_cod=None):
-    """Use the same numbering rules for batches, single previews and saves."""
+def numbering_plan(batches, settings, output_folder, *, inventory=None, starting_cod=None, reserved=None):
+    """Start at an explicit floor, or continue after the last used number."""
     folder = Path(output_folder)
-    highest = _highest_sequence(batches, dict(settings, certificate_number_start=1), folder,
-                                folder.parent / 'Data' / 'certificate-history.sqlite', inventory=inventory)
-    start = starting_cod_sequence(starting_cod) if starting_cod is not None else None
+    if reserved is None:
+        reserved = _reserved_sequences(batches, settings, folder, inventory=inventory,
+                                       legacy_history=folder.parent / 'Data' / 'certificate-history.sqlite')
+    highest = max(reserved, default=0)
     configured = settings.get('next_cod')
-    if start is not None and highest:
-        raise ValueError('Existing CODs were found. Refresh to continue numbering automatically.')
-    if start is not None and configured is not None:
-        raise ValueError('The next COD is set in Settings. Refresh to use that sequence.')
-    minimum = max(int(settings.get('certificate_number_start', 1)), highest + 1)
-    sequence = start if start is not None else max(configured or 1, minimum)
+    default_start = max(int(settings.get('certificate_number_start', 1)), highest + 1)
+    start = starting_cod_sequence(starting_cod) if starting_cod is not None else configured or default_start
+    sequence = _first_free_sequence(start, reserved)
     return {'needs_start': not highest and configured is None, 'next_cod': certificate_number(sequence, settings),
-            'minimum_sequence': minimum,
             'prefix': settings.get('certificate_number_prefix', ''),
             'width': int(settings.get('certificate_number_width', 4)), 'sequence': sequence}
 
@@ -405,7 +391,7 @@ def find_certificate(output_folder, batch, *, inventory=None, receipt=LOOKUP_REC
     # same COD need their issuance receipt to identify the owning inward.
     if valid_matches:
         return valid_matches[0] if len(valid_matches) == 1 else None
-    if status_value(batch.get('issued')) not in {'generated_manual', 'completed'}:
+    if status_value(batch.get('_recycling_status', batch.get('issued'))) not in {'generated_manual', 'completed'}:
         return None
     inventory = inventory if inventory is not None else scan_inventory(folder.parent)
     matches = [entry for entry in inventory['entries']
@@ -424,7 +410,7 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
         plants=None, allow_warnings=False, overrides=None, details=None, update_excel=True,
         override_reason='', expected_revision=None, report_sink=None, read_only_preflight=False,
         starting_cod=None, selected_keys=None,
-        remove_inward=False, hdd_needed=None, check_timings=None):
+        remove_inward=False, hdd_needed=None, check_timings=None, reviewed_assignments=None):
     """Check both workbooks or generate PDFs for rows explicitly marked Ready."""
     root = Path(root)
     if remove_inward and (not selected or details is None or update_excel):
@@ -477,7 +463,7 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
             recover_issuances(root)
         if expected_revision is not None:
             from workspace_review import require_revision
-            require_revision(root, expected_revision)
+            require_revision(root, expected_revision, force=False)
         report = Report(root, as_of, mode, publish_latest=publish_latest and not read_only_preflight)
         report.result_sink = report_sink
         finish_stage('recovery')
@@ -513,7 +499,9 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
                         report.add({'source_id': f'plant{index}', 'source_path': str(path)}, 'needs_review',
                                    f'{path.name} is unavailable: {exc}', issue_code='source_unavailable', system_alert=True)
                 if expected_revision is not None:
-                    require_revision(root, expected_revision, {str(session.path.resolve()): session.data for session in sessions if session is not None})
+                    require_revision(root, expected_revision,
+                                     {str(session.path.resolve()): session.data for session in sessions if session is not None},
+                                     force=not read_only_preflight)
                 finish_stage('open_workbooks')
                 inventory = scan_inventory(root, persist=not read_only_preflight)
                 report.certificate_inventory = inventory
@@ -636,7 +624,7 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
                         if not original_form_batch or original_form_batch.get('certificate_type', 'standard') == details.get('certificate_type'):
                             raise ValueError('Excel removal is only available when changing this inward’s certificate type.')
                         if (original_form_batch.get('hdd_cod_no')
-                                or status_value(original_form_batch.get('issued')) in {'generated', 'generated_manual', 'completed'}
+                                or status_value(original_form_batch.get('_recycling_status', original_form_batch.get('issued'))) in {'generated', 'generated_manual', 'completed'}
                                 or latest_issuance(root, 'workbook', selected[0], selected[1])):
                             raise ValueError('A certificate has already been generated for this inward. It cannot be deleted.')
                         from inward_removal import stage_removal
@@ -683,10 +671,13 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
                     inventory = report.certificate_inventory = scan_inventory(root, persist=True)
 
                 finish_stage('workbook_status_and_formatting')
+                reserved = _reserved_sequences(numbering_batches, settings, output_folder, inventory=inventory,
+                                               legacy_history=root / 'Data' / 'certificate-history.sqlite')
                 plan = numbering_plan(numbering_batches, settings, output_folder,
-                                      inventory=inventory, starting_cod=start_sequence)
+                                      starting_cod=start_sequence, reserved=reserved)
                 next_sequence = plan['sequence']
                 report.numbering = {key: value for key, value in plan.items() if key != 'sequence'}
+                publication_files = {}
                 ready_count = 0
                 for batch in batches:
                     if plants is not None and batch["source_id"] not in plants:
@@ -697,32 +688,19 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
                         continue
                     if limit is not None and ready_count >= limit and not check_only:
                         break
-                    state = status_value(batch.get("issued"))
+                    recycling_state = status_value(batch.get("_recycling_status", batch.get("issued")))
+                    state = recycling_state
                     if batch.get('duplicate_serial_number') or batch.get('record_identity_conflict'):
                         batch['_issuance_blocked'] = True
                         report.add(batch, 'needs_review', ' '.join(batch['blocking_issues']),
                                    warnings=batch['blocking_issues'], system_alert=True)
                         continue
                     if check_only and state == 'completed' and _linked_hdd_pending(batch, manual_records):
-                        # Excel has one outward status cell for the inward. If
-                        # its Recycling certificate was completed while a
-                        # requested HDD certificate remains open, expose the
-                        # true per-certificate state and safely repair Excel
-                        # when this refresh owns a writable session.
+                        # The app keeps Recycling's per-certificate state. Excel's
+                        # shared cell is reconciled separately to the lagging state.
                         batch['recycling_completed'] = True
-                        receipt = history.get((batch['source_id'], batch['case_id'].strip().casefold()))
-                        target_status = ('Generated Externally'
-                                         if batch.get('external_pdf') or (receipt or {}).get('external_upload')
-                                         else 'Generated')
-                        session = sessions[int(batch['source_id'][-1]) - 1]
-                        if (session is not None and not read_only_preflight
-                                and not batch.get('_workbook_read_only')
-                                and not isinstance(session, WorkbookSnapshot)):
-                            session.set_issued_status(batch['case_id'], batch['source_sheet'],
-                                batch['source_row'], batch['cod_no'], batch['issued'], target_status,
-                                metadata={'_recycling_completed': True})
-                            batch['issued'] = target_status
-                        state = 'generated_manual' if target_status == 'Generated Externally' else 'generated'
+                        target_status = ('Generated Externally' if batch.get('external_pdf') else 'Generated')
+                        state = status_value(target_status)
                     if (batch.get('_workbook_read_only') or read_only_preflight) and state in {'blank', 'ready', 'alert'}:
                         # Effective status only: the saved Excel cell remains
                         # untouched until a write can safely acquire its lock.
@@ -855,7 +833,15 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
 
                     row_cod = manual_cod or str(batch.get("cod_no") or "").strip()
                     try:
-                        cod = row_cod or certificate_number(next_sequence, settings)
+                        key = (batch['source_id'], str(batch['case_id']))
+                        reviewed_cod = reviewed_assignments.get(key) if reviewed_assignments is not None else None
+                        reviewed_sequence = _series_sequence(reviewed_cod, settings)
+                        # If an earlier save failed, keep this row's reviewed
+                        # assignment as long as the number is still available.
+                        automatic_cod = certificate_number(next_sequence, settings)
+                        if reviewed_sequence >= next_sequence and reviewed_sequence not in reserved:
+                            automatic_cod = reviewed_cod
+                        cod = row_cod or automatic_cod
                         cod_owners = []
                         for owner in batches:
                             if cod_identity(owner.get("cod_no")) == cod_identity(cod):
@@ -871,11 +857,11 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
                             if not allow_warnings:
                                 raise ValueError(message)
                             issues.append(message + " A new automatic COD was used after confirmation.")
-                            cod = certificate_number(next_sequence, settings)
+                            cod = automatic_cod
                         conflicts = cod_conflicts(inventory, cod, allowed_paths, owned=owned and cod_identity(cod) == cod_identity(source_batch.get('cod_no')))
                         if conflicts:
                             names = ', '.join(Path(entry['path']).name for entry in conflicts[:3])
-                            replacement = certificate_number(next_sequence, settings)
+                            replacement = automatic_cod
                             message = f"COD {cod} is already recorded in certificate PDF history ({names}). Continuing will use new automatic COD {replacement}; existing PDFs will not be overwritten."
                             if not allow_warnings:
                                 report.add(batch, 'needs_review', message, warnings=[message], system_alert=True)
@@ -888,8 +874,10 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
                             if not allow_warnings:
                                 raise
                             issues.append(str(exc) + " A new automatic COD was used after confirmation.")
-                            cod = certificate_number(next_sequence, settings)
+                            cod = automatic_cod
                             safe_cod = _safe_cod_name(cod)
+                        if reviewed_assignments is not None and reviewed_cod != cod:
+                            raise ValueError('The proposed COD changed. Refresh and review the assignments before creating this certificate.')
                         issued_date = parse_date(batch.get("cod_date")) or as_of
                         destination = certificate_destination(root, certificate_filename(batch, cod=cod))
                         batch['pdf_relative_path'] = destination.relative_to(output_folder).as_posix()
@@ -910,10 +898,10 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
                                 detail += " Warnings: " + "; ".join(dict.fromkeys(issues))
                             report.add(batch, "ready", detail, system_alert=bool(issues),
                                        warnings=list(dict.fromkeys(issues)))
-                            if not row_cod:
-                                next_sequence += 1
-                            else:
-                                next_sequence = max(next_sequence, certificate_sequence(cod, settings) + 1)
+                            report.rows[-1]['proposed_cod'] = cod
+                            if sequence := _series_sequence(cod, settings):
+                                reserved.add(sequence)
+                            next_sequence = _first_free_sequence(next_sequence, reserved)
                             continue
 
                         temporary = root / "Data" / "Previews" / f".{safe_cod}.{uuid.uuid4().hex}.tmp.pdf"
@@ -928,7 +916,7 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
                                                        'workbook', batch['source_id'], batch['case_id'])
                             verify_publication(root, inventory, cod, allowed_paths=list(set(allowed_paths + old_paths)),
                                                owned=owned and cod_identity(cod) == cod_identity(source_batch.get('cod_no')),
-                                               allow_warnings=allow_warnings)
+                                               allow_warnings=allow_warnings, verified_files=publication_files)
                             local_record, companion, converted_from = None, None, None
                             if remove_inward:
                                 from certificate_conversion import prepare_local_certificate
@@ -958,12 +946,12 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
                                 deferred_reference = None
                                 if (not update_excel and original_form_batch
                                         and not original_form_batch.get('form6')
-                                        and status_value(original_form_batch.get('issued'))
+                                        and status_value(original_form_batch.get('_recycling_status', original_form_batch.get('issued')))
                                             not in {'generated', 'generated_manual', 'completed'}):
                                     deferred_form6 = batch.get('form6')
                                 if (not update_excel and original_form_batch
                                         and not original_form_batch.get('reference')
-                                        and status_value(original_form_batch.get('issued'))
+                                        and status_value(original_form_batch.get('_recycling_status', original_form_batch.get('issued')))
                                             not in {'generated', 'generated_manual', 'completed'}):
                                     deferred_reference = batch.get('reference')
                                 backup = session.commit(original_form_batch or source_batch, cod, issued_date,
@@ -1005,6 +993,8 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
                         batch['pdf_filename'] = destination.name
                         batch["_effective_certificate_status"] = "generated"
                         report.created += 1
+                        if sequence := _series_sequence(cod, settings):
+                            reserved.add(sequence)
                         detail = f"Generated {destination.name}; Excel was updated to COD {cod}, {issued_date:%d.%m.%Y}, Generated. Send it manually, then mark Completed."
                         if remove_inward:
                             detail = f'Generated {destination.name}; the selected inward was removed from Excel. The PDF is kept in the local certificate register. Send it manually, then mark Completed.'
@@ -1030,10 +1020,7 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
                                 report.pending_recovery = ('The certificate list could not be updated after saving. '
                                                            f'Refresh before retrying the rest of the batch. {operation_error_message(exc)}')
                                 break
-                        if not row_cod:
-                            next_sequence += 1
-                        else:
-                            next_sequence = max(next_sequence, certificate_sequence(cod, settings) + 1)
+                        next_sequence = _first_free_sequence(next_sequence, reserved)
                         if progress:
                             progress(f"{batch['source_id']} SN {batch['case_id']}: saved {destination.name}")
                     except Exception as exc:
@@ -1043,6 +1030,8 @@ def run(workbook_paths, root, *, as_of=None, progress=print, check_only=False,
             # saved certificate a second time before returning.
             if not check_only:
                 report.certificate_inventory = scan_inventory(root, persist=not read_only_preflight)
+                plan = numbering_plan(numbering_batches, settings, output_folder, reserved=reserved)
+                report.numbering = {key: value for key, value in plan.items() if key != 'sequence'}
             finish_stage('numbering_and_queue')
             return report.finish()
         except Exception as exc:

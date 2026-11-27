@@ -595,6 +595,38 @@ class ReviewAndEditTests(unittest.TestCase):
         self.assertEqual(result['certificate_no'], '0452')
         self.assertEqual((self.root/'Certificates'/result['relative_path']).read_bytes(), payload)
 
+    def test_app_assigned_tracking_cod_does_not_create_a_saved_pdf_warning(self):
+        from certificate_inventory import INSPECTION_VERSION, scan_inventory
+        from external_certificate_upload import save_upload, stage_upload
+        from tests.test_certificate_inventory import external_pdf
+
+        payload = external_pdf(self.root/'operator.pdf', reference='Uploaded reference').read_bytes()
+        staged = stage_upload(self.root, payload)
+        result = save_upload(self.root, web_app.BACKUP_DIR, {
+            'token':staged['token'], 'inward':None, 'expected_revision':workspace_revision(self.root),
+            'details':{'certificate_type':'standard', 'supplier':'App-only client', 'cod_date':'2026-10-14'},
+        })
+        inventory = scan_inventory(self.root, force=True)
+        relative = (self.root/'Certificates'/result['relative_path']).relative_to(self.root).as_posix()
+        entry = next(item for item in inventory['entries'] if item['path'] == relative)
+        self.assertEqual(entry['current_cods'], [result['certificate_no']])
+        self.assertEqual(entry['warnings'], [], 'A tracking COD is not expected to be printed on the user PDF.')
+        self.assertEqual(inventory['warnings'], [])
+
+        # Older inventories cached this false positive. A new inspection must
+        # clear it instead of continuing to show a warning for this saved file.
+        ledger_path = self.root/'Data'/'Certificate Inventory.json'
+        ledger = json.loads(ledger_path.read_text(encoding='utf-8'))
+        cached = next(item for item in ledger['entries'] if item['path'] == relative)
+        cached['inspection_version'] = INSPECTION_VERSION - 1
+        cached['warnings'] = ['App-assigned COD 0452 could not be confirmed on the PDF. Check the printed certificate number.']
+        ledger_path.write_text(json.dumps(ledger), encoding='utf-8')
+        refreshed = scan_inventory(self.root)
+        refreshed_entry = next(item for item in refreshed['entries'] if item['path'] == relative)
+        self.assertEqual(refreshed_entry['inspection_version'], INSPECTION_VERSION)
+        self.assertEqual(refreshed_entry['warnings'], [])
+        self.assertEqual(refreshed['warnings'], [])
+
     def test_upload_without_readable_cod_uses_existing_inward_cod(self):
         from external_certificate_upload import save_upload, stage_upload
         from openpyxl import load_workbook

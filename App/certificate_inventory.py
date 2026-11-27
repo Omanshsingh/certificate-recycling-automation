@@ -4,6 +4,7 @@ The folder is another numbering source, not an instruction source. A durable
 local ledger remembers observed identifiers even if a file is later removed.
 """
 from pathlib import Path
+from stat import S_ISREG
 from io import BytesIO
 import json
 import re
@@ -15,7 +16,7 @@ from workflow_support import save_json, load_settings
 
 MAX_PDF_BYTES = 50 * 1024 * 1024
 MAX_PAGES = 8
-INSPECTION_VERSION = 6
+INSPECTION_VERSION = 8
 _RECORDED_COD_MISMATCH = 'Printed COD differs from the recorded certificate number. Check this PDF.'
 
 
@@ -142,7 +143,11 @@ def _inspect_pdf(path, *, pdf_data=None, number_prefix='', certificate_pages=Non
                 (attachment_cods if attached else printed).update(found)
                 references.update(refs)
         if assigned_upload_cod:
-            return [assigned_upload_cod], sorted(references), [], []
+            if not readable:
+                warnings.append('PDF has no readable text (possibly a scan); check the certificate details manually.')
+            # The app-assigned COD is only a local tracking number. It is not
+            # expected to be printed on a PDF supplied by the user.
+            return [assigned_upload_cod], sorted(references), warnings, sorted(attachment_cods)
         cods.update(printed)
         if issued_cod:
             cods.add(str(issued_cod))
@@ -188,7 +193,7 @@ def _issued_certificate_facts(root, *, history=None):
     for record in records:
         if record.get('state') not in {'complete', 'source_committed'}:
             continue
-        if record.get('external_replacement') or record.get('assigned_upload_cod'):
+        if record.get('external_replacement') or _assigned_upload_cod(record):
             continue  # Its selected COD belongs to the recorded path, not every copy of the PDF.
         details = record.get('after')
         if not isinstance(details, dict):
@@ -219,13 +224,28 @@ def _issued_certificate_facts(root, *, history=None):
     return {digest: next(iter(facts)) for digest, facts in facts_by_digest.items() if len(facts) == 1}
 
 
+def _assigned_upload_cod(record):
+    """Return the app-assigned number for an app-only external upload.
+
+    Older receipts predate the explicit marker. A first manual external
+    upload has an empty `before` snapshot; its COD was assigned by the app,
+    rather than read from the uploaded PDF.
+    """
+    if record.get('assigned_upload_cod'):
+        return str(record.get('cod') or '').strip()
+    if (record.get('external_upload') and record.get('source_kind') == 'manual'
+            and not record.get('before')):
+        return str(record.get('cod') or '').strip()
+    return ''
+
+
 def _issued_certificate_pages(root):
     """Return page boundaries for PDFs proven by exact committed receipts."""
     return {digest: pages for digest, (_cod, pages) in _issued_certificate_facts(root).items()
             if pages is not None}
 
 
-def scan_inventory(root, persist=False, *, force=False):
+def scan_inventory(root, persist=False, *, force=False, _new_owner=None, _verified_files=None):
     root = Path(root)
     number_prefix = load_settings(root).get('certificate_number_prefix', '')
     ledger_path = root / 'Data' / 'Certificate Inventory.json'
@@ -251,9 +271,9 @@ def scan_inventory(root, persist=False, *, force=False):
                     for record in history if record.get('state') in {'complete', 'source_committed'}
                     and record.get('external_replacement') and record.get('pdf_path')
                     and record.get('pdf_sha256') and record.get('cod')}
-    assigned_uploads = {(record['pdf_path'].replace('\\', '/').casefold(), record['pdf_sha256']): str(record['cod'])
+    assigned_uploads = {(record['pdf_path'].replace('\\', '/').casefold(), record['pdf_sha256']): _assigned_upload_cod(record)
                         for record in history if record.get('state') in {'complete', 'source_committed'}
-                        and record.get('assigned_upload_cod') and record.get('pdf_path')
+                        and _assigned_upload_cod(record) and record.get('pdf_path')
                         and record.get('pdf_sha256') and record.get('cod')}
     origins = {record['pdf_sha256']: 'external' if record.get('external_upload') else 'app'
                for record in history if record.get('state') in {'complete', 'source_committed'} and record.get('pdf_sha256')}
@@ -262,7 +282,7 @@ def scan_inventory(root, persist=False, *, force=False):
                         'plant':record.get('plant'), 'key':str(record.get('key')), 'cod':str(record.get('cod'))}
                         for record in history if record.get('state') == 'complete'
                         and record.get('pdf_sha256') and not record.get('external_replacement')
-                        and not record.get('assigned_upload_cod')}
+                        and not _assigned_upload_cod(record)}
     # A byte-identical PDF may now be intentionally saved for more than one
     # inward. Prefer the issuance tied to this exact path; digest-only ownership
     # remains a fallback for older files that were moved outside the app.
@@ -282,20 +302,23 @@ def scan_inventory(root, persist=False, *, force=False):
     folder = root / 'Certificates'
     if folder.is_dir():
         for path in sorted(folder.rglob('*')):
-            if not path.is_file() or path.suffix.casefold() != '.pdf' or path.name.startswith('.'):
+            if path.suffix.casefold() != '.pdf' or path.name.startswith('.'):
                 continue
-            relative = path.relative_to(root).as_posix()
             try:
                 stat = path.stat()
             except FileNotFoundError:
                 # Explorer may remove/move a PDF after the directory listing.
                 # Its prior identifiers remain reserved by the ledger above.
                 continue
+            if not S_ISREG(stat.st_mode):
+                continue
+            relative = path.relative_to(root).as_posix()
             old = entries.get(relative.casefold())
             pdf_data = None
             try:
                 from file_fingerprints import fingerprint
-                digest, pdf_data = fingerprint(path, force=force, payload_limit=MAX_PDF_BYTES)
+                digest, pdf_data = fingerprint(path, force=force, payload_limit=MAX_PDF_BYTES,
+                                               verified=_verified_files)
             except OSError:
                 digest = None
             issued_cod, certificate_pages = issued.get(digest, (None, None))
@@ -375,6 +398,14 @@ def scan_inventory(root, persist=False, *, force=False):
                          linkable_external=not entry.get('managed_owner')
                          and (origin == 'external' or (not origin and path.parent == folder)))
             entries[relative.casefold()] = entry
+    if _new_owner is not None:
+        relative, owner, external_upload, expected_sha = _new_owner
+        entry = entries.get(relative.casefold())
+        if (not entry or not entry.get('present') or not entry.get('sha256')
+                or (expected_sha is not None and entry['sha256'] != expected_sha)):
+            raise ValueError('The saved PDF could not be verified for the certificate inventory.')
+        entry.update(managed_owner=owner, external=external_upload,
+                     app_generated=not external_upload, linkable_external=False)
     result = {'version': 1, 'entries': sorted(entries.values(), key=lambda entry: entry['path'].casefold())}
     if persist and result != previous and (result['entries'] or ledger_path.exists()):
         if ledger_path.exists():
@@ -442,20 +473,18 @@ def issuance_paths(inventory, cod, source_kind, plant, key):
             and identity(entry['managed_owner'].get('cod')) == identity(cod)]
 
 
-def record_issuance(root, path, cod, source_kind, plant, key, *, external_upload=False):
-    inventory = scan_inventory(root, persist=True)
+def record_issuance(root, path, cod, source_kind, plant, key, *, external_upload=False, expected_sha=None):
     relative = Path(path).relative_to(Path(root)).as_posix()
-    entry = next(entry for entry in inventory['entries'] if entry['path'].casefold() == relative.casefold())
-    entry['managed_owner'] = {'source_kind': source_kind, 'plant': plant, 'key': str(key), 'cod': str(cod)}
-    entry.update(external=external_upload, app_generated=not external_upload, linkable_external=False)
+    owner = {'source_kind': source_kind, 'plant': plant, 'key': str(key), 'cod': str(cod)}
+    inventory = scan_inventory(root, persist=True, _new_owner=(relative, owner, external_upload, expected_sha))
     inventory.pop('warnings', None)
-    save_json(Path(root) / 'Data' / 'Certificate Inventory.json', inventory)
     return inventory
 
 
-def verify_publication(root, snapshot, cod, reference=None, allowed_paths=(), owned=False, allow_warnings=False):
+def verify_publication(root, snapshot, cod, reference=None, allowed_paths=(), owned=False, allow_warnings=False,
+                       *, verified_files=None):
     """Recheck Explorer/PowerPoint changes made while the PDF was rendering."""
-    current = scan_inventory(root, force=True)
+    current = scan_inventory(root, force=True, _verified_files=verified_files)
     unknown = unresolved_cod_entries(current)
     if unknown:
         messages = [cod_recovery_message(entry['path']) for entry in unknown[:3]]

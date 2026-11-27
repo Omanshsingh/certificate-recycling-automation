@@ -9,7 +9,7 @@ import re
 import xml.etree.ElementTree as ET
 from zipfile import ZipFile
 
-from openpyxl import load_workbook
+from register_reader import load_workbook
 from openpyxl.formula.tokenizer import Tokenizer
 from openpyxl.utils.cell import column_index_from_string, get_column_letter
 
@@ -42,9 +42,11 @@ def _bytes(root):
     return ET.tostring(root, encoding='utf-8', xml_declaration=True)
 
 
-def normalize_register_columns(data):
+def normalize_register_columns(data, *, book=None):
     from workbook_store import _sheet_member
-    book = load_workbook(BytesIO(data), data_only=False)
+    owns_book = book is None
+    if owns_book:
+        book = load_workbook(BytesIO(data), data_only=False)
     try:
         sheet, header, cols = select_register(book)
         width = max(sheet.max_column, max(cell.column for cell in sheet[header] if cell.value is not None))
@@ -249,4 +251,5 @@ def normalize_register_columns(data):
             raise ValueError('The column move changed inward facts. The original workbook has been kept.')
         return result
     finally:
-        book.close()
+        if owns_book:
+            book.close()

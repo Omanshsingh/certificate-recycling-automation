@@ -18,6 +18,7 @@ def workspace_revision(root, file_overrides=None, *, force=False):
              root / 'Data' / 'Certificate Inventory.json', root / 'Data' / 'History Reset.json',
              root / 'Data' / 'Certificate Folder Moves.json',
              root / 'Data' / 'Issued Excel Change Reviews.json']
+    paths.extend(path for path in sorted((root / 'Data' / 'Issuance Corrections').glob('*.json')))
     paths.extend(Path(value).resolve() for value in settings.get('workbook_paths', []) if value)
     for folder in (root / 'Certificates', root / 'Data' / 'Attachments', root / 'App' / 'templates' / 'certificate-types'):
         paths.extend(path for path in sorted(folder.rglob('*')) if path.is_file() and not path.name.startswith('.'))
@@ -45,17 +46,18 @@ def require_revision(root, expected, file_overrides=None, *, force=True):
         raise ValueError('The files changed since you opened these details. Refresh Excel and review the current details before saving. Your entered details have not been saved.')
 
 
-def review_token(endpoint, payload, revision, warnings):
+def review_token(endpoint, payload, revision, warnings, assignments=None):
     clean = {key: value for key, value in payload.items()
              if key not in {'confirmed', 'review_token', 'override_reason', 'expected_revision'}}
-    raw = json.dumps([endpoint, clean, revision, warnings], sort_keys=True, default=str, ensure_ascii=False).encode('utf-8')
+    raw = json.dumps([endpoint, clean, revision, warnings, assignments], sort_keys=True, default=str, ensure_ascii=False).encode('utf-8')
     return hmac.new(_SECRET, raw, hashlib.sha256).hexdigest()
 
 
 def reviewed_operation(root, endpoint, payload, action):
     """HTTP boundary: never accept a bare confirmed=True as prior review."""
+    payload = {key: value for key, value in payload.items() if key != 'reviewed_assignments'}
     expected = payload.get('expected_revision')
-    require_revision(root, expected)
+    require_revision(root, expected, force=False)
     check = dict(payload, confirmed=False, review_only=True)
     result = action(check)
     if not result.get('requires_confirmation'):
@@ -64,7 +66,8 @@ def reviewed_operation(root, endpoint, payload, action):
     # review tied to the original revision rather than blessing newer data.
     require_revision(root, expected, force=False)
     revision = expected
-    token = review_token(endpoint, payload, revision, result.get('warnings', []))
+    assignments = result.get('assignments', [])
+    token = review_token(endpoint, payload, revision, result.get('warnings', []), assignments)
     submitted_token = payload.get('review_token')
     if (payload.get('confirmed') is True and isinstance(submitted_token, str)
             and submitted_token.isascii() and hmac.compare_digest(submitted_token, token)):
@@ -75,6 +78,6 @@ def reviewed_operation(root, endpoint, payload, action):
         # Retain notes from older clients, without requiring the user to type one.
         default_reason = 'Warnings reviewed; user chose Continue anyway.' if result.get('warnings') else 'Creation confirmed.'
         return action(dict(payload, expected_revision=revision, review_only=False,
-                           override_reason=reason or default_reason))
+                           override_reason=reason or default_reason, reviewed_assignments=assignments))
     result.update(review_token=token, workspace_revision=revision)
     return result

@@ -2,7 +2,7 @@
 from io import BytesIO
 from zipfile import ZipFile
 
-from openpyxl import load_workbook
+from register_reader import load_workbook
 
 from register_protection import externally_protected
 from certificate_core import batch_content, read_batches, select_register, text

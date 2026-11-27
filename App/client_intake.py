@@ -9,7 +9,7 @@ import xml.etree.ElementTree as ET
 from xml.sax.saxutils import quoteattr
 from zipfile import ZipFile
 
-from openpyxl import load_workbook
+from register_reader import load_workbook
 from openpyxl.styles.numbers import is_date_format
 from openpyxl.utils.cell import get_column_letter, range_boundaries
 from openpyxl.utils.datetime import to_excel
@@ -119,7 +119,8 @@ def _package(source, changes):
     with ZipFile(buffer, 'w') as target:
         target.comment = source.comment
         for info in source.infolist():
-            target.writestr(copy(info), changes.get(info.filename, source.read(info.filename)))
+            payload = changes[info.filename] if info.filename in changes else source.read(info.filename)
+            target.writestr(copy(info), payload)
     return buffer.getvalue()
 
 
@@ -189,10 +190,13 @@ def stage_new_client(session, raw, *, reserved_serials=(), recycling_needed=True
         details['certificate_type'] = text(raw.get('certificate_type')) or 'standard'
     certificate_values = {key: (raw if restoring else details).get(key)
                           for key in ('certificate_weight', 'certificate_fields')}
-    source_data = add_tracking_column(session.data)
-    original = read_batches(BytesIO(source_data))
-    book = load_workbook(BytesIO(source_data), data_only=False)
+    book = load_workbook(BytesIO(session.data), data_only=False)
     try:
+        source_data = add_tracking_column(session.data, book=book)
+        if source_data is not session.data:
+            book.close()
+            book = load_workbook(BytesIO(source_data), data_only=False)
+        original = read_batches(BytesIO(source_data))
         sheet, header_row, cols = select_register(book)
         original_sheet_width = register_content_width(sheet, header_row)
         if externally_protected(sheet):
@@ -434,14 +438,16 @@ def stage_new_client(session, raw, *, reserved_serials=(), recycling_needed=True
                         if key not in cols and details[key] and (key != 'certificate_type' or details[key] != 'standard')}
             metadata.update({key:value for key, value in certificate_values.items()
                              if key not in cols and value is not None})
-            updated = write_details(_package(archive, changes), sheet.title, case_id, metadata)
-            batches = read_batches(BytesIO(updated))
-            added = next(batch for batch in batches if batch['case_id'] == case_id)
-            ready = inward_details_complete(added)
-            status = ('N/A' if not recycling_needed or supplier_is_always_not_applicable(details['supplier'])
-                      else 'Ready' if ready else '')
             if restoring:
                 status = text(raw.get('issued'))
+            elif not recycling_needed or supplier_is_always_not_applicable(details['supplier']):
+                status = 'N/A'
+            elif details['inward_date'] is None or not any(item['item'] for item in details['items']):
+                status = ''
+            else:
+                staged = write_details(_package(archive, changes), sheet.title, case_id, metadata)
+                added = next(batch for batch in read_batches(BytesIO(staged)) if batch['case_id'] == case_id)
+                status = 'Ready' if inward_details_complete(added) else ''
             xml = _set_cell(xml, f'{get_column_letter(cols["issued"] + 1)}{first}', status,
                             'inlineStr' if status else 'blank')
             changes[member] = xml.encode('utf-8')

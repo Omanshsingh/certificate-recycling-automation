@@ -13,7 +13,7 @@ from openpyxl.utils.exceptions import InvalidFileException
 from certificate_core import (certificate_number, material_items, number, parse_date, read_batches,
                               status_value, supplier_is_always_not_applicable)
 from certificate_templates import TEMPLATE_NAMES, layout_warnings, make_template_certificate, template_id, validate_fields, current_warnings
-from run_certificates import _highest_sequence, _safe_cod_name, certificate_filename, find_certificate, cod_identity, numbering_plan
+from run_certificates import _safe_cod_name, certificate_filename, find_certificate, cod_identity, numbering_plan
 from certificate_inventory import (scan_inventory, cod_conflicts, verify_publication,
                                    issuance_paths, record_issuance, certificate_destination, safe_certificate_path,
                                    unresolved_cod_entries, cod_recovery_message)
@@ -216,16 +216,21 @@ def numbering_sources(root, settings):
             warnings.append(f"Plant {index} workbook is not connected; confirm that the COD does not duplicate an existing certificate before sending.")
             continue
         try:
-            for batch in read_batches(Path(value)):
+            parsed = read_batches(Path(value))
+            for batch in parsed:
                 batch["source_id"] = f"plant{index}"
                 batches.append(batch)
+            for issue in getattr(parsed, 'row_issues', ()):
+                if issue.get('reserved_cod_numbers'):
+                    batches.append({'source_id': f'plant{index}', 'case_id': '',
+                                    'reserved_cod_numbers': issue['reserved_cod_numbers']})
         except (OSError, ValueError, BadZipFile, InvalidFileException) as exc:
             warnings.append(f"Plant {index} workbook could not be checked for existing CODs: {exc}. Verify the COD before sending.")
     return batches, warnings
 
 
 def prepare_certificate(root, plant, details, *, record_id=None, as_of=None, source_kind="manual",
-                        starting_cod=None):
+                        starting_cod=None, inventory=None):
     """Preview/preflight without saving a draft, consuming a COD or changing Excel."""
     if source_kind == 'workbook' and plant not in {"plant1", "plant2"}:
         raise ValueError("Choose Plant 1 or Plant 2.")
@@ -258,7 +263,8 @@ def prepare_certificate(root, plant, details, *, record_id=None, as_of=None, sou
     from identifier_rules import require_unique
     require_unique(details, plant, source_kind,
                    details['case_id'] if source_kind == 'workbook' else record_id, batches, data['records'])
-    inventory = scan_inventory(root)
+    if inventory is None:
+        inventory = scan_inventory(root)
     numbering = numbering_plan(batches, settings, Path(root) / 'Certificates',
                                inventory=inventory, starting_cod=starting_cod)
     automatic = numbering['next_cod']
@@ -274,6 +280,13 @@ def prepare_certificate(root, plant, details, *, record_id=None, as_of=None, sou
         owned = bool(allowed_paths)
     owners = [batch for batch in batches if cod_identity(batch.get("cod_no")) == cod_identity(cod)
               and not (source_kind == "workbook" and batch.get("source_id") == plant and batch.get("case_id") == details["case_id"])]
+    link = details.get('destruction_source') or {}
+    for batch in batches:
+        own_hdd = (existing and link and not link.get('record_id') and link.get('plant') == batch.get('source_id')
+                   and str(link.get('case_id')).casefold() == str(batch.get('case_id')).casefold())
+        if (any(cod_identity(value) == cod_identity(cod) for value in batch.get('reserved_cod_numbers', ()))
+                or (not own_hdd and cod_identity(batch.get('hdd_cod_no')) == cod_identity(cod))):
+            owners.append(batch)
     owners.extend(record for record in data["records"] if record["id"] != record_id
                   and cod_identity(record["details"].get("cod_no")) == cod_identity(cod))
     if owners:
@@ -493,12 +506,13 @@ def reconcile_manual(root):
 
 
 def generate_draft(root, plant=None, details=None, record_id=None, confirmed=False, as_of=None,
-                   override_reason='', expected_revision=None, starting_cod=None, *, review_only=False):
+                   override_reason='', expected_revision=None, starting_cod=None, *, review_only=False,
+                   reviewed_assignments=None):
     with run_lock(root), ExitStack() as resources:
         recover_issuances(root)
         if expected_revision is not None:
             from workspace_review import require_revision
-            require_revision(root, expected_revision)
+            require_revision(root, expected_revision, force=False)
         # Keep review inputs unchanged until the certificate commits. Updating
         # the ledger here would invalidate the revision checked below.
         inventory = scan_inventory(root)
@@ -530,14 +544,21 @@ def generate_draft(root, plant=None, details=None, record_id=None, confirmed=Fal
             if issues:
                 raise ValueError(' '.join(issues))
         batch, cod, issued_date, warnings = prepare_certificate(root, plant, details, record_id=record_id,
-                                                               as_of=as_of, starting_cod=starting_cod)
+                                                               as_of=as_of, starting_cod=starting_cod,
+                                                               inventory=inventory)
+        assignments = [{'plant': batch.get('source_id') or plant, 'supplier': batch['supplier'],
+                        'sn': batch['case_id'], 'cod': cod}]
+        if reviewed_assignments is not None and reviewed_assignments != assignments:
+            raise ValueError('The proposed COD changed. Review the assignment before creating this certificate.')
         if warnings and not confirmed:
             row = {"plant": plant, "supplier": batch["supplier"], "sn": batch["case_id"],
                    "certificate_status": "ready", "outcome": "needs_review", "warnings": warnings,
                    "detail": "; ".join(warnings)}
-            return {"requires_confirmation": True, "warnings": [row], "created": 0, "record_id": record_id}
+            return {"requires_confirmation": True, "warnings": [row], "assignments": assignments,
+                    "created": 0, "record_id": record_id}
         if review_only:
-            return {"requires_confirmation": True, "warnings": [], "created": 0, "record_id": record_id}
+            return {"requires_confirmation": True, "warnings": [], "assignments": assignments,
+                    "created": 0, "record_id": record_id}
         details = clean_details(details)
         details.update(cod_no=cod, cod_date=issued_date.isoformat())
         linked_session = None

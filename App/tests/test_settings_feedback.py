@@ -160,15 +160,18 @@ class SettingsFeedbackTests(unittest.TestCase):
             self.settings_writer.assert_not_called()
             self.scheduler.assert_not_called()
 
-    def test_next_cod_setting_is_validated_against_reserved_numbers(self):
+    def test_starting_cod_setting_skips_reserved_numbers(self):
         from run_certificates import numbering_plan
         from tests.test_certificate_workflow import make_workbook
 
         make_workbook(self.paths[0], [{'sn':'1', 'cod':'REC000090'}])
         make_workbook(self.paths[1], [{'sn':'2'}])
-        status, failed = self.post_settings(self.body(next_cod='90', update_reminder=False))
-        self.assertEqual(status, 400)
-        self.assertIn('REC000091', failed['error'])
+        status, saved = self.post_settings(self.body(next_cod='90', update_reminder=False))
+        self.assertEqual(status, 200)
+        self.assertEqual(saved['settings']['next_cod'], 90)
+        plan = numbering_plan([{'cod_no':'REC000090'}, {'cod_no':'OTHER9000'}],
+                              load_settings(self.root), self.root/'Certificates')
+        self.assertEqual(plan['next_cod'], 'REC000091')
         status, saved = self.post_settings(self.body(next_cod='00100', update_reminder=False))
         self.assertEqual(status, 200)
         self.assertEqual(saved['settings']['next_cod'], 100)
